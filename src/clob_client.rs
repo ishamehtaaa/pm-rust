@@ -211,7 +211,7 @@ impl ClobClient {
             }
         };
 
-        // Post to exchange
+        // Post to exchange - PostOrderResponse has id field directly
         let response = match self.client.post_order(signed_order).await {
             Ok(r) => r,
             Err(e) => {
@@ -231,7 +231,8 @@ impl ClobClient {
             elapsed, token_id, price, size
         );
 
-        let order_id = response.id;
+        // PostOrderResponse has id field
+        let order_id = response.order_id.clone();
         OrderPlacement::success(token_id.to_string(), price, size, order_id)
     }
 
@@ -280,10 +281,14 @@ impl ClobClient {
             .await
             .map_err(|e: polymarket_client_sdk::error::Error| ClobError::Sdk(e.to_string()))?;
 
+        // SDK's Decimal is rust_decimal::Decimal, convert via string if needed
+        let size_matched = Decimal::from_str(&order.size_matched.to_string())
+            .ok();
+
         Ok(OrderInfo {
             id: order.id,
-            status: order.status,
-            size_matched: from_poly_decimal_opt(&order.size_matched),
+            status: order.status.to_string(),
+            size_matched,
         })
     }
 
@@ -314,8 +319,4 @@ fn to_poly_decimal(d: Decimal) -> Result<PolyDecimal, ClobError> {
 
 fn from_poly_decimal(d: &PolyDecimal) -> Result<Decimal, ClobError> {
     Decimal::from_str(&d.to_string()).map_err(|e| ClobError::DecimalConversion(e.to_string()))
-}
-
-fn from_poly_decimal_opt(d: &Option<PolyDecimal>) -> Option<Decimal> {
-    d.as_ref().and_then(|v| Decimal::from_str(&v.to_string()).ok())
 }

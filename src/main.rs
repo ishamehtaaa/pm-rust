@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create CLOB client (authenticates with Polymarket)
-    let clob_client = ClobClient::new(&config.polymarket_private_key, config.dry_run).await?;
+    let clob_client = ClobClient::new(&config.polymarket_private_key, false).await?;
 
     // Create bot
     let mut bot = HighFreqArbBot::new(config, clob_client);
