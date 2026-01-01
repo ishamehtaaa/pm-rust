@@ -71,10 +71,10 @@ pub struct ArbConfig {
 impl Default for ArbConfig {
     fn default() -> Self {
         Self {
-            shares_per_side: dec!(10),
+            shares_per_side: dec!(20),
             max_limit_price: dec!(0.52),
             min_profit_per_share: dec!(0.03),
-            arb_threshold: dec!(0.94),
+            arb_threshold: dec!(0.98),
         }
     }
 }

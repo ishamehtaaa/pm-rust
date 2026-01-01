@@ -1,3 +1,4 @@
+
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use polymarket_client_sdk::auth::Normal;
@@ -115,6 +116,9 @@ impl ClobClient {
         let signer = PrivateKeySigner::from_str(private_key)
             .map_err(|e| ClobError::Auth(format!("Invalid private key: {}", e)))?;
         
+        let address = signer.address();
+        info!("Wallet address: {}", address);
+        
         let signer_with_chain = signer.clone().with_chain_id(Some(POLYGON));
 
         let client = Client::new(crate::config::POLYMARKET_CLOB_HOST, Config::default())
@@ -139,11 +143,15 @@ impl ClobClient {
         price: Decimal,
         size: Decimal,
     ) -> OrderPlacement {
+        let total_cost = price * size;
+        
+        info!(
+            "ORDER: token={} price={} size={} total_cost={}",
+            token_id, price, size, total_cost
+        );
+
         if self.dry_run {
-            debug!(
-                "DRY RUN: limit order token={} price={} size={}",
-                token_id, price, size
-            );
+            info!("DRY RUN: would place order");
             return OrderPlacement::dry_run(token_id.to_string(), price, size);
         }
 
@@ -152,6 +160,7 @@ impl ClobClient {
         let poly_price = match to_poly_decimal(price) {
             Ok(p) => p,
             Err(e) => {
+                warn!("Price conversion failed: {}", e);
                 return OrderPlacement::failed(
                     token_id.to_string(),
                     price,
@@ -164,6 +173,7 @@ impl ClobClient {
         let poly_size = match to_poly_decimal(size) {
             Ok(s) => s,
             Err(e) => {
+                warn!("Size conversion failed: {}", e);
                 return OrderPlacement::failed(
                     token_id.to_string(),
                     price,
@@ -172,6 +182,11 @@ impl ClobClient {
                 )
             }
         };
+
+        info!(
+            "SDK params: poly_price={} poly_size={} side=Buy",
+            poly_price, poly_size
+        );
 
         // Build limit order using SDK builder
         let signable_order = match self
@@ -184,7 +199,10 @@ impl ClobClient {
             .build()
             .await
         {
-            Ok(o) => o,
+            Ok(o) => {
+                debug!("Order built successfully");
+                o
+            }
             Err(e) => {
                 warn!("Failed to build order: {}", e);
                 return OrderPlacement::failed(
@@ -199,7 +217,10 @@ impl ClobClient {
         // Sign the order
         let signer_with_chain = self.signer.clone().with_chain_id(Some(POLYGON));
         let signed_order = match self.client.sign(&signer_with_chain, signable_order).await {
-            Ok(s) => s,
+            Ok(s) => {
+                debug!("Order signed successfully");
+                s
+            }
             Err(e) => {
                 warn!("Failed to sign order: {}", e);
                 return OrderPlacement::failed(
@@ -211,7 +232,7 @@ impl ClobClient {
             }
         };
 
-        // Post to exchange - PostOrderResponse has id field directly
+        // Post to exchange
         let response = match self.client.post_order(signed_order).await {
             Ok(r) => r,
             Err(e) => {
@@ -226,14 +247,12 @@ impl ClobClient {
         };
 
         let elapsed = start.elapsed();
-        debug!(
-            "Order posted in {:?}: token={} price={} size={}",
-            elapsed, token_id, price, size
+        info!(
+            "Order posted in {:?}: order_id={}",
+            elapsed, response.order_id
         );
 
-        // PostOrderResponse has id field
-        let order_id = response.order_id.clone();
-        OrderPlacement::success(token_id.to_string(), price, size, order_id)
+        OrderPlacement::success(token_id.to_string(), price, size, response.order_id)
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), ClobError> {
@@ -281,9 +300,7 @@ impl ClobClient {
             .await
             .map_err(|e: polymarket_client_sdk::error::Error| ClobError::Sdk(e.to_string()))?;
 
-        // SDK's Decimal is rust_decimal::Decimal, convert via string if needed
-        let size_matched = Decimal::from_str(&order.size_matched.to_string())
-            .ok();
+        let size_matched = Decimal::from_str(&order.size_matched.to_string()).ok();
 
         Ok(OrderInfo {
             id: order.id,

@@ -217,7 +217,6 @@ fn process_price_changes(
                 }
                 p.last_update_ms = ts_ms;
 
-                debug!("{} {:?} bid={} ask={}", p.asset, side, bid_val, ask_val);
             }
         }
     }

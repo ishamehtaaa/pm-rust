@@ -1,12 +1,15 @@
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use polymarket_client_sdk::rtds::Client as RtdsClient;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+
+const BINANCE_WS_BASE: &str = "wss://stream.binance.com:9443/ws";
 
 #[derive(Debug, Clone)]
 pub struct BinancePrice {
@@ -43,7 +46,7 @@ impl BinanceFeed {
         });
 
         self.task = Some(task);
-        info!("Binance feed started");
+        info!("Binance WebSocket feed started");
     }
 
     pub fn stop(&mut self) {
@@ -71,52 +74,80 @@ async fn run_binance_feed(
 ) {
     loop {
         if let Err(e) = run_binance_stream(&symbols, &prices).await {
-            error!("Binance stream error: {}, reconnecting in 1s...", e);
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            error!("Binance WebSocket error: {}, reconnecting in 2s...", e);
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct MiniTickerEvent {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "c")]
+    close_price: String,
+    #[serde(rename = "E")]
+    event_time: i64,
 }
 
 async fn run_binance_stream(
     symbols: &[String],
     prices: &Arc<RwLock<HashMap<String, BinancePrice>>>,
 ) -> anyhow::Result<()> {
-    let client = RtdsClient::default();
+    if symbols.is_empty() {
+        warn!("No symbols to subscribe");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        return Ok(());
+    }
 
-    let symbols_owned: Vec<String> = symbols.iter().map(|s| s.to_lowercase()).collect();
-    info!("Subscribing to Binance prices: {:?}", symbols_owned);
+    // Build combined stream URL for mini tickers
+    // Format: wss://stream.binance.com:9443/stream?streams=btcusdt@miniTicker/ethusdt@miniTicker
+    let streams: Vec<String> = symbols
+        .iter()
+        .map(|s| format!("{}@miniTicker", s.to_lowercase()))
+        .collect();
+    
+    let url = format!("wss://stream.binance.com:9443/stream?streams={}", streams.join("/"));
+    
+    info!("Connecting to Binance: {}", url);
 
-    // rtds::Client.subscribe_crypto_prices takes Option<Vec<String>>
-    let stream = client.subscribe_crypto_prices(Some(symbols_owned))?;
-    let mut stream = Box::pin(stream);
+    let (ws_stream, _) = connect_async(&url).await?;
+    let (mut _write, mut read) = ws_stream.split();
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(crypto_price) => {
-                // CryptoPrice struct - check actual fields
-                let symbol = crypto_price.symbol.to_lowercase();
-                let timestamp_ms = crate::models::now_ms();
-                
-                // Convert price - try different approaches
-                let price = Decimal::from_str(&format!("{}", crypto_price.value))
-                    .or_else(|_| Decimal::from_str(&format!("{:?}", crypto_price.value)))
-                    .unwrap_or(Decimal::ZERO);
+    info!("Binance WebSocket connected, subscribed to: {:?}", symbols);
 
-                if price > Decimal::ZERO {
-                    debug!("Binance {} = {}", symbol, price);
-
-                    prices.write().insert(
-                        symbol.clone(),
-                        BinancePrice {
-                            symbol,
-                            price,
-                            timestamp_ms,
-                        },
-                    );
-                }
-            }
+    while let Some(msg) = read.next().await {
+        let msg = match msg {
+            Ok(m) => m,
             Err(e) => {
-                warn!("Binance price error: {}", e);
+                warn!("Binance WS error: {}", e);
+                break;
+            }
+        };
+
+        if let Message::Text(text) = msg {
+            // Combined stream format: {"stream":"btcusdt@miniTicker","data":{...}}
+            if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(data) = wrapper.get("data") {
+                    if let Ok(ticker) = serde_json::from_value::<MiniTickerEvent>(data.clone()) {
+                        if let Ok(price) = Decimal::from_str(&ticker.close_price) {
+                            let symbol_lower = ticker.symbol.to_lowercase();
+                            
+                            debug!("Binance {} = {}", symbol_lower, price);
+                            
+                            prices.write().insert(
+                                symbol_lower.clone(),
+                                BinancePrice {
+                                    symbol: symbol_lower,
+                                    price,
+                                    timestamp_ms: ticker.event_time,
+                                },
+                            );
+                        }
+                    }
+                }
             }
         }
     }

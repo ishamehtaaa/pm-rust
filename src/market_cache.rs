@@ -29,7 +29,7 @@ impl MarketCache {
         }
     }
 
-    pub async fn get_markets(&self, now: DateTime<Utc>) -> Result<Vec<MarketInfo>, MarketCacheError> {
+    pub async fn get_markets(&self, _now: DateTime<Utc>) -> Result<Vec<MarketInfo>, MarketCacheError> {
         let raw_markets = self.fetch_raw_markets().await?;
         info!("Fetched {} raw markets from Gamma API", raw_markets.len());
 
