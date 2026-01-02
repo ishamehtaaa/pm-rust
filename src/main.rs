@@ -1,6 +1,5 @@
 use clap::Parser;
 use polymarket::bot::HighFreqArbBot;
-use polymarket::clob_client::ClobClient;
 use polymarket::config::Config;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -21,16 +20,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Initialize logging
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     fmt().with_env_filter(filter).init();
 
-    // Load config
     let mut config = Config::from_env()?;
-    if args.dry_run {
-        config.dry_run = true;
-    }
+    // Command-line flag takes precedence: set dry_run directly from args.
+    config.dry_run = args.dry_run;
 
     tracing::info!(
         "Starting Polymarket arb bot (dry_run={}, targets={:?})",
@@ -38,20 +33,14 @@ async fn main() -> anyhow::Result<()> {
         config.target_assets
     );
 
-    // Create CLOB client (authenticates with Polymarket)
-    let clob_client = ClobClient::new(&config.polymarket_private_key, false).await?;
+    let mut bot = HighFreqArbBot::new(config).await?;
 
-    // Create bot
-    let mut bot = HighFreqArbBot::new(config, clob_client);
-
-    // Initial market discovery
     bot.discover_markets().await;
 
     if bot.market_count() == 0 {
         tracing::warn!("No markets discovered, will retry in main loop");
     }
 
-    // Print discovered markets
     for (market_id, state) in bot.markets() {
         let pair = state.pair.read();
         tracing::info!(
@@ -64,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Run the main trading loop
     bot.run().await;
 
     Ok(())

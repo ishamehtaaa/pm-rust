@@ -63,8 +63,7 @@ pub static TARGET_ASSETS: Lazy<HashSet<String>> = Lazy::new(|| {
 #[derive(Debug, Clone)]
 pub struct ArbConfig {
     pub shares_per_side: Decimal,
-    pub max_limit_price: Decimal,
-    pub min_profit_per_share: Decimal,
+    /// The threshold factor for considering an arbitrage (e.g., 0.98 means we require the combined price <= 0.98 * reference)
     pub arb_threshold: Decimal,
 }
 
@@ -72,8 +71,6 @@ impl Default for ArbConfig {
     fn default() -> Self {
         Self {
             shares_per_side: dec!(20),
-            max_limit_price: dec!(0.52),
-            min_profit_per_share: dec!(0.03),
             arb_threshold: dec!(0.98),
         }
     }

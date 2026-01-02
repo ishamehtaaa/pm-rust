@@ -42,11 +42,16 @@ impl MarketInfo {
             up_token_id: self.up_token_id.clone(),
             down_token_id: self.down_token_id.clone(),
             end_time: self.end_time,
-            up_bid: None,
-            up_ask: None,
-            down_bid: None,
-            down_ask: None,
-            last_update_ms: 0,
+            ws_up_bid: None,
+            ws_up_ask: None,
+            ws_down_bid: None,
+            ws_down_ask: None,
+            rest_up_bid: None,
+            rest_up_ask: None,
+            rest_down_bid: None,
+            rest_down_ask: None,
+            last_ws_update_ms: 0,
+            last_rest_update_ms: 0,
         }
     }
 }
@@ -60,28 +65,52 @@ pub struct TradingPair {
     pub down_token_id: String,
     pub end_time: DateTime<Utc>,
 
-    pub up_bid: Option<Decimal>,
-    pub up_ask: Option<Decimal>,
-    pub down_bid: Option<Decimal>,
-    pub down_ask: Option<Decimal>,
-    pub last_update_ms: i64,
+    // WS-provided prices
+    pub ws_up_bid: Option<Decimal>,
+    pub ws_up_ask: Option<Decimal>,
+    pub ws_down_bid: Option<Decimal>,
+    pub ws_down_ask: Option<Decimal>,
+
+    // REST-provided prices
+    pub rest_up_bid: Option<Decimal>,
+    pub rest_up_ask: Option<Decimal>,
+    pub rest_down_bid: Option<Decimal>,
+    pub rest_down_ask: Option<Decimal>,
+
+    // Timestamps for last updates from each source
+    pub last_ws_update_ms: i64,
+    pub last_rest_update_ms: i64,
 }
 
 impl TradingPair {
+    /// Prefer WS prices if present, otherwise fall back to REST.
+    pub fn latest_up_ask(&self) -> Option<Decimal> {
+        self.ws_up_ask.or(self.rest_up_ask)
+    }
+
+    pub fn latest_down_ask(&self) -> Option<Decimal> {
+        self.ws_down_ask.or(self.rest_down_ask)
+    }
+
     pub fn combined_ask(&self) -> Option<Decimal> {
-        Some(self.up_ask? + self.down_ask?)
+        Some(self.latest_up_ask()? + self.latest_down_ask()?)
     }
 
     pub fn has_both_asks(&self) -> bool {
-        self.up_ask.is_some() && self.down_ask.is_some()
+        self.latest_up_ask().is_some() && self.latest_down_ask().is_some()
     }
 
     pub fn clear_prices(&mut self) {
-        self.up_bid = None;
-        self.up_ask = None;
-        self.down_bid = None;
-        self.down_ask = None;
-        self.last_update_ms = 0;
+        self.ws_up_bid = None;
+        self.ws_up_ask = None;
+        self.ws_down_bid = None;
+        self.ws_down_ask = None;
+        self.rest_up_bid = None;
+        self.rest_up_ask = None;
+        self.rest_down_bid = None;
+        self.rest_down_ask = None;
+        self.last_ws_update_ms = 0;
+        self.last_rest_update_ms = 0;
     }
 }
 
@@ -89,11 +118,11 @@ impl std::fmt::Display for TradingPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[{}]: {} UP: {:?} DOWN: {:?}",
+            "[{}]: {} WS_UP: {:?} REST_UP: {:?}",
             self.asset.to_uppercase(),
             self.duration,
-            self.up_ask,
-            self.down_ask
+            self.ws_up_ask,
+            self.rest_up_ask
         )
     }
 }
