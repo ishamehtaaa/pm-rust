@@ -1,3 +1,4 @@
+
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -42,15 +43,10 @@ impl MarketInfo {
             up_token_id: self.up_token_id.clone(),
             down_token_id: self.down_token_id.clone(),
             end_time: self.end_time,
-            ws_up_bid: None,
-            ws_up_ask: None,
-            ws_down_bid: None,
-            ws_down_ask: None,
             rest_up_bid: None,
             rest_up_ask: None,
             rest_down_bid: None,
             rest_down_ask: None,
-            last_ws_update_ms: 0,
             last_rest_update_ms: 0,
         }
     }
@@ -65,31 +61,24 @@ pub struct TradingPair {
     pub down_token_id: String,
     pub end_time: DateTime<Utc>,
 
-    // WS-provided prices
-    pub ws_up_bid: Option<Decimal>,
-    pub ws_up_ask: Option<Decimal>,
-    pub ws_down_bid: Option<Decimal>,
-    pub ws_down_ask: Option<Decimal>,
-
-    // REST-provided prices
+    // REST-provided prices (we no longer store WS prices on TradingPair)
     pub rest_up_bid: Option<Decimal>,
     pub rest_up_ask: Option<Decimal>,
     pub rest_down_bid: Option<Decimal>,
     pub rest_down_ask: Option<Decimal>,
 
-    // Timestamps for last updates from each source
-    pub last_ws_update_ms: i64,
+    // Timestamp for last REST update
     pub last_rest_update_ms: i64,
 }
 
 impl TradingPair {
-    /// Prefer WS prices if present, otherwise fall back to REST.
+    /// Since WS feed is no longer stored in TradingPair, use REST prices only.
     pub fn latest_up_ask(&self) -> Option<Decimal> {
-        self.ws_up_ask.or(self.rest_up_ask)
+        self.rest_up_ask
     }
 
     pub fn latest_down_ask(&self) -> Option<Decimal> {
-        self.ws_down_ask.or(self.rest_down_ask)
+        self.rest_down_ask
     }
 
     pub fn combined_ask(&self) -> Option<Decimal> {
@@ -101,15 +90,10 @@ impl TradingPair {
     }
 
     pub fn clear_prices(&mut self) {
-        self.ws_up_bid = None;
-        self.ws_up_ask = None;
-        self.ws_down_bid = None;
-        self.ws_down_ask = None;
         self.rest_up_bid = None;
         self.rest_up_ask = None;
         self.rest_down_bid = None;
         self.rest_down_ask = None;
-        self.last_ws_update_ms = 0;
         self.last_rest_update_ms = 0;
     }
 }
@@ -118,10 +102,9 @@ impl std::fmt::Display for TradingPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[{}]: {} WS_UP: {:?} REST_UP: {:?}",
+            "[{}]: {} REST_UP: {:?}",
             self.asset.to_uppercase(),
             self.duration,
-            self.ws_up_ask,
             self.rest_up_ask
         )
     }

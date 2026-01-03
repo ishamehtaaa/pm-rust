@@ -1,4 +1,4 @@
-use crate::models::{Side, TradingPair};
+use crate::models::Side;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -12,39 +12,33 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::connect_async;
 
 pub struct ClobFeed {
-    // token_id -> (TradingPair, Side)
-    token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPair>>, Side)>>>,
+    // token_id -> Side
+    token_map: Arc<RwLock<HashMap<String, Side>>>,
+    // Internal price storages (independent of TradingPair)
+    ws_prices: Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
+    rest_prices: Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
     ws_task: Option<JoinHandle<()>>,
     rest_task: Option<JoinHandle<()>>,
-}
+} 
 
 impl ClobFeed {
     pub fn new() -> Self {
         Self {
             token_map: Arc::new(RwLock::new(HashMap::new())),
+            ws_prices: Arc::new(RwLock::new(HashMap::new())),
+            rest_prices: Arc::new(RwLock::new(HashMap::new())),
             ws_task: None,
             rest_task: None,
         }
     }
 
-    /// Replace tracked pairs. This will be used by the bot to register current markets.
-    pub fn set_pairs(&mut self, pairs: Vec<Arc<RwLock<TradingPair>>>) {
+    /// Replace tracked tokens. This accepts (token_id, Side) pairs and will only track token IDs/sides.
+    pub fn set_pairs(&mut self, tokens: Vec<(String, Side)>) {
         let mut map = HashMap::new();
 
-        for pair in pairs {
-            let (up_token, down_token, asset) = {
-                let p = pair.read();
-                (
-                    p.up_token_id.clone(),
-                    p.down_token_id.clone(),
-                    p.asset.clone(),
-                )
-            };
-
-            map.insert(up_token.clone(), (pair.clone(), Side::Up));
-            map.insert(down_token.clone(), (pair.clone(), Side::Down));
-
-            debug!("Registered tokens for {}: UP={}, DOWN={}", asset, up_token, down_token);
+        for (token_id, side) in tokens {
+            map.insert(token_id.clone(), side);
+            debug!("Registered token {} side={:?}", token_id, side);
         }
 
         *self.token_map.write() = map;
@@ -58,15 +52,17 @@ impl ClobFeed {
         }
 
         let token_map_ws = self.token_map.clone();
+        let ws_prices = self.ws_prices.clone();
         let ws_handle = tokio::spawn(async move {
-            if let Err(e) = run_clob_ws(token_map_ws).await {
+            if let Err(e) = run_clob_ws(token_map_ws, ws_prices).await {
                 error!("CLOB WS task terminated: {}", e);
             }
         });
 
         let token_map_rest = self.token_map.clone();
+        let rest_prices = self.rest_prices.clone();
         let rest_handle = tokio::spawn(async move {
-            run_clob_rest_loop(token_map_rest).await;
+            run_clob_rest_loop(token_map_rest, rest_prices).await;
         });
 
         self.ws_task = Some(ws_handle);
@@ -102,7 +98,10 @@ impl Drop for ClobFeed {
     }
 }
 
-async fn run_clob_ws(token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPair>>, Side)>>>) -> anyhow::Result<()> {
+async fn run_clob_ws(
+    token_map: Arc<RwLock<HashMap<String, Side>>>,
+    ws_prices: Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
+) -> anyhow::Result<()> {
     // Connect to live RTDS websocket
     loop {
         debug!("Attempting RTDS WS connect to wss://ws-live-data.polymarket.com");
@@ -159,7 +158,7 @@ async fn run_clob_ws(token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPa
                                     debug!("WS subscription ack: {}", short);
                                 }
 
-                                let updates = handle_ws_price_message(&v, &token_map);
+                                let updates = handle_ws_price_message(&v, &token_map, &ws_prices);
                                 if updates == 0 {
                                     // Short preview of structure to help diagnose mismatching shapes without spamming logs
                                     let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
@@ -193,11 +192,13 @@ async fn run_clob_ws(token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPa
             }
         }
     }
-}
+} 
 
-fn handle_ws_price_message(v: &Value, token_map: &Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPair>>, Side)>>>) -> usize {
-    let ts_ms = crate::models::now_ms();
-
+fn handle_ws_price_message(
+    v: &Value,
+    token_map: &Arc<RwLock<HashMap<String, Side>>>,
+    ws_prices: &Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
+) -> usize {
     // Patterns to look for: data array, updates array, or direct object
     let mut candidates = Vec::new();
 
@@ -273,37 +274,26 @@ fn handle_ws_price_message(v: &Value, token_map: &Arc<RwLock<HashMap<String, (Ar
             }
         }
 
-        // Apply to token map
+        // Apply to token map (we no longer write into TradingPair; keep internal price cache)
         let map = token_map.read();
-        if let Some((pair, side)) = map.get(&tid) {
+        if let Some(side) = map.get(&tid) {
             matched += 1;
-            let mut p = pair.write();
-            if let Some(b) = bid_dec {
-                match side {
-                    Side::Up => p.ws_up_bid = Some(b),
-                    Side::Down => p.ws_down_bid = Some(b),
-                }
-                p.last_ws_update_ms = ts_ms;
-            }
-            if let Some(a) = ask_dec {
-                match side {
-                    Side::Up => p.ws_up_ask = Some(a),
-                    Side::Down => p.ws_down_ask = Some(a),
-                }
-                p.last_ws_update_ms = ts_ms;
-            }
+            ws_prices.write().insert(tid.clone(), (bid_dec.clone(), ask_dec.clone()));
             debug!("CLOB WS update {} side={:?} bid={:?} ask={:?}", tid, side, bid_dec, ask_dec);
         }
     }
 
     matched
-}
+} 
 
 // REST poller (runs in parallel for comparison/observability)
-async fn run_clob_rest_loop(token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPair>>, Side)>>>) {
+async fn run_clob_rest_loop(
+    token_map: Arc<RwLock<HashMap<String, Side>>>,
+    rest_prices: Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
+) {
     let client = reqwest::Client::new();
     loop {
-        if let Err(e) = run_clob_rest_once(&client, &token_map).await {
+        if let Err(e) = run_clob_rest_once(&client, &token_map, &rest_prices).await {
             error!("CLOB REST error: {}", e);
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -312,7 +302,8 @@ async fn run_clob_rest_loop(token_map: Arc<RwLock<HashMap<String, (Arc<RwLock<Tr
 
 async fn run_clob_rest_once(
     client: &reqwest::Client,
-    token_map: &Arc<RwLock<HashMap<String, (Arc<RwLock<TradingPair>>, Side)>>>,
+    token_map: &Arc<RwLock<HashMap<String, Side>>>,
+    rest_prices: &Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
 ) -> anyhow::Result<()> {
     let token_ids: Vec<String> = token_map.read().keys().cloned().collect();
 
@@ -325,16 +316,10 @@ async fn run_clob_rest_once(
     for tid in token_ids {
         if let Ok(Some((bid, ask))) = fetch_token_price(client, &tid).await {
             let map = token_map.read();
-            if let Some((pair, side)) = map.get(&tid) {
-                let mut p = pair.write();
-                match side {
-                    Side::Up => { p.rest_up_bid = Some(bid); p.rest_up_ask = Some(ask); }
-                    Side::Down => { p.rest_down_bid = Some(bid); p.rest_down_ask = Some(ask); }
-                }
-                p.last_rest_update_ms = crate::models::now_ms();
-
+            if let Some(_side) = map.get(&tid) {
+                rest_prices.write().insert(tid.clone(), (Some(bid), Some(ask)));
                 // Lower log level for frequent REST updates.
-                debug!("CLOB REST update {} side={:?} bid={} ask={}", tid, side, bid, ask);
+                debug!("CLOB REST update {} bid={} ask={}", tid, bid, ask);
             }
         }
     }
@@ -342,11 +327,11 @@ async fn run_clob_rest_once(
     Ok(())
 }
 
-async fn fetch_token_price(
+pub(crate) async fn fetch_token_price(
     client: &reqwest::Client,
     token_id: &str,
 ) -> anyhow::Result<Option<(Decimal, Decimal)>> {
-    use std::str::FromStr;
+    
 
     let host = crate::config::POLYMARKET_CLOB_HOST;
 

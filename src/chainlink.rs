@@ -3,7 +3,7 @@ use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const CHAINLINK_API: &str = "https://data.chain.link/api/query-timescale";
 

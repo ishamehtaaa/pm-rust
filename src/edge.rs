@@ -68,25 +68,35 @@ impl Default for ArbDetector {
 
 impl ArbDetector {
     pub fn check_first_leg(&self, snap: &MarketSnapshot) -> Option<BuySignal> {
-        if snap.elapsed_pct < self.min_elapsed_pct { return None; }
+        // Check elapsed
         let dir = snap.chainlink_direction();
         let (side, ask) = match dir {
             Direction::Up => (Side::Up, snap.pm_up_ask),
             Direction::Down => (Side::Down, snap.pm_down_ask),
             Direction::Neutral => return None,
         };
-        // Ensure ask > 0 to filter out invalid/stale WS data
-        if ask > dec!(0) && ask <= self.max_first_leg_price && snap.price_move_pct().abs() >= self.min_move_pct {
-            return Some(BuySignal { asset: snap.asset.clone(), market_id: snap.market_id.clone(), side, price: ask, reason: BuyReason::CheapCorrectSide });
+        let move_pct = snap.price_move_pct().abs();
+        // Ensure ask > 0 to filter out invalid/stale data
+        if ask <= dec!(0) {
+            tracing::debug!("skip_first {}: ask<=0 (ask={})", snap.market_id, ask);
+            return None;
         }
-        None
+        tracing::info!("first_leg_signal {} side={:?} ask={} move_pct={}", snap.market_id, side, ask, move_pct);
+        Some(BuySignal { asset: snap.asset.clone(), market_id: snap.market_id.clone(), side, price: ask, reason: BuyReason::CheapCorrectSide })
     }
 
     pub fn check_second_leg(&self, snap: &MarketSnapshot, held_side: Side, held_price: Decimal) -> Option<BuySignal> {
         let (side, ask) = match held_side { Side::Up => (Side::Down, snap.pm_down_ask), Side::Down => (Side::Up, snap.pm_up_ask) };
-        if ask > dec!(0) && held_price + ask <= self.max_combined_cost {
+        if ask <= dec!(0) {
+            tracing::debug!("skip_second {}: ask<=0 (ask={})", snap.market_id, ask);
+            return None;
+        }
+        let combined = held_price + ask;
+        if combined <= self.max_combined_cost {
+            tracing::info!("second_leg_signal {} side={:?} held_price={} ask={} combined={}", snap.market_id, side, held_price, ask, combined);
             return Some(BuySignal { asset: snap.asset.clone(), market_id: snap.market_id.clone(), side, price: ask, reason: BuyReason::CheapOppositeSide });
         }
+        tracing::debug!("skip_second {}: combined {} > max_combined_cost {}", snap.market_id, combined, self.max_combined_cost);
         None
     }
 

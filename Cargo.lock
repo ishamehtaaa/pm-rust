@@ -2851,8 +2851,9 @@ dependencies = [
 
 [[package]]
 name = "polymarket-client-sdk"
-version = "0.3.0"
-source = "git+https://github.com/Polymarket/rs-clob-client#3ee85c5e164b621807661c9054d8d8b60e13753f"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55c480244bf7e4234714db36541b3970d1fd1282a84c7ed3dacdb3c801cb474a"
 dependencies = [
  "alloy",
  "async-stream",
