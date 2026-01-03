@@ -1,9 +1,9 @@
 use crate::config::ASSETS_BY_PREFIX;
-use crate::models::{duration_label, MarketInfo};
+use crate::models::{MarketInfo, duration_label};
 use chrono::{DateTime, Utc};
+use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market as GammaMarket;
-use polymarket_client_sdk::gamma::Client as GammaClient;
 use std::collections::HashSet;
 use tracing::info;
 
@@ -29,17 +29,21 @@ impl MarketCache {
         }
     }
 
-    pub async fn get_markets(&self, _now: DateTime<Utc>) -> Result<Vec<MarketInfo>, MarketCacheError> {
+    pub async fn get_markets(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<MarketInfo>, MarketCacheError> {
         let raw_markets = self.fetch_raw_markets().await?;
         info!("Fetched {} raw markets from Gamma API", raw_markets.len());
 
-        let markets: Vec<MarketInfo> = raw_markets
+        let active_markets: Vec<MarketInfo> = raw_markets
             .into_iter()
             .filter_map(|m| self.convert_market(m))
+            .filter(|info| info.start_time <= now && info.end_time > now)
             .collect();
 
-        info!("Filtered to {} valid markets", markets.len());
-        Ok(markets)
+        info!("Filtered to {} valid markets", active_markets.len());
+        Ok(active_markets)
     }
 
     async fn fetch_raw_markets(&self) -> Result<Vec<GammaMarket>, MarketCacheError> {
@@ -58,7 +62,7 @@ impl MarketCache {
 
     fn convert_market(&self, m: GammaMarket) -> Option<MarketInfo> {
         let slug = m.slug.as_deref()?;
-         
+
         if !is_15m_market(slug) {
             return None;
         }
@@ -83,15 +87,21 @@ impl MarketCache {
         }
 
         let up_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("up"))?;
-        let down_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))?;
+        let down_idx = outcomes
+            .iter()
+            .position(|o| o.eq_ignore_ascii_case("down"))?;
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;
 
         let duration = duration_label(end_time - start_time);
 
+        // Extract condition_id - this is what the CLOB/WS API uses
+        let condition_id = m.condition_id.clone()?;
+
         Some(MarketInfo {
             id: m.id,
+            condition_id,
             slug: slug.to_string(),
             asset: asset_info.asset.clone(),
             binance_symbol: asset_info.binance.clone(),
@@ -103,14 +113,13 @@ impl MarketCache {
         })
     }
 
-
-
-    pub async fn fetch_market_by_id(&self, market_id: &str) -> Result<Option<GammaMarket>, MarketCacheError> {
+    pub async fn fetch_market_by_id(
+        &self,
+        market_id: &str,
+    ) -> Result<Option<GammaMarket>, MarketCacheError> {
         use polymarket_client_sdk::gamma::types::request::MarketByIdRequest;
-        
-        let request = MarketByIdRequest::builder()
-            .id(market_id)
-            .build();
+
+        let request = MarketByIdRequest::builder().id(market_id).build();
 
         match self.client.market_by_id(&request).await {
             Ok(market) => Ok(Some(market)),
@@ -126,7 +135,6 @@ impl MarketCache {
     }
 }
 
-
 fn is_15m_market(slug: &str) -> bool {
     // Match pattern: {asset}-updown-15m-{number}
     let parts: Vec<&str> = slug.split('-').collect();
@@ -135,8 +143,6 @@ fn is_15m_market(slug: &str) -> bool {
     }
     parts.get(1) == Some(&"updown") && parts.get(2) == Some(&"15m")
 }
-
-
 
 #[cfg(test)]
 mod tests {

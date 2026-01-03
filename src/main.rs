@@ -1,98 +1,71 @@
-use clap::{Parser, ValueEnum};
-use polymarket::bot::HighFreqArbBot;
+use clap::Parser;
 use polymarket::config::Config;
 use polymarket::legging::LeggingBot;
-use tracing_subscriber::{fmt, EnvFilter};
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Strategy {
-    /// Legacy bot based on Chainlink + window open price.
-    Arb,
-    /// Buy both sides when combined ask < 1.00 (configurable).
-    Legging,
-}
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
-#[command(about = "Polymarket arbitrage bot")]
+#[command(about = "Polymarket high-frequency legging bot")]
 struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
     #[arg(long, help = "Run in dry-run mode (no real orders)")]
     dry_run: bool,
-
-    #[arg(long, value_enum, default_value_t = Strategy::Legging)]
-    strategy: Strategy,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    // Initialize logging with tracing-subscriber
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     fmt().with_env_filter(filter).init();
 
+    // Load configuration from environment
     let mut config = Config::from_env()?;
-    // Command-line flag takes precedence: set dry_run directly from args.
-    config.dry_run = args.dry_run;
+
+    // Command-line flag takes precedence for dry-run mode
+    if args.dry_run {
+        config.dry_run = true;
+    }
 
     tracing::info!(
-        "Starting Polymarket bot (strategy={:?}, dry_run={}, targets={:?})",
-        args.strategy,
+        "Starting Powerful Polymarket Bot (dry_run={}, targets={:?})",
         config.dry_run,
         config.target_assets
     );
 
-    match args.strategy {
-        Strategy::Legging => {
-            let mut bot = LeggingBot::new(config).await?;
-            bot.discover_markets().await;
+    // Initialize the bot
+    let mut bot = LeggingBot::new(config).await?;
 
-            if bot.market_count() == 0 {
-                tracing::warn!("No markets discovered, will retry in main loop");
-            }
+    // Discover initial markets
+    bot.discover_markets().await;
 
-            for (market_id, state) in bot.markets() {
-                let pair = state.pair.read();
-                tracing::info!(
-                    "Market: {} | {} | {} | up={} down={}",
-                    state.info.asset,
-                    state.info.duration,
-                    market_id,
-                    pair.up_token_id,
-                    pair.down_token_id
-                );
-            }
-
-            bot.run().await;
-        }
-        Strategy::Arb => {
-            let mut bot = HighFreqArbBot::new(config).await?;
-
-            bot.discover_markets().await;
-
-            if bot.market_count() == 0 {
-                tracing::warn!("No markets discovered, will retry in main loop");
-            }
-
-            for (market_id, state) in bot.markets() {
-                let pair = state.pair.read();
-                tracing::info!(
-                    "Market: {} | {} | {} | up={} down={}",
-                    state.info.asset,
-                    state.info.duration,
-                    market_id,
-                    pair.up_token_id,
-                    pair.down_token_id
-                );
-            }
-
-            bot.run().await;
-        }
+    if bot.market_count() == 0 {
+        tracing::warn!(
+            "No active markets discovered during startup. Will keep searching in the background."
+        );
     }
+
+    // Log the initial state of discovered markets
+    for (market_id, state) in bot.markets() {
+        tracing::info!(
+            "Monitored Market: {} | {} | Asset: {} | End: {}",
+            market_id,
+            state.info.slug,
+            state.info.asset,
+            state.info.end_time
+        );
+    }
+
+    // Start the high-frequency trading loop
+    // This calls the scan_markets method and manages the WS/REST event loop
+    bot.run().await;
 
     Ok(())
 }

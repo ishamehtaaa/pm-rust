@@ -1,9 +1,8 @@
-
 use chrono::{DateTime, TimeDelta, Utc};
+use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
@@ -24,6 +23,7 @@ pub enum Phase {
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     pub id: String,
+    pub condition_id: String,  // The hex condition ID used by CLOB/WS
     pub slug: String,
     pub asset: String,
     pub binance_symbol: String,
