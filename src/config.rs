@@ -80,7 +80,7 @@ impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
             // If down_ask = 0.82, we bid up @ 0.16 (combined = 0.98)
-            target_combined: dec!(0.98),
+            target_combined: dec!(0.97),
 
             // When completing second leg, add this to the ask
             taker_buffer: dec!(0.01),
@@ -89,10 +89,10 @@ impl Default for LeggingConfig {
             requote_threshold: dec!(0.01),
 
             // Size per order
-            shares_per_trade: dec!(25.0),
+            shares_per_trade: dec!(10.0),
 
             // Stop posting new quotes after this exposure
-            target_shares_per_market: dec!(100.0),
+            target_shares_per_market: dec!(50.0),
         }
     }
 }
@@ -118,26 +118,7 @@ impl Config {
         let polymarket_proxy_address =
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
-        // Allow overriding target_combined via env
         let mut legging_config = LeggingConfig::default();
-
-        if let Ok(tc) = std::env::var("TARGET_COMBINED") {
-            if let Ok(v) = tc.parse::<Decimal>() {
-                legging_config.target_combined = v;
-            }
-        }
-
-        if let Ok(spt) = std::env::var("SHARES_PER_TRADE") {
-            if let Ok(v) = spt.parse::<Decimal>() {
-                legging_config.shares_per_trade = v;
-            }
-        }
-
-        if let Ok(tspm) = std::env::var("TARGET_SHARES_PER_MARKET") {
-            if let Ok(v) = tspm.parse::<Decimal>() {
-                legging_config.target_shares_per_market = v;
-            }
-        }
 
         Ok(Self {
             dry_run,

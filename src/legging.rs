@@ -69,15 +69,6 @@ pub enum LegSide {
     Down,
 }
 
-impl LegSide {
-    fn opposite(&self) -> LegSide {
-        match self {
-            LegSide::Up => LegSide::Down,
-            LegSide::Down => LegSide::Up,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RestingOrder {
     pub order_id: String,
@@ -142,6 +133,22 @@ impl MarketInventory {
 
     pub fn total_shares(&self) -> Decimal {
         self.up_shares.min(self.down_shares)
+    }
+
+    pub fn avg_up_price(&self) -> Option<Decimal> {
+        if self.up_shares > Decimal::ZERO {
+            Some(self.up_cost_basis / self.up_shares)
+        } else {
+            None
+        }
+    }
+
+    pub fn avg_down_price(&self) -> Option<Decimal> {
+        if self.down_shares > Decimal::ZERO {
+            Some(self.down_cost_basis / self.down_shares)
+        } else {
+            None
+        }
     }
 
     pub fn add_buy(&mut self, side: LegSide, size: Decimal, price: Decimal) {
@@ -297,9 +304,12 @@ impl LeggingBot {
             let inventory = inv.get(market_id);
             let quotes = self.market_quotes.get(market_id);
 
-            let (up_shares, down_shares) = inventory
-                .map(|i| (i.up_shares, i.down_shares))
-                .unwrap_or((dec!(0), dec!(0)));
+            let (up_shares, down_shares, up_avg, down_avg) = inventory
+                .map(|i| (i.up_shares, i.down_shares, i.avg_up_price(), i.avg_down_price()))
+                .unwrap_or((dec!(0), dec!(0), None, None));
+
+            let pairs = up_shares.min(down_shares);
+            let imbalance = up_shares - down_shares;
 
             let (up_bid, down_bid) = quotes
                 .map(|q| {
@@ -314,16 +324,34 @@ impl LeggingBot {
             let up_ask = cache.get(&state.info.up_token_id).map(|(_, a, _)| *a);
             let down_ask = cache.get(&state.info.down_token_id).map(|(_, a, _)| *a);
 
-            info!(
-                "[{}] inv: {}↑ {}↓ | bids: {:?}↑ {:?}↓ | asks: {:?}↑ {:?}↓",
-                state.info.asset,
-                up_shares,
-                down_shares,
-                up_bid,
-                down_bid,
-                up_ask,
-                down_ask
-            );
+            // Calculate P&L: pairs are worth $1 each, cost is up_cost_basis + down_cost_basis for paired shares
+            let pnl = if pairs > dec!(0) {
+                let up_cost = up_avg.unwrap_or(dec!(0)) * pairs;
+                let down_cost = down_avg.unwrap_or(dec!(0)) * pairs;
+                pairs - (up_cost + down_cost)
+            } else {
+                dec!(0)
+            };
+
+            // Format status line
+            if imbalance.abs() > dec!(1) {
+                // Highlight imbalance
+                info!(
+                    "[{}] {}↑ {}↓ | IMB: {} | pairs: {} | P&L: ${:.2} | bids: {:?}↑ {:?}↓",
+                    state.info.asset,
+                    up_shares, down_shares,
+                    imbalance, pairs, pnl,
+                    up_bid, down_bid,
+                );
+            } else {
+                info!(
+                    "[{}] {}↑ {}↓ | pairs: {} | P&L: ${:.2} | bids: {:?}↑ {:?}↓",
+                    state.info.asset,
+                    up_shares, down_shares,
+                    pairs, pnl,
+                    up_bid, down_bid,
+                );
+            }
         }
     }
 
@@ -516,10 +544,9 @@ impl LeggingBot {
                                             let size_matched = o.size_matched.unwrap_or_default();
                                             
                                             info!(
-                                                "ORDER EVENT: type={} side={:?} price={} size_matched={}",
-                                                 msg_type, o.side, o.price, size_matched
+                                                "ORDER EVENT: id={} type={} side={:?} price={} size_matched={} market={} asset_id={}",
+                                                o.id, msg_type, o.side, o.price, size_matched, o.market, o.asset_id
                                             );
-                                            debug!("Order event for ID: {}", o.id);
                                             
                                             // Determine leg side from asset_id
                                             let leg_side = if let Some((up_token, down_token)) = trade_tokens.get(&o.market) {
@@ -528,16 +555,30 @@ impl LeggingBot {
                                                 } else if o.asset_id == *down_token {
                                                     LegSide::Down
                                                 } else {
+                                                    info!(
+                                                        "ORDER SKIP: asset_id '{}' not in tokens (up={}, down={})",
+                                                        o.asset_id, up_token, down_token
+                                                    );
                                                     continue;
                                                 }
                                             } else {
+                                                info!(
+                                                    "ORDER SKIP: market '{}' not in trade_tokens. Keys: {:?}",
+                                                    o.market, trade_tokens.keys().collect::<Vec<_>>()
+                                                );
                                                 continue;
                                             };
                                             
                                             // Convert condition_id to numeric ID
                                             let numeric_id = match trade_condition_to_id.get(&o.market) {
                                                 Some(id) => id.clone(),
-                                                None => continue,
+                                                None => {
+                                                    warn!(
+                                                        "ORDER: Unknown condition_id '{}', known: {:?}",
+                                                        o.market, trade_condition_to_id.keys().collect::<Vec<_>>()
+                                                    );
+                                                    continue;
+                                                }
                                             };
                                             
                                             // Parse price and size_matched
@@ -549,13 +590,18 @@ impl LeggingBot {
                                             
                                             let order_event = OrderEvent {
                                                 order_id: o.id.clone(),
-                                                market_id: numeric_id,
+                                                market_id: numeric_id.clone(),
                                                 token_id: o.asset_id.clone(),
                                                 side: leg_side,
                                                 price: price_dec,
                                                 size_matched: size_matched_dec,
-                                                msg_type,
+                                                msg_type: msg_type.clone(),
                                             };
+                                            
+                                            info!(
+                                                "Sending OrderEvent to channel: market={} side={:?} size_matched={}",
+                                                numeric_id, leg_side, size_matched_dec
+                                            );
                                             
                                             if trade_order_tx.send(order_event).await.is_err() {
                                                 warn!("Order event channel closed");
@@ -595,66 +641,135 @@ impl LeggingBot {
     }
 
     async fn handle_order_event(&mut self, event: OrderEvent) {
-        // Find the order in our quotes
-        let quotes = match self.market_quotes.get_mut(&event.market_id) {
-            Some(q) => q,
-            None => return,  // Unknown market
+        info!(
+            ">>> handle_order_event: id={} market={} side={:?} type={} size_matched={}",
+            event.order_id, event.market_id, event.side, event.msg_type, event.size_matched
+        );
+        
+        let market_id = event.market_id.clone();
+        let order_id = event.order_id.clone();
+        let side = event.side;
+        let price = event.price;
+        let new_filled = event.size_matched;
+        let msg_type = event.msg_type.clone();
+
+        // Find the order in our quotes and get previous fill state
+        let (found_in_quotes, prev_filled) = {
+            let quotes = match self.market_quotes.get(&market_id) {
+                Some(q) => q,
+                None => {
+                    // Unknown market - but if there's a fill, we should still track it
+                    info!(
+                        "Market {} not in quotes (msg_type={}, size_matched={})",
+                        market_id, msg_type, new_filled
+                    );
+                    if msg_type == "UPDATE" && new_filled > Decimal::ZERO {
+                        info!(
+                            "FILL (untracked order): {} {:?} @ {} (size_matched={})",
+                            new_filled, side, price, new_filled
+                        );
+                        let mut inv = self.ws_inventory.write();
+                        let entry = inv.entry(market_id.clone()).or_default();
+                        entry.add_buy(side, new_filled, price);
+                        info!(
+                            "Inventory updated: {}↑ {}↓",
+                            entry.up_shares, entry.down_shares
+                        );
+                        
+                        // Check for rebalancing
+                        drop(inv);
+                        let imbalance = {
+                            let inv = self.ws_inventory.read();
+                            inv.get(&market_id).map(|i| i.imbalance()).unwrap_or(dec!(0))
+                        };
+                        if imbalance.abs() >= dec!(1.0) {
+                            info!("Imbalance {} in market {}, completing opposite leg", imbalance, market_id);
+                            self.complete_second_leg(&market_id, imbalance).await;
+                        }
+                    }
+                    return;
+                }
+            };
+            
+            // Check if this order is in our tracked quotes
+            let order_match = if let Some(ref o) = quotes.up_order {
+                if o.order_id == order_id { Some((true, o.filled)) } else { None }
+            } else {
+                None
+            }.or_else(|| {
+                if let Some(ref o) = quotes.down_order {
+                    if o.order_id == order_id { Some((true, o.filled)) } else { None }
+                } else {
+                    None
+                }
+            });
+            
+            match order_match {
+                Some((found, filled)) => (found, filled),
+                None => (false, Decimal::ZERO),
+            }
         };
 
-        // Find order by ID
-        let (order, side) = match quotes.find_order_mut(&event.order_id) {
-            Some(found) => found,
-            None => return,  // Not our order or already cleared
-        };
-
-        match event.msg_type.as_str() {
+        match msg_type.as_str() {
             "PLACEMENT" => {
-                debug!("Order {} confirmed on book", event.order_id);
+                debug!("Order {} confirmed on book", order_id);
             }
             "CANCELLATION" => {
-                info!("Order {} was cancelled, clearing", event.order_id);
-                quotes.clear_order(event.side);
+                if found_in_quotes {
+                    info!("Order {} was cancelled, clearing", order_id);
+                    if let Some(quotes) = self.market_quotes.get_mut(&market_id) {
+                        quotes.clear_order(side);
+                    }
+                }
             }
             "UPDATE" | _ => {
-                // Check size_matched for fills
-                let new_filled = event.size_matched;
-                if new_filled > order.filled {
-                    let fill_amount = new_filled - order.filled;
-                    let market_id = event.market_id.clone();
-                    let price = event.price;
+                // Process fills
+                if new_filled > Decimal::ZERO && new_filled > prev_filled {
+                    let fill_amount = new_filled - prev_filled;
 
                     info!(
-                        "FILL via ORDER UPDATE: {} {:?} @ {} (total filled: {}/{})",
-                        fill_amount, side, price, new_filled, order.size
+                        "FILL via ORDER UPDATE: {} {:?} @ {} (total: {}, prev: {})",
+                        fill_amount, side, price, new_filled, prev_filled
                     );
-
-                    // Update our tracked fill
-                    order.filled = new_filled;
 
                     // Update inventory
                     {
                         let mut inv = self.ws_inventory.write();
                         let entry = inv.entry(market_id.clone()).or_default();
                         entry.add_buy(side, fill_amount, price);
-
                         info!(
                             "Inventory updated: {}↑ {}↓",
                             entry.up_shares, entry.down_shares
                         );
                     }
 
-                    // If fully filled, clear the order
-                    if order.is_fully_filled() {
-                        info!("Order {} fully filled", event.order_id);
-                        quotes.clear_order(side);
+                    // Update our tracked order
+                    if let Some(quotes) = self.market_quotes.get_mut(&market_id) {
+                        let order_opt = match side {
+                            LegSide::Up => &mut quotes.up_order,
+                            LegSide::Down => &mut quotes.down_order,
+                        };
+                        
+                        if let Some(order) = order_opt {
+                            if order.order_id == order_id {
+                                order.filled = new_filled;
+                                if order.is_fully_filled() {
+                                    info!("Order {} fully filled", order_id);
+                                }
+                            }
+                        }
+                        
+                        // Clear if fully filled
+                        let should_clear = order_opt.as_ref().map(|o| o.is_fully_filled()).unwrap_or(false);
+                        if should_clear {
+                            *order_opt = None;
+                        }
                     }
 
                     // Check if we need to complete the other leg
                     let imbalance = {
                         let inv = self.ws_inventory.read();
-                        inv.get(&market_id)
-                            .map(|i| i.imbalance())
-                            .unwrap_or(dec!(0))
+                        inv.get(&market_id).map(|i| i.imbalance()).unwrap_or(dec!(0))
                     };
 
                     if imbalance.abs() >= dec!(1.0) {
@@ -670,8 +785,10 @@ impl LeggingBot {
     }
 
     async fn complete_second_leg(&mut self, market_id: &str, imbalance: Decimal) {
-        // Extract data upfront to avoid borrow conflicts
-        let (up_token_id, down_token_id, taker_buffer) = {
+        let target_combined = self.config.legging_config.target_combined;
+
+        // Extract token IDs
+        let (up_token_id, down_token_id) = {
             let state = match self.markets.get(market_id) {
                 Some(s) => s,
                 None => return,
@@ -679,42 +796,84 @@ impl LeggingBot {
             (
                 state.info.up_token_id.clone(),
                 state.info.down_token_id.clone(),
-                self.config.legging_config.taker_buffer,
             )
         };
 
-        let (token_id, side) = if imbalance > dec!(0) {
-            (down_token_id, LegSide::Down)
-        } else {
-            (up_token_id, LegSide::Up)
+        // Determine which side we need and get avg price of the excess side
+        let (token_id, side, avg_first_leg_price) = {
+            let inv = self.ws_inventory.read();
+            let inventory = match inv.get(market_id) {
+                Some(i) => i,
+                None => return,
+            };
+
+            if imbalance > dec!(0) {
+                // More Up than Down - need to buy Down
+                let avg = inventory.avg_up_price().unwrap_or(dec!(0.50));
+                (down_token_id, LegSide::Down, avg)
+            } else {
+                // More Down than Up - need to buy Up
+                let avg = inventory.avg_down_price().unwrap_or(dec!(0.50));
+                (up_token_id, LegSide::Up, avg)
+            }
         };
 
-        // Round size to whole number for taker orders (ensures price*size has max 2 decimals)
+        // Calculate max taker price that keeps us profitable
+        // If first leg avg = 0.18, max second leg = 0.98 - 0.18 = 0.80
+        let max_taker_price = target_combined - avg_first_leg_price;
+
+        // Round size to whole number for taker orders
         let size = round_size_for_taker(imbalance.abs());
 
-        // Skip if below minimum order size
         if size < MIN_ORDER_SIZE {
             debug!(
-                "Imbalance {} rounds to {} which is below minimum {}, skipping second leg",
+                "Imbalance {} rounds to {} which is below minimum {}, skipping",
                 imbalance, size, MIN_ORDER_SIZE
             );
             return;
         }
 
-        let ask = {
+        // Get current ask
+        let current_ask = {
             let cache = self.ws_price_cache.read();
-            cache.get(&token_id).map(|(_, a, _)| *a)
-        };
-
-        let price = match ask {
-            Some(a) => clamp_price(a + taker_buffer),
-            None => {
-                warn!("No ask price for {}, cannot complete leg", token_id);
-                return;
+            match cache.get(&token_id) {
+                Some((_, a, _)) => *a,
+                None => {
+                    warn!("No ask price for {:?}, cannot complete leg", side);
+                    return;
+                }
             }
         };
 
-        info!("Completing {:?} leg: {} @ {} (taker)", side, size, price);
+        // STRICT PROFITABILITY CHECK
+        // Only take if we can make a profit
+        if current_ask > max_taker_price {
+            info!(
+                "SKIP TAKER: {:?} ask {} > max {} (first leg: {}, would be combined: {})",
+                side, current_ask, max_taker_price, avg_first_leg_price,
+                avg_first_leg_price + current_ask
+            );
+            // Don't take at a loss - we'll get filled by maker orders instead
+            return;
+        }
+
+        let taker_price = clamp_price(current_ask + dec!(0.01)); // Just above ask
+        let combined = avg_first_leg_price + taker_price;
+        let profit_per_share = dec!(1.0) - combined;
+
+        // Double-check profitability with actual taker price
+        if profit_per_share < dec!(0.01) {
+            info!(
+                "SKIP TAKER: profit {} too low (combined: {}, first: {}, taker: {})",
+                profit_per_share, combined, avg_first_leg_price, taker_price
+            );
+            return;
+        }
+
+        info!(
+            "TAKING {:?}: {} @ {} | first_leg: {} | combined: {} | profit: {}",
+            side, size, taker_price, avg_first_leg_price, combined, profit_per_share
+        );
 
         // Cancel our resting order on this side first
         if let Some(quotes) = self.market_quotes.get_mut(market_id) {
@@ -727,7 +886,24 @@ impl LeggingBot {
             }
         }
 
-        self.post_taker_order(&token_id, price, size, market_id).await;
+        // Post taker order
+        let fill_result = self.post_taker_order(&token_id, taker_price, size, market_id).await;
+        
+        // Update inventory ONLY if taker succeeded
+        if fill_result.is_some() {
+            let mut inv = self.ws_inventory.write();
+            let entry = inv.entry(market_id.to_string()).or_default();
+            entry.add_buy(side, size, taker_price);
+            
+            let pairs = entry.total_shares();
+            let imb = entry.imbalance();
+            info!(
+                "TAKER FILLED: {}↑ {}↓ | pairs: {} | imbalance: {}",
+                entry.up_shares, entry.down_shares, pairs, imb
+            );
+        } else {
+            info!("Taker failed for {:?}, will retry via maker bids", side);
+        }
     }
 
     async fn maintain_all_quotes(&mut self) {
@@ -755,12 +931,16 @@ impl LeggingBot {
             )
         };
 
-        let current_exposure = {
+        // Get inventory state
+        let (up_shares, down_shares, imbalance) = {
             let inv = self.ws_inventory.read();
-            inv.get(market_id)
-                .map(|i| i.up_shares.max(i.down_shares))
-                .unwrap_or(dec!(0))
+            match inv.get(market_id) {
+                Some(i) => (i.up_shares, i.down_shares, i.imbalance()),
+                None => (dec!(0), dec!(0), dec!(0)),
+            }
         };
+
+        let current_exposure = up_shares.max(down_shares);
 
         if current_exposure >= target_shares {
             self.cancel_market_quotes(market_id).await;
@@ -777,12 +957,11 @@ impl LeggingBot {
             }
         };
 
-        // If down_ask = 0.82 and target_combined = 0.98, then up_bid = 0.16
+        // Calculate target bid prices
         let up_bid_target = target_combined - down_ask;
         let down_bid_target = target_combined - up_ask;
         let size = shares_per_trade.min(target_shares - current_exposure);
 
-        // Don't post if remaining capacity is below minimum
         if size < MIN_ORDER_SIZE {
             debug!(
                 "Remaining capacity {} < {} for {}, skipping new quotes",
@@ -791,8 +970,26 @@ impl LeggingBot {
             return;
         }
 
-        self.update_quote(market_id, LegSide::Up, &up_token_id, up_bid_target, size).await;
-        self.update_quote(market_id, LegSide::Down, &down_token_id, down_bid_target, size).await;
+        // IMBALANCE-AWARE QUOTING:
+        // If imbalanced, only bid on the side we need to rebalance
+        // This prevents building up more imbalance
+        let imbalance_threshold = dec!(5.0);
+
+        if imbalance > imbalance_threshold {
+            // We have more Up than Down - only bid on Down
+            debug!("Imbalance +{}: only bidding Down for {}", imbalance, market_id);
+            self.cancel_quote(market_id, LegSide::Up).await;
+            self.update_quote(market_id, LegSide::Down, &down_token_id, down_bid_target, size).await;
+        } else if imbalance < -imbalance_threshold {
+            // We have more Down than Up - only bid on Up
+            debug!("Imbalance {}: only bidding Up for {}", imbalance, market_id);
+            self.cancel_quote(market_id, LegSide::Down).await;
+            self.update_quote(market_id, LegSide::Up, &up_token_id, up_bid_target, size).await;
+        } else {
+            // Balanced - bid on both sides
+            self.update_quote(market_id, LegSide::Up, &up_token_id, up_bid_target, size).await;
+            self.update_quote(market_id, LegSide::Down, &down_token_id, down_bid_target, size).await;
+        }
     }
 
     async fn update_quote(
@@ -866,7 +1063,7 @@ impl LeggingBot {
 
                 info!(
                     "Posted {:?} bid @ {} for {}",
-                    side, target_price, market_id 
+                    side, target_price, market_id
                 );
             }
             None => {
@@ -921,7 +1118,9 @@ impl LeggingBot {
             return Some(format!("dry-{}", Utc::now().timestamp_millis()));
         }
 
-        let size_poly = PolyDecimal::try_from(size.to_string().as_str()).ok()?;
+
+        /* Round the size and then convert it to a polydecimal. */
+        let size_poly = PolyDecimal::try_from(round_size(size).to_string().as_str()).ok()?;
         let price_poly = PolyDecimal::try_from(price.to_string().as_str()).ok()?;
 
         match self
@@ -931,7 +1130,7 @@ impl LeggingBot {
             .price(price_poly)
             .size(size_poly)
             .side(ClobSide::Buy)
-            .order_type(OrderType::GTC) // Good Till Cancel - resting order
+            .order_type(OrderType::GTC) /* good till cancelled. */
             .build()
             .await
         {
