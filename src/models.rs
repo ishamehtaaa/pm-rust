@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
@@ -20,18 +20,57 @@ pub enum Phase {
     Closed,
 }
 
+/// All identifiers for a single binary market.
+/// Polymarket uses different IDs in different API contexts.
+#[derive(Debug, Clone)]
+pub struct MarketIds {
+    /// Numeric ID from Gamma API (e.g., "12345").
+    /// Used for: internal tracking, some REST endpoints.
+    pub gamma_id: String,
+
+    /// Hex condition ID (e.g., "0xabc123...").
+    /// Used for: WebSocket subscriptions, CLOB market identification.
+    pub condition_id: String,
+
+    /// CLOB token ID for the "Up" outcome.
+    pub up_token: String,
+
+    /// CLOB token ID for the "Down" outcome.
+    pub down_token: String,
+}
+
+impl MarketIds {
+    pub fn token_for_side(&self, side: Side) -> &str {
+        match side {
+            Side::Up => &self.up_token,
+            Side::Down => &self.down_token,
+        }
+    }
+
+    pub fn side_for_token(&self, token_id: &str) -> Option<Side> {
+        if token_id == self.up_token {
+            Some(Side::Up)
+        } else if token_id == self.down_token {
+            Some(Side::Down)
+        } else {
+            None
+        }
+    }
+
+    pub fn both_tokens(&self) -> [&str; 2] {
+        [&self.up_token, &self.down_token]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
-    pub id: String,
-    pub condition_id: String,  // The hex condition ID used by CLOB/WS
+    pub ids: MarketIds,
     pub slug: String,
     pub asset: String,
     pub binance_symbol: String,
     pub duration: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
-    pub up_token_id: String,
-    pub down_token_id: String,
 }
 
 impl MarketInfo {
@@ -39,9 +78,9 @@ impl MarketInfo {
         TradingPair {
             asset: self.asset.clone(),
             duration: self.duration.clone(),
-            market_id: self.id.clone(),
-            up_token_id: self.up_token_id.clone(),
-            down_token_id: self.down_token_id.clone(),
+            gamma_id: self.ids.gamma_id.clone(),
+            up_token_id: self.ids.up_token.clone(),
+            down_token_id: self.ids.down_token.clone(),
             end_time: self.end_time,
             rest_up_bid: None,
             rest_up_ask: None,
@@ -56,23 +95,19 @@ impl MarketInfo {
 pub struct TradingPair {
     pub asset: String,
     pub duration: String,
-    pub market_id: String,
+    pub gamma_id: String,
     pub up_token_id: String,
     pub down_token_id: String,
     pub end_time: DateTime<Utc>,
 
-    // REST-provided prices (we no longer store WS prices on TradingPair)
     pub rest_up_bid: Option<Decimal>,
     pub rest_up_ask: Option<Decimal>,
     pub rest_down_bid: Option<Decimal>,
     pub rest_down_ask: Option<Decimal>,
-
-    // Timestamp for last REST update
     pub last_rest_update_ms: i64,
 }
 
 impl TradingPair {
-    /// Since WS feed is no longer stored in TradingPair, use REST prices only.
     pub fn latest_up_ask(&self) -> Option<Decimal> {
         self.rest_up_ask
     }
@@ -151,6 +186,201 @@ impl MarketState {
         } else {
             Phase::Midgame
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MarketQuotes {
+    pub up_orders: Vec<RestingOrder>,
+    pub down_orders: Vec<RestingOrder>,
+}
+
+impl MarketQuotes {
+    /// All orders for a given side (read-only)
+    pub fn side_orders(&self, side: Side) -> &Vec<RestingOrder> {
+        match side {
+            Side::Up => &self.up_orders,
+            Side::Down => &self.down_orders,
+        }
+    }
+
+    /// All orders for a given side (mutable)
+    pub fn side_orders_mut(&mut self, side: Side) -> &mut Vec<RestingOrder> {
+        match side {
+            Side::Up => &mut self.up_orders,
+            Side::Down => &mut self.down_orders,
+        }
+    }
+
+    /// Best (highest price) order on a side – keeps `log_status` working.
+    pub fn order_for_side(&self, side: Side) -> Option<&RestingOrder> {
+        self.side_orders(side)
+            .iter()
+            .max_by(|a, b| a.price.cmp(&b.price))
+    }
+
+    /// Find an order by id (read-only)
+    pub fn find_order_by_id(&self, order_id: &str) -> Option<(&RestingOrder, Side)> {
+        for o in &self.up_orders {
+            if o.order_id == order_id {
+                return Some((o, Side::Up));
+            }
+        }
+        for o in &self.down_orders {
+            if o.order_id == order_id {
+                return Some((o, Side::Down));
+            }
+        }
+        None
+    }
+
+    /// Find an order by id (mutable)
+    pub fn find_order_mut_by_id(&mut self, order_id: &str) -> Option<(&mut RestingOrder, Side)> {
+        for o in &mut self.up_orders {
+            if o.order_id == order_id {
+                return Some((o, Side::Up));
+            }
+        }
+        for o in &mut self.down_orders {
+            if o.order_id == order_id {
+                return Some((o, Side::Down));
+            }
+        }
+        None
+    }
+
+    /// Remove a specific order by id
+    pub fn clear_order_by_id(&mut self, order_id: &str) {
+        self.up_orders.retain(|o| o.order_id != order_id);
+        self.down_orders.retain(|o| o.order_id != order_id);
+    }
+}
+
+
+
+#[derive(Debug, Clone)]
+pub struct OrderEvent {
+    pub order_id: String,
+    pub gamma_id: String,
+    pub token_id: String,
+    pub side: Side,
+    pub price: Decimal,
+    pub size_matched: Decimal,
+    pub msg_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestingOrder {
+    pub order_id: String,
+    pub token_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub filled: Decimal,
+    pub posted_at: Instant,
+    pub second_leg: Option<SecondLegParams>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecondLegParams {
+    pub token_id: String,
+    pub side: Side,
+    pub max_price: Decimal,
+}
+
+impl RestingOrder {
+    pub fn remaining(&self) -> Decimal {
+        (self.size - self.filled).max(Decimal::ZERO)
+    }
+
+    pub fn is_fully_filled(&self) -> bool {
+        self.filled >= self.size
+    }
+}
+
+
+#[derive(Debug, Clone, Default)]
+pub struct MarketInventory {
+    pub up_shares: Decimal,
+    pub down_shares: Decimal,
+    pub up_cost_basis: Decimal,
+    pub down_cost_basis: Decimal,
+}
+
+impl MarketInventory {
+    pub fn imbalance(&self) -> Decimal {
+        self.up_shares - self.down_shares
+    }
+
+    pub fn total_pairs(&self) -> Decimal {
+        self.up_shares.min(self.down_shares)
+    }
+
+    pub fn avg_price(&self, side: Side) -> Option<Decimal> {
+        let (shares, cost) = match side {
+            Side::Up => (self.up_shares, self.up_cost_basis),
+            Side::Down => (self.down_shares, self.down_cost_basis),
+        };
+        if shares > Decimal::ZERO {
+            Some(cost / shares)
+        } else {
+            None
+        }
+    }
+
+    pub fn add_buy(&mut self, side: Side, size: Decimal, price: Decimal) {
+        match side {
+            Side::Up => {
+                self.up_shares += size;
+                self.up_cost_basis += price * size;
+            }
+            Side::Down => {
+                self.down_shares += size;
+                self.down_cost_basis += price * size;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MarketLookup {
+    condition_to_gamma: HashMap<String, String>,
+    gamma_to_ids: HashMap<String, MarketIds>,
+}
+
+impl MarketLookup {
+    pub fn new(markets: &HashMap<String, MarketState>) -> Self {
+        let mut condition_to_gamma = HashMap::new();
+        let mut gamma_to_ids = HashMap::new();
+
+        for (gamma_id, state) in markets {
+            let ids = &state.info.ids;
+            condition_to_gamma.insert(ids.condition_id.clone(), gamma_id.clone());
+            gamma_to_ids.insert(gamma_id.clone(), ids.clone());
+        }
+
+        Self {
+            condition_to_gamma,
+            gamma_to_ids,
+        }
+    }
+
+    pub fn resolve_condition(&self, condition_id: &str) -> Option<&str> {
+        self.condition_to_gamma.get(condition_id).map(|s| s.as_str())
+    }
+
+    pub fn get_ids(&self, gamma_id: &str) -> Option<&MarketIds> {
+        self.gamma_to_ids.get(gamma_id)
+    }
+
+    pub fn all_tokens(&self) -> Vec<String> {
+        self.gamma_to_ids
+            .values()
+            .flat_map(|ids| vec![ids.up_token.clone(), ids.down_token.clone()])
+            .collect()
+    }
+
+    pub fn all_condition_ids(&self) -> Vec<String> {
+        self.condition_to_gamma.keys().cloned().collect()
     }
 }
 

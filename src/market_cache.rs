@@ -1,5 +1,5 @@
 use crate::config::ASSETS_BY_PREFIX;
-use crate::models::{MarketInfo, duration_label};
+use crate::models::{MarketIds, MarketInfo, duration_label};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
@@ -70,12 +70,10 @@ impl MarketCache {
         let prefix = slug.split('-').next()?.to_ascii_lowercase();
         let asset_info = ASSETS_BY_PREFIX.get(&prefix)?;
 
-        // Must be a target asset
         if !self.target_assets.contains(&asset_info.asset) {
             return None;
         }
 
-        // Parse outcomes from JSON string
         let outcomes_str = m.outcomes.as_deref()?;
         let outcomes: Vec<String> = serde_json::from_str(outcomes_str).ok()?;
 
@@ -87,29 +85,28 @@ impl MarketCache {
         }
 
         let up_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("up"))?;
-        let down_idx = outcomes
-            .iter()
-            .position(|o| o.eq_ignore_ascii_case("down"))?;
+        let down_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))?;
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;
-
         let duration = duration_label(end_time - start_time);
-
-        // Extract condition_id - this is what the CLOB/WS API uses
         let condition_id = m.condition_id.clone()?;
 
-        Some(MarketInfo {
-            id: m.id,
+        let ids = MarketIds {
+            gamma_id: m.id,
             condition_id,
+            up_token: clob_token_ids[up_idx].to_string(),
+            down_token: clob_token_ids[down_idx].to_string(),
+        };
+
+        Some(MarketInfo {
+            ids,
             slug: slug.to_string(),
             asset: asset_info.asset.clone(),
             binance_symbol: asset_info.binance.clone(),
             duration,
             start_time,
             end_time,
-            up_token_id: clob_token_ids[up_idx].to_string(),
-            down_token_id: clob_token_ids[down_idx].to_string(),
         })
     }
 
@@ -136,7 +133,6 @@ impl MarketCache {
 }
 
 fn is_15m_market(slug: &str) -> bool {
-    // Match pattern: {asset}-updown-15m-{number}
     let parts: Vec<&str> = slug.split('-').collect();
     if parts.len() < 4 {
         return false;

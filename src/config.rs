@@ -9,7 +9,8 @@ pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> = Lazy::new(|| HashSet::fr
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
-    pub asset: String,
+    /* this is the name of the asset (btc, eth) we are trading */
+    pub asset: String,  
     pub prefixes: Vec<String>,
     pub chainlink: String,
     pub binance: String,
@@ -54,7 +55,6 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
 pub static TARGET_ASSETS: Lazy<HashSet<String>> = Lazy::new(|| {
     HashSet::from([
         "bitcoin".to_string(),
-        "ethereum".to_string(),
     ])
 });
 
@@ -80,7 +80,7 @@ impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
             // If down_ask = 0.82, we bid up @ 0.16 (combined = 0.98)
-            target_combined: dec!(0.97),
+            target_combined: dec!(0.98),
 
             // When completing second leg, add this to the ask
             taker_buffer: dec!(0.01),
@@ -92,7 +92,7 @@ impl Default for LeggingConfig {
             shares_per_trade: dec!(10.0),
 
             // Stop posting new quotes after this exposure
-            target_shares_per_market: dec!(50.0),
+            target_shares_per_market: dec!(30.0),
         }
     }
 }
@@ -108,9 +108,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let dry_run = std::env::var("DRY_RUN")
-            .map(|v| v == "1" || v.to_lowercase() == "false")
-            .unwrap_or(false);
+        
+        let dry_run = false;
 
         let polymarket_private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
             .map_err(|_| anyhow::anyhow!("POLYMARKET_PRIVATE_KEY env var is required"))?;
@@ -118,7 +117,7 @@ impl Config {
         let polymarket_proxy_address =
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
-        let mut legging_config = LeggingConfig::default();
+        let legging_config = LeggingConfig::default();
 
         Ok(Self {
             dry_run,
