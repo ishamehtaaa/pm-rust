@@ -1,3 +1,5 @@
+
+
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -55,6 +57,8 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
 pub static TARGET_ASSETS: Lazy<HashSet<String>> = Lazy::new(|| {
     HashSet::from([
         "bitcoin".to_string(),
+        "solana".to_string(),
+        // "ethereum".to_string(),
     ])
 });
 
@@ -80,7 +84,7 @@ impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
             // If down_ask = 0.82, we bid up @ 0.16 (combined = 0.98)
-            target_combined: dec!(0.98),
+            target_combined: dec!(0.99),
 
             // When completing second leg, add this to the ask
             taker_buffer: dec!(0.01),
@@ -89,10 +93,10 @@ impl Default for LeggingConfig {
             requote_threshold: dec!(0.01),
 
             // Size per order
-            shares_per_trade: dec!(10.0),
+            shares_per_trade: dec!(8.0),
 
             // Stop posting new quotes after this exposure
-            target_shares_per_market: dec!(30.0),
+            target_shares_per_market: dec!(32.0),
         }
     }
 }
