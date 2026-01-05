@@ -83,6 +83,8 @@ pub fn spawn_user_events_task(
     price_tx: mpsc::Sender<PriceUpdate>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let order_channel = order_tx;
+        let fill_channel = fill_tx;
         let mut backoff = Duration::from_millis(500);
         loop {
             match client.subscribe_user_events(conditions.clone()) {
@@ -146,23 +148,28 @@ pub fn spawn_user_events_task(
                                     Err(_) => continue,
                                 };
 
-                                if let Err(err) = order_tx.try_send(OrderEvent {
-                                    order_id: o.id.clone(),
-                                    gamma_id,
-                                    token_id: o.asset_id.clone(),
-                                    side,
-                                    price,
-                                    size_matched: Decimal::from(
-                                        o.size_matched.unwrap_or_default(),
-                                    ),
-                                    msg_type: o.msg_type.clone().unwrap_or_default(),
-                                }) {
+                                let order_gamma = gamma_id.clone();
+                                if order_channel
+                                    .send(OrderEvent {
+                                        order_id: o.id.clone(),
+                                        gamma_id: order_gamma,
+                                        token_id: o.asset_id.clone(),
+                                        side,
+                                        price,
+                                        size_matched: Decimal::from(
+                                            o.size_matched.unwrap_or_default(),
+                                        ),
+                                        msg_type: o.msg_type.clone().unwrap_or_default(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
                                     warn!(
                                         order_id = %o.id,
                                         gamma_id = %gamma_id,
-                                        error = ?err,
-                                        "Dropping order event (channel full)"
+                                        "Order channel closed"
                                     );
+                                    break;
                                 }
                             }
                             Ok(WsMessage::Trade(ref t)) => {
@@ -210,22 +217,26 @@ pub fn spawn_user_events_task(
                                         continue;
                                     }
 
-                                    if let Err(err) = fill_tx.try_send(FillEvent {
-                                        trade_id: t.id.clone(),
-                                        gamma_id: gamma_id.clone(),
-                                        token_id: mo.asset_id.clone(),
-                                        order_id: mo.order_id.clone(),
-                                        side,
-                                        price,
-                                        size: matched,
-                                        is_taker,
-                                    }) {
+                                    if fill_channel
+                                        .send(FillEvent {
+                                            trade_id: t.id.clone(),
+                                            gamma_id: gamma_id.clone(),
+                                            token_id: mo.asset_id.clone(),
+                                            order_id: mo.order_id.clone(),
+                                            side,
+                                            price,
+                                            size: matched,
+                                            is_taker,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         warn!(
                                             order_id = %mo.order_id,
                                             gamma_id = %gamma_id,
-                                            error = ?err,
-                                            "Dropping fill event (channel full)"
+                                            "Fill channel closed"
                                         );
+                                        break;
                                     }
                                 }
                             }

@@ -32,6 +32,13 @@ struct Args {
         value_parser = parse_decimal
     )]
     shares_per_trade: Option<Decimal>,
+
+    #[arg(
+        long,
+        help = "Max shares (per side) allowed before the trailing side triggers rebalancing",
+        value_parser = parse_decimal
+    )]
+    max_shares_per_market: Option<Decimal>,
 }
 
 fn parse_decimal(value: &str) -> Result<Decimal, String> {
@@ -78,6 +85,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(shares_per_trade) = args.shares_per_trade {
         config.legging_config.shares_per_trade = shares_per_trade;
+    }
+
+    if let Some(max_shares_per_market) = args.max_shares_per_market {
+        config.legging_config.max_shares_per_market = max_shares_per_market;
     }
 
     tracing::info!(

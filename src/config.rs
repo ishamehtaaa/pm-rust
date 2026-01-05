@@ -2,6 +2,7 @@ use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
 
@@ -68,7 +69,7 @@ impl Default for LeggingConfig {
             taker_buffer: dec!(0.01),
             requote_threshold: dec!(0.01),
             shares_per_trade: dec!(8.0),
-            max_shares_per_market: dec!(50.0),
+            max_shares_per_market: dec!(100.0),
             max_levels: 5,
         }
     }
@@ -97,12 +98,19 @@ impl Config {
             Err(_) => HashSet::from(["bitcoin".to_string()]), // sane default
         };
 
+        let mut legging_config = LeggingConfig::default();
+        if let Ok(value) = std::env::var("POLYMARKET_MAX_SHARES_PER_MARKET") {
+            let parsed = Decimal::from_str(&value)
+                .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_MAX_SHARES_PER_MARKET: {}", e))?;
+            legging_config.max_shares_per_market = parsed;
+        }
+
         Ok(Self {
             dry_run: false,
             polymarket_private_key,
             polymarket_proxy_address,
             target_assets,
-            legging_config: LeggingConfig::default(),
+            legging_config,
         })
     }
 }
