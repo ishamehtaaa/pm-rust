@@ -1,5 +1,3 @@
-
-
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -11,8 +9,7 @@ pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> = Lazy::new(|| HashSet::fr
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
-    /* this is the name of the asset (btc, eth) we are trading */
-    pub asset: String,  
+    pub asset: String,
     pub prefixes: Vec<String>,
     pub chainlink: String,
     pub binance: String,
@@ -23,7 +20,7 @@ pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str], &str, &str)>> = Lazy::new(|| {
         ("bitcoin", &["btc", "bitcoin"], "btc/usd", "btcusdt"),
         ("ethereum", &["eth", "ethereum"], "eth/usd", "ethusdt"),
         ("solana", &["sol", "solana"], "sol/usd", "solusdt"),
-        ("xrp", &["xrp", "xrp"], "xrp/usd", "xrpusdt"),
+        ("xrp", &["xrp"], "xrp/usd", "xrpusdt"),
     ]
 });
 
@@ -54,49 +51,25 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     map
 });
 
-pub static TARGET_ASSETS: Lazy<HashSet<String>> = Lazy::new(|| {
-    HashSet::from([
-        "bitcoin".to_string(),
-        "solana".to_string(),
-        // "ethereum".to_string(),
-    ])
-});
-
 #[derive(Debug, Clone)]
 pub struct LeggingConfig {
-    /// Target combined price for Up + Down (e.g., 0.98 = 2% profit)
     pub target_combined: Decimal,
-
-    /// Buffer added to ask when completing second leg as taker
     pub taker_buffer: Decimal,
-
-    /// How much the target bid must change before we cancel and repost
     pub requote_threshold: Decimal,
-
-    /// Size per resting order
     pub shares_per_trade: Decimal,
-
-    /// Max exposure per market before pausing new quotes
-    pub target_shares_per_market: Decimal,
+    pub max_shares_per_market: Decimal,
+    pub max_levels: usize,
 }
 
 impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
-            // If down_ask = 0.82, we bid up @ 0.16 (combined = 0.98)
-            target_combined: dec!(0.99),
-
-            // When completing second leg, add this to the ask
+            target_combined: dec!(0.97),
             taker_buffer: dec!(0.01),
-
-            // Only requote if price moved more than this
             requote_threshold: dec!(0.01),
-
-            // Size per order
             shares_per_trade: dec!(8.0),
-
-            // Stop posting new quotes after this exposure
-            target_shares_per_market: dec!(32.0),
+            max_shares_per_market: dec!(50.0),
+            max_levels: 5,
         }
     }
 }
@@ -112,23 +85,46 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        
-        let dry_run = false;
-
         let polymarket_private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
             .map_err(|_| anyhow::anyhow!("POLYMARKET_PRIVATE_KEY env var is required"))?;
 
         let polymarket_proxy_address =
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
-        let legging_config = LeggingConfig::default();
+        // Optional env override: POLYMARKET_ASSETS=btc,eth
+        let target_assets = match std::env::var("POLYMARKET_ASSETS") {
+            Ok(v) => parse_assets(&v)?,
+            Err(_) => HashSet::from(["bitcoin".to_string()]), // sane default
+        };
 
         Ok(Self {
-            dry_run,
+            dry_run: false,
             polymarket_private_key,
             polymarket_proxy_address,
-            target_assets: TARGET_ASSETS.clone(),
-            legging_config,
+            target_assets,
+            legging_config: LeggingConfig::default(),
         })
     }
+}
+
+/// Normalize + validate asset list from CLI or env
+pub fn parse_assets(input: &str) -> anyhow::Result<HashSet<String>> {
+    let mut assets = HashSet::new();
+
+    for raw in input.split(',') {
+        let key = raw.trim().to_lowercase();
+
+        let info = ASSETS_BY_PREFIX
+            .get(&key)
+            .or_else(|| ASSETS_BY_NAME.get(&key))
+            .ok_or_else(|| anyhow::anyhow!("Unsupported asset: {}", raw))?;
+
+        if PAUSED_ASSETS.contains(info.asset.as_str()) {
+            anyhow::bail!("Asset is paused: {}", info.asset);
+        }
+
+        assets.insert(info.asset.clone());
+    }
+
+    Ok(assets)
 }
