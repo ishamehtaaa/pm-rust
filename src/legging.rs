@@ -21,6 +21,7 @@ use polymarket_client_sdk::types::Address;
 use polymarket_client_sdk::types::Decimal as PolyDecimal;
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -129,6 +130,7 @@ pub struct LeggingBot {
     market_cache: MarketCache,
     markets: HashMap<String, MarketState>,
     positions: HashMap<String, Position>,
+    token_to_gamma: HashMap<String, String>,
 
     // Channels
     order_rx: mpsc::Receiver<OrderEvent>,
@@ -197,6 +199,7 @@ impl LeggingBot {
             market_cache,
             markets: HashMap::new(),
             positions: HashMap::new(),
+            token_to_gamma: HashMap::new(),
             order_rx,
             order_tx,
             fill_rx,
@@ -269,22 +272,28 @@ impl LeggingBot {
     }
 
     fn handle_positions_update(&mut self, positions: Vec<PolyPosition>) {
+        let mut asset_sizes = HashMap::with_capacity(positions.len());
+        for position in positions {
+            asset_sizes
+                .entry(position.asset)
+                .and_modify(|size| *size += position.size)
+                .or_insert(position.size);
+        }
+
         for (gamma_id, pos) in self.positions.iter_mut() {
             let market = match self.markets.get(gamma_id) {
                 Some(m) => m,
                 None => continue,
             };
 
-            pos.up_shares = positions
-                .iter()
-                .find(|p| p.asset == market.info.ids.up_token)
-                .map(|p| p.size)
+            pos.up_shares = asset_sizes
+                .get(&market.info.ids.up_token)
+                .cloned()
                 .unwrap_or(Decimal::ZERO);
 
-            pos.down_shares = positions
-                .iter()
-                .find(|p| p.asset == market.info.ids.down_token)
-                .map(|p| p.size)
+            pos.down_shares = asset_sizes
+                .get(&market.info.ids.down_token)
+                .cloned()
                 .unwrap_or(Decimal::ZERO);
         }
     }
@@ -296,10 +305,12 @@ impl LeggingBot {
             let pos = self.positions.get(gamma_id).unwrap();
             let imb = pos.imbalance();
             let asset = market.info.asset.to_uppercase();
+            let progress =
+                Decimal::from_f64(market.elapsed_pct(Utc::now())).unwrap_or(Decimal::ZERO);
 
             for side in [Side::Up, Side::Down] {
                 let current: Vec<_> = pos.orders.iter().filter(|o| o.side == side).collect();
-                let ladder = self.calculate_ladder(pos, side, imb);
+                let ladder = self.calculate_ladder(pos, side, imb, progress);
 
                 let price_mismatch = !current.is_empty()
                     && !ladder.is_empty()
@@ -331,11 +342,23 @@ impl LeggingBot {
             }
         }
 
+        let asset_name = self.asset_name(gamma_id);
         for action in actions {
             match action {
                 MarketAction::CancelAll(ids) => {
                     for id in ids {
-                        let _ = self.client.cancel_order(&id).await;
+                        match self.client.cancel_order(&id).await {
+                            Ok(_) => info!(
+                                "[{}] Cancelled ladder order (order_id={})",
+                                asset_name, id
+                            ),
+                            Err(err) => tracing::warn!(
+                                "[{}] Cancel request failed (order_id={}): {}",
+                                asset_name,
+                                id,
+                                err
+                            ),
+                        }
                     }
                 }
                 MarketAction::PlaceLadder(token, side, rungs) => {
@@ -353,6 +376,7 @@ impl LeggingBot {
         pos: &Position,
         side: Side,
         imb: Decimal,
+        progress: Decimal,
     ) -> Vec<(Decimal, Decimal)> {
         let cfg = &self.config.legging_config;
         if cfg.max_levels == 0 {
@@ -364,14 +388,14 @@ impl LeggingBot {
             None => return Vec::new(),
         };
 
-        let mut remaining_capacity = self.remaining_capacity(pos, side);
+        let mut remaining_capacity = self.remaining_capacity(pos, side, imb, progress);
         if remaining_capacity < MIN_ORDER_SIZE {
             return Vec::new();
         }
 
-        let total_target = cfg
-            .shares_per_trade
-            .min(remaining_capacity.max(Decimal::ZERO));
+        let progress_factor = Decimal::ONE + progress.min(Decimal::ONE);
+        let total_target =
+            (cfg.shares_per_trade * progress_factor).min(remaining_capacity.max(Decimal::ZERO));
         if total_target <= Decimal::ZERO {
             return Vec::new();
         }
@@ -420,7 +444,13 @@ impl LeggingBot {
         Some(clamp_price(base + skew))
     }
 
-    fn remaining_capacity(&self, pos: &Position, side: Side) -> Decimal {
+    fn remaining_capacity(
+        &self,
+        pos: &Position,
+        side: Side,
+        imb: Decimal,
+        progress: Decimal,
+    ) -> Decimal {
         let cfg = &self.config.legging_config;
         let side_shares = match side {
             Side::Up => pos.up_shares,
@@ -434,7 +464,20 @@ impl LeggingBot {
             .sum();
 
         let available = cfg.max_shares_per_market - side_shares - outstanding;
-        available.max(Decimal::ZERO)
+        // Allow the trailing side to exceed the per-side cap in order to rebalance the book.
+        let needs_rebalance = match side {
+            Side::Up => imb < Decimal::ZERO,
+            Side::Down => imb > Decimal::ZERO,
+        };
+        let rebalance_multiplier = Decimal::ONE + progress.min(Decimal::ONE);
+        let imbalance_allowance = if needs_rebalance {
+            imb.abs() * rebalance_multiplier
+        } else {
+            Decimal::ZERO
+        };
+        let time_allowance = cfg.max_shares_per_market * progress.min(Decimal::ONE) * dec!(0.25);
+
+        (available + imbalance_allowance + time_allowance).max(Decimal::ZERO)
     }
 
     fn rung_price(&self, anchor: Decimal, side: Side, step: u32) -> Decimal {
@@ -519,8 +562,10 @@ impl LeggingBot {
     }
 
     fn handle_price_update(&mut self, upd: PriceUpdate) {
-        for (gamma_id, market) in &self.markets {
-            if let Some(pos) = self.positions.get_mut(gamma_id) {
+        if let Some(gamma_id) = self.token_to_gamma.get(&upd.token_id) {
+            if let (Some(market), Some(pos)) =
+                (self.markets.get(gamma_id), self.positions.get_mut(gamma_id))
+            {
                 if upd.token_id == market.info.ids.up_token {
                     pos.up_bid = Some(upd.bid);
                     pos.up_ask = Some(upd.ask);
@@ -553,9 +598,9 @@ impl LeggingBot {
         let mut all_tokens = Vec::new();
         let mut all_conditions = Vec::new();
         for m in window {
-            let gid = m.ids.gamma_id.clone();
+            let gamma_id = m.ids.gamma_id.clone();
             self.markets.insert(
-                gid.clone(),
+                gamma_id.clone(),
                 MarketState {
                     pair: Arc::new(RwLock::new(m.to_trading_pair())),
                     info: m.clone(),
@@ -565,7 +610,11 @@ impl LeggingBot {
                     binance_open_price: None,
                 },
             );
-            self.positions.entry(gid).or_default();
+            self.positions.entry(gamma_id.clone()).or_default();
+            self.token_to_gamma
+                .insert(m.ids.up_token.clone(), gamma_id.clone());
+            self.token_to_gamma
+                .insert(m.ids.down_token.clone(), gamma_id.clone());
             all_tokens.push(m.ids.up_token.clone());
             all_tokens.push(m.ids.down_token.clone());
             all_conditions.push(m.ids.condition_id.clone());

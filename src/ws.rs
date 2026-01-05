@@ -49,13 +49,13 @@ pub fn spawn_orderbook_task(
                                     .and_then(|l| l.price.to_string().parse().ok());
 
                                 if let (Some(bid), Some(ask)) = (bid, ask) {
-                                    let _ = price_tx
-                                        .send(PriceUpdate {
-                                            token_id: asset_id,
-                                            bid,
-                                            ask,
-                                        })
-                                        .await;
+                                    if let Err(err) = price_tx.try_send(PriceUpdate {
+                                        token_id: asset_id.clone(),
+                                        bid,
+                                        ask,
+                                    }) {
+                                        trace!(%asset_id, error = ?err, "Dropping price update (channel full)");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -110,13 +110,17 @@ pub fn spawn_user_events_task(
                                 for entry in &change.price_changes {
                                     if let (Some(bid), Some(ask)) = (entry.best_bid, entry.best_ask)
                                     {
-                                        let _ = price_tx
-                                            .send(PriceUpdate {
-                                                token_id: entry.asset_id.clone(),
-                                                bid,
-                                                ask,
-                                            })
-                                            .await;
+                                        if let Err(err) = price_tx.try_send(PriceUpdate {
+                                            token_id: entry.asset_id.clone(),
+                                            bid,
+                                            ask,
+                                        }) {
+                                            warn!(
+                                                asset = %entry.asset_id,
+                                                error = ?err,
+                                                "Dropping user price update (channel full)"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -142,19 +146,24 @@ pub fn spawn_user_events_task(
                                     Err(_) => continue,
                                 };
 
-                                let _ = order_tx
-                                    .send(OrderEvent {
-                                        order_id: o.id.clone(),
-                                        gamma_id,
-                                        token_id: o.asset_id.clone(),
-                                        side,
-                                        price,
-                                        size_matched: Decimal::from(
-                                            o.size_matched.unwrap_or_default(),
-                                        ),
-                                        msg_type: o.msg_type.clone().unwrap_or_default(),
-                                    })
-                                    .await;
+                                if let Err(err) = order_tx.try_send(OrderEvent {
+                                    order_id: o.id.clone(),
+                                    gamma_id,
+                                    token_id: o.asset_id.clone(),
+                                    side,
+                                    price,
+                                    size_matched: Decimal::from(
+                                        o.size_matched.unwrap_or_default(),
+                                    ),
+                                    msg_type: o.msg_type.clone().unwrap_or_default(),
+                                }) {
+                                    warn!(
+                                        order_id = %o.id,
+                                        gamma_id = %gamma_id,
+                                        error = ?err,
+                                        "Dropping order event (channel full)"
+                                    );
+                                }
                             }
                             Ok(WsMessage::Trade(ref t)) => {
                                 let trade_payload =
@@ -201,18 +210,23 @@ pub fn spawn_user_events_task(
                                         continue;
                                     }
 
-                                    let _ = fill_tx
-                                        .send(FillEvent {
-                                            trade_id: t.id.clone(),
-                                            gamma_id: gamma_id.clone(),
-                                            token_id: mo.asset_id.clone(),
-                                            order_id: mo.order_id.clone(),
-                                            side,
-                                            price,
-                                            size: matched,
-                                            is_taker,
-                                        })
-                                        .await;
+                                    if let Err(err) = fill_tx.try_send(FillEvent {
+                                        trade_id: t.id.clone(),
+                                        gamma_id: gamma_id.clone(),
+                                        token_id: mo.asset_id.clone(),
+                                        order_id: mo.order_id.clone(),
+                                        side,
+                                        price,
+                                        size: matched,
+                                        is_taker,
+                                    }) {
+                                        warn!(
+                                            order_id = %mo.order_id,
+                                            gamma_id = %gamma_id,
+                                            error = ?err,
+                                            "Dropping fill event (channel full)"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
