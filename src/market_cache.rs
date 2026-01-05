@@ -85,7 +85,9 @@ impl MarketCache {
         }
 
         let up_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("up"))?;
-        let down_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))?;
+        let down_idx = outcomes
+            .iter()
+            .position(|o| o.eq_ignore_ascii_case("down"))?;
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;

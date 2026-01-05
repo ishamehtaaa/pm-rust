@@ -1,6 +1,9 @@
 use clap::Parser;
-use polymarket::config::Config;
-use polymarket::legging::LeggingBot;
+use polymarket::bot::LeggingBot;
+use polymarket::config::{ASSETS_BY_NAME, ASSETS_BY_PREFIX, Config};
+use rust_decimal::Decimal;
+use std::collections::HashSet;
+use std::str::FromStr;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
@@ -12,6 +15,39 @@ struct Args {
 
     #[arg(long, help = "Run in dry-run mode (no real orders)")]
     dry_run: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_decimal_arg,
+        help = "Override target shares per market"
+    )]
+    shares_per_market: Option<Decimal>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_parser = parse_asset_arg,
+        help = "Assets to include (name or prefix), comma-separated"
+    )]
+    target_assets: Vec<String>,
+}
+
+fn parse_decimal_arg(value: &str) -> Result<Decimal, String> {
+    Decimal::from_str(value).map_err(|e| format!("invalid decimal '{}': {e}", value))
+}
+
+fn parse_asset_arg(value: &str) -> Result<String, String> {
+    let key = value.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Err("asset cannot be empty".to_string());
+    }
+    if let Some(info) = ASSETS_BY_NAME.get(&key) {
+        return Ok(info.asset.clone());
+    }
+    if let Some(info) = ASSETS_BY_PREFIX.get(&key) {
+        return Ok(info.asset.clone());
+    }
+    Err(format!("unsupported asset '{}'", value))
 }
 
 #[tokio::main]
@@ -32,6 +68,14 @@ async fn main() -> anyhow::Result<()> {
     // Command-line flag takes precedence for dry-run mode
     if args.dry_run {
         config.dry_run = true;
+    }
+
+    if let Some(value) = args.shares_per_market {
+        config.legging_config.target_shares_per_market = value;
+    }
+
+    if !args.target_assets.is_empty() {
+        config.target_assets = args.target_assets.into_iter().collect::<HashSet<_>>();
     }
 
     tracing::info!(

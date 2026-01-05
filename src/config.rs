@@ -1,9 +1,8 @@
-
-
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
 
@@ -12,7 +11,7 @@ pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> = Lazy::new(|| HashSet::fr
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
     /* this is the name of the asset (btc, eth) we are trading */
-    pub asset: String,  
+    pub asset: String,
     pub prefixes: Vec<String>,
     pub chainlink: String,
     pub binance: String,
@@ -57,8 +56,9 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
 pub static TARGET_ASSETS: Lazy<HashSet<String>> = Lazy::new(|| {
     HashSet::from([
         "bitcoin".to_string(),
-        "solana".to_string(),
+        // "solana".to_string(),
         // "ethereum".to_string(),
+        // "xrp".to_string(),
     ])
 });
 
@@ -80,11 +80,51 @@ pub struct LeggingConfig {
     pub target_shares_per_market: Decimal,
 }
 
+/// Runtime settings derived from user config/environment.
+#[derive(Debug, Clone)]
+pub struct BotSettings {
+    pub status_interval: Duration,
+    pub ladder_interval: Duration,
+    pub rollover_interval: Duration,
+    pub cleanup_interval: Duration,
+    pub positions_poll_interval: Duration,
+    pub min_price: Decimal,
+    pub max_price: Decimal,
+    pub price_tick: Decimal,
+    pub min_order_size: Decimal,
+    pub min_notional: Decimal,
+    pub imbalance_threshold: Decimal,
+    pub levels_per_side: usize,
+    pub taker_cooldown: Duration,
+    pub balance_error_cooldown: Duration,
+}
+
+impl Default for BotSettings {
+    fn default() -> Self {
+        Self {
+            status_interval: Duration::from_secs(10),
+            ladder_interval: Duration::from_secs(2),
+            rollover_interval: Duration::from_secs(1),
+            cleanup_interval: Duration::from_secs(300),
+            positions_poll_interval: Duration::from_secs(30),
+            min_price: dec!(0.01),
+            max_price: dec!(0.99),
+            price_tick: dec!(0.01),
+            min_order_size: dec!(5.0),
+            min_notional: dec!(1.0),
+            imbalance_threshold: dec!(2.0),
+            levels_per_side: 5,
+            taker_cooldown: Duration::from_secs(2),
+            balance_error_cooldown: Duration::from_secs(30),
+        }
+    }
+}
+
 impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
             // If down_ask = 0.82, we bid up @ 0.16 (combined = 0.98)
-            target_combined: dec!(0.99),
+            target_combined: dec!(0.97),
 
             // When completing second leg, add this to the ask
             taker_buffer: dec!(0.01),
@@ -108,11 +148,11 @@ pub struct Config {
     pub polymarket_proxy_address: String,
     pub target_assets: HashSet<String>,
     pub legging_config: LeggingConfig,
+    pub bot_settings: BotSettings,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        
         let dry_run = false;
 
         let polymarket_private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
@@ -129,6 +169,7 @@ impl Config {
             polymarket_proxy_address,
             target_assets: TARGET_ASSETS.clone(),
             legging_config,
+            bot_settings: BotSettings::default(),
         })
     }
 }

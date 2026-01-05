@@ -1,10 +1,10 @@
-
-
 use chrono::{DateTime, TimeDelta, Utc};
-use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
@@ -12,14 +12,6 @@ pub enum Side {
     Up,
     #[serde(rename = "Down")]
     Down,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Opening,
-    Midgame,
-    Endgame,
-    Closed,
 }
 
 /// All identifiers for a single binary market.
@@ -75,81 +67,10 @@ pub struct MarketInfo {
     pub end_time: DateTime<Utc>,
 }
 
-impl MarketInfo {
-    pub fn to_trading_pair(&self) -> TradingPair {
-        TradingPair {
-            asset: self.asset.clone(),
-            duration: self.duration.clone(),
-            gamma_id: self.ids.gamma_id.clone(),
-            up_token_id: self.ids.up_token.clone(),
-            down_token_id: self.ids.down_token.clone(),
-            end_time: self.end_time,
-            rest_up_bid: None,
-            rest_up_ask: None,
-            rest_down_bid: None,
-            rest_down_ask: None,
-            last_rest_update_ms: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TradingPair {
-    pub asset: String,
-    pub duration: String,
-    pub gamma_id: String,
-    pub up_token_id: String,
-    pub down_token_id: String,
-    pub end_time: DateTime<Utc>,
-
-    pub rest_up_bid: Option<Decimal>,
-    pub rest_up_ask: Option<Decimal>,
-    pub rest_down_bid: Option<Decimal>,
-    pub rest_down_ask: Option<Decimal>,
-    pub last_rest_update_ms: i64,
-}
-
-impl TradingPair {
-    pub fn latest_up_ask(&self) -> Option<Decimal> {
-        self.rest_up_ask
-    }
-
-    pub fn latest_down_ask(&self) -> Option<Decimal> {
-        self.rest_down_ask
-    }
-
-    pub fn combined_ask(&self) -> Option<Decimal> {
-        Some(self.latest_up_ask()? + self.latest_down_ask()?)
-    }
-
-    pub fn has_both_asks(&self) -> bool {
-        self.latest_up_ask().is_some() && self.latest_down_ask().is_some()
-    }
-
-    pub fn clear_prices(&mut self) {
-        self.rest_up_bid = None;
-        self.rest_up_ask = None;
-        self.rest_down_bid = None;
-        self.rest_down_ask = None;
-        self.last_rest_update_ms = 0;
-    }
-}
-
-impl std::fmt::Display for TradingPair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[{}]: {} REST_UP: {:?}",
-            self.asset.to_uppercase(),
-            self.duration,
-            self.rest_up_ask
-        )
-    }
-}
+impl MarketInfo {}
 
 #[derive(Debug)]
 pub struct MarketState {
-    pub pair: Arc<RwLock<TradingPair>>,
     pub info: MarketInfo,
     pub binance_symbol: String,
     pub start_time: DateTime<Utc>,
@@ -173,21 +94,6 @@ impl MarketState {
         }
         let elapsed = (now - self.start_time).num_milliseconds() as f64;
         (elapsed / total).min(1.0).max(0.0)
-    }
-
-    pub fn phase(&self, now: DateTime<Utc>) -> Phase {
-        let remaining = self.remaining_seconds(now);
-        let elapsed = self.elapsed_seconds(now);
-
-        if remaining <= 0.0 {
-            Phase::Closed
-        } else if elapsed < 60.0 {
-            Phase::Opening
-        } else if remaining <= 120.0 {
-            Phase::Endgame
-        } else {
-            Phase::Midgame
-        }
     }
 }
 
@@ -258,8 +164,6 @@ impl MarketQuotes {
     }
 }
 
-
-
 #[derive(Debug, Clone)]
 pub struct OrderEvent {
     pub order_id: String,
@@ -298,7 +202,6 @@ impl RestingOrder {
         self.filled >= self.size
     }
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct MarketInventory {
@@ -343,6 +246,76 @@ impl MarketInventory {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TradingState {
+    pub inventory: MarketInventory,
+}
+
+impl TradingState {
+    pub fn imbalance(&self) -> Decimal {
+        self.inventory.imbalance()
+    }
+
+    pub fn add_fill(&mut self, side: Side, size: Decimal, price: Decimal) {
+        self.inventory.add_buy(side, size, price);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ExecutionState {
+    pub trading_state: TradingState,
+    pub quotes: MarketQuotes,
+    pub taker_in_flight: bool,
+    pub last_taker_time: Option<Instant>,
+    pub balance_error: bool,
+    pub up_bid: Option<Decimal>,
+    pub up_ask: Option<Decimal>,
+    pub down_bid: Option<Decimal>,
+    pub down_ask: Option<Decimal>,
+    pub processed_trade_ids: HashMap<String, Instant>,
+    pub prefilled: HashMap<String, (Decimal, Instant)>,
+}
+
+impl ExecutionState {
+    pub fn can_send_taker(
+        &self,
+        taker_cooldown: Duration,
+        balance_error_cooldown: Duration,
+    ) -> bool {
+        if self.taker_in_flight {
+            return false;
+        }
+        if let Some(t) = self.last_taker_time {
+            if self.balance_error && t.elapsed() < balance_error_cooldown {
+                return false;
+            }
+            if t.elapsed() < taker_cooldown {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn inventory(&self) -> &MarketInventory {
+        &self.trading_state.inventory
+    }
+
+    pub fn inventory_mut(&mut self) -> &mut MarketInventory {
+        &mut self.trading_state.inventory
+    }
+
+    pub fn record_fill(&mut self, side: Side, size: Decimal, price: Decimal) {
+        self.trading_state.add_fill(side, size, price);
+    }
+
+    pub fn ask_for_side(&self, side: Side) -> Option<Decimal> {
+        match side {
+            Side::Up => self.up_ask,
+            Side::Down => self.down_ask,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MarketLookup {
     condition_to_gamma: HashMap<String, String>,
@@ -367,7 +340,9 @@ impl MarketLookup {
     }
 
     pub fn resolve_condition(&self, condition_id: &str) -> Option<&str> {
-        self.condition_to_gamma.get(condition_id).map(|s| s.as_str())
+        self.condition_to_gamma
+            .get(condition_id)
+            .map(|s| s.as_str())
     }
 
     pub fn get_ids(&self, gamma_id: &str) -> Option<&MarketIds> {
@@ -385,7 +360,6 @@ impl MarketLookup {
         self.condition_to_gamma.keys().cloned().collect()
     }
 }
-
 
 pub fn duration_label(delta: TimeDelta) -> String {
     let minutes = delta.num_minutes();
