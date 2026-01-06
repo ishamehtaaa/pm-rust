@@ -1,16 +1,9 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use polymarket::bot::HighFreqArbBot;
 use polymarket::config::Config;
-use polymarket::legging::LeggingBot;
+use rust_decimal::Decimal;
+use std::collections::HashSet;
 use tracing_subscriber::{fmt, EnvFilter};
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Strategy {
-    /// Orderbook laddering bot.
-    Arb,
-    /// Buy both sides when combined ask < 1.00 (configurable).
-    Legging,
-}
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
@@ -22,8 +15,17 @@ struct Args {
     #[arg(long, help = "Run in dry-run mode (no real orders)")]
     dry_run: bool,
 
-    #[arg(long, value_enum, default_value_t = Strategy::Legging)]
-    strategy: Strategy,
+    #[arg(long, help = "Ladder levels per side (default: 2)")]
+    ladder_levels: Option<usize>,
+
+    #[arg(long, help = "Max filled shares per side for a market")]
+    max_shares_per_side: Option<Decimal>,
+
+    #[arg(long, help = "Per-market cooldown in seconds")]
+    cooldown_secs: Option<u64>,
+
+    #[arg(long, help = "Comma-separated asset list (e.g. bitcoin,solana)")]
+    assets: Option<String>,
 }
 
 #[tokio::main]
@@ -38,61 +40,55 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::from_env()?;
     // Command-line flag takes precedence: set dry_run directly from args.
     config.dry_run = args.dry_run;
+    if let Some(levels) = args.ladder_levels {
+        config.legging_config.max_live_orders_per_token = levels.max(1);
+    }
+    if let Some(max_shares_per_side) = args.max_shares_per_side {
+        config.legging_config.max_shares_per_side = max_shares_per_side;
+    }
+    if let Some(cooldown_secs) = args.cooldown_secs {
+        config.legging_config.cooldown_secs = cooldown_secs;
+    }
+    if let Some(assets) = args.assets {
+        let mut set: HashSet<String> = HashSet::new();
+        for asset in assets.split(',') {
+            let trimmed = asset.trim();
+            if !trimmed.is_empty() {
+                set.insert(trimmed.to_lowercase());
+            }
+        }
+        if !set.is_empty() {
+            config.target_assets = set;
+        }
+    }
 
     tracing::info!(
-        "Starting Polymarket bot (strategy={:?}, dry_run={}, targets={:?})",
-        args.strategy,
+        "Starting Polymarket bot (strategy=arb, dry_run={}, targets={:?})",
         config.dry_run,
         config.target_assets
     );
 
-    match args.strategy {
-        Strategy::Legging => {
-            let mut bot = LeggingBot::new(config).await?;
-            bot.discover_markets().await;
+    let mut bot = HighFreqArbBot::new(config).await?;
 
-            if bot.market_count() == 0 {
-                tracing::warn!("No markets discovered, will retry in main loop");
-            }
+    bot.discover_markets().await;
 
-            for (market_id, state) in bot.markets() {
-                let pair = state.pair.read();
-                tracing::info!(
-                    "Market: {} | {} | {} | up={} down={}",
-                    state.info.asset,
-                    state.info.duration,
-                    market_id,
-                    pair.up_token_id,
-                    pair.down_token_id
-                );
-            }
-
-            bot.run().await;
-        }
-        Strategy::Arb => {
-            let mut bot = HighFreqArbBot::new(config).await?;
-
-            bot.discover_markets().await;
-
-            if bot.market_count() == 0 {
-                tracing::warn!("No markets discovered, will retry in main loop");
-            }
-
-            for (market_id, state) in bot.markets() {
-                let pair = state.pair.read();
-                tracing::info!(
-                    "Market: {} | {} | {} | up={} down={}",
-                    state.info.asset,
-                    state.info.duration,
-                    market_id,
-                    pair.up_token_id,
-                    pair.down_token_id
-                );
-            }
-
-            bot.run().await;
-        }
+    if bot.market_count() == 0 {
+        tracing::warn!("No markets discovered, will retry in main loop");
     }
+
+    for (market_id, state) in bot.markets() {
+        let pair = state.pair.read();
+        tracing::info!(
+            "Market: {} | {} | {} | up={} down={}",
+            state.info.asset,
+            state.info.duration,
+            market_id,
+            pair.up_token_id,
+            pair.down_token_id
+        );
+    }
+
+    bot.run().await;
 
     Ok(())
 }

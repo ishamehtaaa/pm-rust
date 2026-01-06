@@ -107,17 +107,17 @@ impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
             max_shares_per_side: dec!(40),
-            max_total_cost: dec!(0.95),
+            max_total_cost: dec!(0.98),
             taker_buffer: dec!(0.00),
-            cooldown_secs: 10,
-            max_price_age_ms: 2_500,
+            cooldown_secs: 1,
+            max_price_age_ms: 1,
             mop_start_secs: 90,
             mop_max_total_cost: dec!(1.00),
             end_target_imbalance_shares: dec!(3),
             prevent_order_pileup: true,
             manage_pileup_orders: true,
             max_live_orders_per_market: 6,
-            max_live_orders_per_token: 4,
+            max_live_orders_per_token: 2,
             equalize_max_total_cost: dec!(0.98),
         }
     }

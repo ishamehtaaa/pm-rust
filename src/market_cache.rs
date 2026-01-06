@@ -43,11 +43,16 @@ impl MarketCache {
     }
 
     async fn fetch_raw_markets(&self) -> Result<Vec<GammaMarket>, MarketCacheError> {
+        let now = Utc::now();
+        let end_min = now;
+        let end_max = now + chrono::TimeDelta::minutes(15);
         let request = MarketsRequest::builder()
             .tag_id("102467")
             .limit(1200)
             .closed(false)
             .ascending(false)
+            .end_date_min(end_min)
+            .end_date_max(end_max)
             .build();
 
         self.client
@@ -87,6 +92,10 @@ impl MarketCache {
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;
+
+        if (end_time - start_time).num_minutes() != 15 {
+            return None;
+        }
 
         let duration = duration_label(end_time - start_time);
 

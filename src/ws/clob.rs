@@ -1,15 +1,13 @@
 use crate::models::Side;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
-use serde_json::Value;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
-use futures_util::{StreamExt, SinkExt};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::connect_async;
+use futures_util::StreamExt;
+use polymarket_client_sdk::clob::ws::Client as WsClient;
+use serde_json::Value;
 
 pub struct ClobFeed {
     // token_id -> Side
@@ -70,6 +68,24 @@ impl ClobFeed {
         info!("CLOB feed started (WS + REST poller)");
     }
 
+    /// Start WS only (lowest latency).
+    pub fn start_ws_only(&mut self) {
+        if self.ws_task.is_some() || self.rest_task.is_some() {
+            return;
+        }
+
+        let token_map_ws = self.token_map.clone();
+        let ws_prices = self.ws_prices.clone();
+        let ws_handle = tokio::spawn(async move {
+            if let Err(e) = run_clob_ws(token_map_ws, ws_prices).await {
+                error!("CLOB WS task terminated: {}", e);
+            }
+        });
+
+        self.ws_task = Some(ws_handle);
+        info!("CLOB feed started (WS only)");
+    }
+
     pub fn stop(&mut self) {
         if let Some(t) = self.ws_task.take() {
             t.abort();
@@ -83,6 +99,10 @@ impl ClobFeed {
 
     pub fn clear(&mut self) {
         self.token_map.write().clear();
+    }
+
+    pub fn ws_price(&self, token_id: &str) -> Option<(Option<Decimal>, Option<Decimal>)> {
+        self.ws_prices.read().get(token_id).cloned()
     }
 }
 
@@ -102,188 +122,58 @@ async fn run_clob_ws(
     token_map: Arc<RwLock<HashMap<String, Side>>>,
     ws_prices: Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
 ) -> anyhow::Result<()> {
-    // Connect to live RTDS websocket
     loop {
-        debug!("Attempting RTDS WS connect to wss://ws-live-data.polymarket.com");
-        match connect_async("wss://ws-live-data.polymarket.com").await {
-            Ok((ws_stream, _resp)) => {
-                info!("Connected to Polymarket RTDS WS");
-                let (mut write, mut read) = ws_stream.split();
+        let asset_ids: Vec<String> = token_map.read().keys().cloned().collect();
+        if asset_ids.is_empty() {
+            debug!("No tokens to subscribe for WS orderbook, waiting 1s...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue;
+        }
 
-                // Subscribe to crypto_prices updates
-                let sub = serde_json::json!({
-                    "action": "subscribe",
-                    "subscriptions": [
-                        {"topic": "crypto_prices", "type": "update"}
-                    ]
-                });
-                let sub_str = sub.to_string();
-                info!("Sending WS subscribe for topics: crypto_prices");
-                if let Err(e) = write.send(Message::Text(sub_str.clone())).await {
-                    error!("Failed to send subscribe: {}", e);
-                }
-
-                // Move write into a ping task (we only need send pings from here on)
-                let ping_handle = tokio::spawn(async move {
-                    let mut sink = write; // take ownership
-                    loop {
-                        let ping = serde_json::json!({"action":"ping"}).to_string();
-                        if let Err(e) = sink.send(Message::Text(ping)).await {
-                            debug!("WS ping failed: {}", e);
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    }
-                });
-
-                // One-time preview of the first incoming text message to help diagnose message shapes
-                let mut previewed = false;
-
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(Message::Text(txt)) => {
-                            if !previewed {
-                                let short = txt.chars().take(300).collect::<String>();
-                                debug!("WS sample text (first seen): {}", short);
-                                previewed = true;
-                            }
-
-                            if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                                // Detect and log subscription acknowledgements (one-liners)
-                                let is_ack = v.get("type").and_then(|t| t.as_str()).map(|s| s.eq_ignore_ascii_case("subscribed")).unwrap_or(false)
-                                    || (v.get("subscriptions").is_some() && v.get("data").is_none() && v.get("updates").is_none());
-                                if is_ack {
-                                    let short = serde_json::to_string(&v).unwrap_or_default().chars().take(200).collect::<String>();
-                                    debug!("WS subscription ack: {}", short);
-                                }
-
-                                let updates = handle_ws_price_message(&v, &token_map, &ws_prices);
-                                if updates == 0 {
-                                    // Short preview of structure to help diagnose mismatching shapes without spamming logs
-                                    let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-                                    let preview = serde_json::to_string(&v).unwrap_or_default();
-                                    let short = preview.chars().take(200).collect::<String>();
-                                    debug!("WS message had no matches; top_keys={:?} preview='{}'", keys, short);
-                                }
-                            } else {
-                                debug!("WS message non-json: {}", txt);
-                            }
-                        }
-                        Ok(Message::Ping(_)) => {
-                            // ignore
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("WS read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                // If read loop ends, cancel ping and retry connect
-                ping_handle.abort();
-                debug!("WS read loop ended, reconnecting...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            }
+        let client = WsClient::default();
+        info!("Connected to Polymarket CLOB WS (orderbook)");
+        let stream = match client.subscribe_orderbook(asset_ids.clone()) {
+            Ok(s) => s,
             Err(e) => {
-                error!("RTDS WS connect error: {}", e);
+                error!("Orderbook subscribe failed: {}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            }
-        }
-    }
-} 
-
-fn handle_ws_price_message(
-    v: &Value,
-    token_map: &Arc<RwLock<HashMap<String, Side>>>,
-    ws_prices: &Arc<RwLock<HashMap<String, (Option<Decimal>, Option<Decimal>)>>>,
-) -> usize {
-    // Patterns to look for: data array, updates array, or direct object
-    let mut candidates = Vec::new();
-
-    if let Some(data) = v.get("data") {
-        if data.is_array() {
-            if let Some(arr) = data.as_array() {
-                for item in arr { candidates.push(item.clone()); }
-            }
-        } else {
-            candidates.push(data.clone());
-        }
-    }
-    if let Some(updates) = v.get("updates") {
-        if let Some(arr) = updates.as_array() {
-            for item in arr { candidates.push(item.clone()); }
-        }
-    }
-
-    // If nothing collected, maybe the message itself is a price object
-    if candidates.is_empty() {
-        candidates.push(v.clone());
-    }
-
-    let mut matched: usize = 0;
-
-    for entry in candidates {
-        // Try token id
-        let token_id = entry.get("token_id")
-            .or_else(|| entry.get("token"))
-            .or_else(|| entry.get("asset_id"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
-
-        if token_id.is_none() { continue; }
-        let tid = token_id.unwrap();
-
-        // Extract bid / ask if available
-        let best_bid = entry.get("best_bid").or_else(|| entry.get("bid")).or_else(|| entry.get("bestBid"));
-        let best_ask = entry.get("best_ask").or_else(|| entry.get("ask")).or_else(|| entry.get("bestAsk"));
-
-        let parse_decimal = |v: &Value| -> Option<Decimal> {
-            match v {
-                Value::String(s) => Decimal::from_str(s).ok(),
-                Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
-                _ => None,
+                continue;
             }
         };
 
-        let mut bid_dec: Option<Decimal> = None;
-        let mut ask_dec: Option<Decimal> = None;
-
-        if let Some(bv) = best_bid { bid_dec = parse_decimal(bv); }
-        if let Some(av) = best_ask { ask_dec = parse_decimal(av); }
-
-        // If single price + side provided
-        if (bid_dec.is_none() && ask_dec.is_none()) && entry.get("price").is_some() {
-            let pv = entry.get("price").unwrap();
-            if let Some(p) = parse_decimal(pv) {
-                if let Some(side_v) = entry.get("side").and_then(|s| s.as_str()) {
-                    if side_v.eq_ignore_ascii_case("BUY") {
-                        ask_dec = Some(p);
-                    } else if side_v.eq_ignore_ascii_case("SELL") {
-                        bid_dec = Some(p);
-                    } else {
-                        // unknown side - use as both
-                        bid_dec = Some(p);
-                        ask_dec = Some(p);
-                    }
-                } else {
-                    bid_dec = Some(p);
-                    ask_dec = Some(p);
+        let mut stream = Box::pin(stream);
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(book) => {
+                    let bid = book
+                        .bids
+                        .iter()
+                        .filter(|lvl| lvl.size > Decimal::ZERO)
+                        .map(|lvl| lvl.price)
+                        .max();
+                    let ask = book
+                        .asks
+                        .iter()
+                        .filter(|lvl| lvl.size > Decimal::ZERO)
+                        .map(|lvl| lvl.price)
+                        .min();
+                    ws_prices.write().insert(book.asset_id.clone(), (bid, ask));
+                    debug!(
+                        "CLOB WS book update asset_id={} bid={:?} ask={:?}",
+                        book.asset_id, bid, ask
+                    );
+                }
+                Err(e) => {
+                    error!("Orderbook stream error: {}", e);
+                    break;
                 }
             }
         }
 
-        // Apply to token map (we no longer write into TradingPair; keep internal price cache)
-        let map = token_map.read();
-        if let Some(side) = map.get(&tid) {
-            matched += 1;
-            ws_prices.write().insert(tid.clone(), (bid_dec.clone(), ask_dec.clone()));
-            debug!("CLOB WS update {} side={:?} bid={:?} ask={:?}", tid, side, bid_dec, ask_dec);
-        }
+        debug!("Orderbook stream ended, reconnecting...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-
-    matched
-} 
+}
 
 // REST poller (runs in parallel for comparison/observability)
 async fn run_clob_rest_loop(
