@@ -1,8 +1,6 @@
-use crate::chainlink::ChainlinkClient;
 use crate::config::Config;
-use crate::edge::{ArbDetector, BuyReason, BuySignal, MarketSnapshot, Side};
 use crate::market_cache::MarketCache;
-use crate::models::{MarketState, TradingPair};
+use crate::models::{MarketState, Side, TradingPair};
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
@@ -11,9 +9,14 @@ use chrono_tz::America::New_York;
 use parking_lot::RwLock;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::Side as ClobSide;
+use polymarket_client_sdk::clob::types::{OrderType, Side as ClobSide};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
+use polymarket_client_sdk::data::{
+    Client as DataClient,
+    types::{request::PositionsRequest, response::Position},
+};
 use polymarket_client_sdk::types::Decimal as PolyDecimal;
+use polymarket_client_sdk::types::Address;
 use polymarket_client_sdk::POLYGON;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -26,88 +29,61 @@ use tracing::{debug, error, info, instrument, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
 // Configuration constants
-const CHAINLINK_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_PRINT_INTERVAL: Duration = Duration::from_secs(5);
 const SCAN_LOOP_DELAY: Duration = Duration::from_millis(100);
-const OPEN_PRICE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-const OPEN_PRICE_RETRY_DELAY: Duration = Duration::from_millis(500);
-const OPEN_PRICE_MAX_RETRIES: u32 = 3;
+const PRICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const POSITIONS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LADDER_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_WINDOW_DURATION: Duration = Duration::from_secs(900);
 
 // Order pricing constants
-const LIMIT_ORDER_BUFFER: Decimal = dec!(0.005);
-const EMERGENCY_TAKER_BUFFER: Decimal = dec!(0.01);
 const TICK_SIZE_DP: u32 = 2; // Polymarket uses 0.01 tick size (2 decimal places)
 const MIN_PRICE: Decimal = dec!(0.01);
 const MAX_PRICE: Decimal = dec!(0.99);
-const MIN_EDGE_AFTER_BUFFER: Decimal = dec!(0.01); // Minimum profit margin after tick rounding
+const LADDER_PRICE_STEP: Decimal = dec!(0.01);
 
 /// Round price down to valid tick size for buy orders (conservative)
 fn round_to_tick_buy(price: Decimal) -> Decimal {
     price.round_dp_with_strategy(TICK_SIZE_DP, rust_decimal::RoundingStrategy::ToZero)
 }
 
-/// Round price up to valid tick size for aggressive buys (ensure fill)
-fn round_to_tick_up(price: Decimal) -> Decimal {
-    price.round_dp_with_strategy(TICK_SIZE_DP, rust_decimal::RoundingStrategy::AwayFromZero)
+fn clamp_price(price: Decimal) -> Decimal {
+    round_to_tick_buy(price).max(MIN_PRICE).min(MAX_PRICE)
 }
 
-/// Calculate limit price for a buy order, ensuring it's within valid bounds
-/// Returns None if no valid price exists (signal price too low)
-fn calculate_buy_limit(signal_price: Decimal, buffer: Decimal, aggressive: bool) -> Option<Decimal> {
-    let raw_price = if aggressive {
-        signal_price + buffer
-    } else {
-        signal_price - buffer
-    };
-    
-    let rounded = if aggressive {
-        round_to_tick_up(raw_price)
-    } else {
-        round_to_tick_buy(raw_price)
-    };
-    
-    // Clamp to valid range
-    let clamped = rounded.max(MIN_PRICE).min(MAX_PRICE);
-    
-    // If we had to raise the price to MIN_PRICE and it's now >= signal, it's not a good trade
-    if !aggressive && clamped >= signal_price {
-        return None;
+#[derive(Debug, Clone, Default)]
+struct MarketInventory {
+    up_shares: Decimal,
+    down_shares: Decimal,
+    up_avg: Option<Decimal>,
+    down_avg: Option<Decimal>,
+}
+
+impl MarketInventory {
+    fn imbalance(&self) -> Decimal {
+        self.up_shares - self.down_shares
     }
-    
-    Some(clamped)
+
+    fn avg_for_side(&self, side: Side) -> Option<Decimal> {
+        match side {
+            Side::Up => self.up_avg,
+            Side::Down => self.down_avg,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct ArbPosition {
-    pub market_id: String,
-    pub asset: String,
-    pub first_side: Side,
-    pub first_price: Decimal,
-    pub first_order_id: Option<String>,
-    pub second_side: Option<Side>,
-    pub second_price: Option<Decimal>,
-    pub second_order_id: Option<String>,
-    pub size: Decimal,
-    pub created_at: DateTime<Utc>,
+struct RestingOrder {
+    order_id: String,
+    price: Decimal,
+    size: Decimal,
 }
 
-impl ArbPosition {
-    pub fn is_complete(&self) -> bool {
-        self.second_side.is_some()
-    }
-
-    pub fn total_cost(&self) -> Decimal {
-        self.first_price + self.second_price.unwrap_or(dec!(0))
-    }
-
-    pub fn profit(&self) -> Option<Decimal> {
-        self.second_price.map(|_| dec!(1) - self.total_cost())
-    }
-
-    pub fn age_seconds(&self, now: DateTime<Utc>) -> i64 {
-        (now - self.created_at).num_seconds()
-    }
+#[derive(Debug, Default)]
+struct MarketOrders {
+    up: Vec<RestingOrder>,
+    down: Vec<RestingOrder>,
+    last_refresh: Option<Instant>,
 }
 
 pub struct HighFreqArbBot {
@@ -115,15 +91,18 @@ pub struct HighFreqArbBot {
     client: Arc<AuthenticatedClient>,
     signer: PrivateKeySigner,
     market_cache: MarketCache,
-    chainlink: ChainlinkClient,
-    arb_detector: ArbDetector,
     markets: HashMap<String, MarketState>,
     trading_pairs: HashMap<String, Arc<RwLock<TradingPair>>>,
-    positions: HashMap<String, ArbPosition>,
+    inventory: HashMap<String, MarketInventory>,
+    orders: HashMap<String, MarketOrders>,
+    token_to_market: HashMap<String, String>,
+    token_to_side: HashMap<String, Side>,
+    data_client: DataClient,
+    user: Address,
     current_window_end: Option<DateTime<Utc>>,
     last_status_print: Instant,
-    last_chainlink_update: Instant,
-    chainlink_prices: HashMap<String, Decimal>,
+    last_price_poll: Instant,
+    last_positions_poll: Instant,
 }
 
 impl HighFreqArbBot {
@@ -156,20 +135,25 @@ impl HighFreqArbBot {
             })?;
         info!("Successfully authenticated with Polymarket CLOB");
 
+        let user = Address::from_str(&signer.address().to_string())?;
+
         Ok(Self {
             config,
             client: Arc::new(client),
             signer,
             market_cache,
-            chainlink: ChainlinkClient::new(),
-            arb_detector: ArbDetector::default(),
             markets: HashMap::new(),
             trading_pairs: HashMap::new(),
-            positions: HashMap::new(),
+            inventory: HashMap::new(),
+            orders: HashMap::new(),
+            token_to_market: HashMap::new(),
+            token_to_side: HashMap::new(),
+            data_client: DataClient::default(),
+            user,
             current_window_end: None,
             last_status_print: Instant::now(),
-            last_chainlink_update: Instant::now(),
-            chainlink_prices: HashMap::new(),
+            last_price_poll: Instant::now(),
+            last_positions_poll: Instant::now(),
         })
     }
 
@@ -191,17 +175,23 @@ impl HighFreqArbBot {
 
             if self.should_rotate_markets(now) {
                 info!(
-                    positions_cleared = self.positions.len(),
+                    inventory_cleared = self.inventory.len(),
                     "Window expired, rotating markets"
                 );
-                self.positions.clear();
+                self.inventory.clear();
+                self.orders.clear();
                 self.discover_markets().await;
                 continue;
             }
 
-            if self.last_chainlink_update.elapsed() > CHAINLINK_UPDATE_INTERVAL {
+            if self.last_price_poll.elapsed() > PRICE_POLL_INTERVAL {
                 self.update_prices().await;
-                self.last_chainlink_update = Instant::now();
+                self.last_price_poll = Instant::now();
+            }
+
+            if self.last_positions_poll.elapsed() > POSITIONS_POLL_INTERVAL {
+                self.update_positions().await;
+                self.last_positions_poll = Instant::now();
             }
 
             if self.last_status_print.elapsed() > STATUS_PRINT_INTERVAL {
@@ -209,13 +199,13 @@ impl HighFreqArbBot {
                 self.last_status_print = Instant::now();
             }
 
-            self.scan().await;
+            self.maintain_all_ladders().await;
 
             if loop_count % 1000 == 0 {
                 debug!(
                     loop_count,
                     markets = self.markets.len(),
-                    positions = self.positions.len(),
+                    inventory = self.inventory.len(),
                     "Main loop heartbeat"
                 );
             }
@@ -224,323 +214,261 @@ impl HighFreqArbBot {
         }
     }
 
-    #[instrument(skip(self), fields(markets = self.markets.len()))]
-    async fn scan(&mut self) {
-        let mut first_leg_signals = Vec::new();
-        let mut second_leg_signals = Vec::new();
+    async fn update_positions(&mut self) {
+        let builder = PositionsRequest::builder().user(self.user.clone());
+        let builder = match builder.limit(500) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Positions request invalid: {}", e);
+                return;
+            }
+        };
+        let request = builder.build();
 
-        for (market_id, state) in &self.markets {
-            let snap = match self.build_snapshot(market_id, state) {
-                Some(s) => s,
+        let positions = match self.data_client.positions(&request).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Positions poll failed: {}", e);
+                return;
+            }
+        };
+
+        self.apply_positions_snapshot(positions);
+    }
+
+    fn apply_positions_snapshot(&mut self, positions: Vec<Position>) {
+        let mut aggregated: HashMap<String, MarketInventory> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for position in positions {
+            let market_id = match self.token_to_market.get(position.asset.as_str()) {
+                Some(m) => m.clone(),
+                None => continue,
+            };
+            let side = match self.token_to_side.get(position.asset.as_str()) {
+                Some(s) => *s,
                 None => continue,
             };
 
-            if let Some(position) = self.positions.get(market_id) {
-                if !position.is_complete() {
-                    if let Some(signal) = self.arb_detector.check_second_leg(
-                        &snap,
-                        position.first_side,
-                        position.first_price,
-                    ) {
-                        // Pre-validate: can we get a valid limit price?
-                        let is_emergency = signal.reason == BuyReason::EmergencyMop;
-                        if let Some(limit_price) = calculate_buy_limit(
-                            signal.price,
-                            if is_emergency { EMERGENCY_TAKER_BUFFER } else { LIMIT_ORDER_BUFFER },
-                            is_emergency,
-                        ) {
-                            // Check combined cost still profitable
-                            let combined_cost = position.first_price + limit_price;
-                            let edge = dec!(1) - combined_cost;
-                            
-                            if edge >= MIN_EDGE_AFTER_BUFFER || is_emergency {
-                                debug!(
-                                    market_id,
-                                    side = ?signal.side,
-                                    signal_price = %signal.price,
-                                    limit_price = %limit_price,
-                                    combined_cost = %combined_cost,
-                                    edge = %edge,
-                                    reason = ?signal.reason,
-                                    "Second leg signal validated"
-                                );
-                                second_leg_signals.push((market_id.clone(), signal));
-                            } else {
-                                debug!(
-                                    market_id,
-                                    edge = %edge,
-                                    min_required = %MIN_EDGE_AFTER_BUFFER,
-                                    "Second leg signal rejected: insufficient edge after rounding"
-                                );
-                            }
-                        } else {
-                            debug!(
-                                market_id,
-                                signal_price = %signal.price,
-                                "Second leg signal rejected: no valid limit price"
-                            );
-                        }
-                    }
+            let entry = aggregated.entry(market_id.clone()).or_default();
+            match side {
+                Side::Up => {
+                    entry.up_shares = position.size;
+                    entry.up_avg = Some(position.avg_price);
                 }
-            } else if let Some(signal) = self.arb_detector.check_first_leg(&snap) {
-                // Pre-validate: can we get a valid limit price?
-                if let Some(limit_price) = calculate_buy_limit(signal.price, LIMIT_ORDER_BUFFER, false) {
-                    // Check if there's potential for second leg
-                    let opposite_ask = if signal.side == Side::Up {
-                        snap.pm_down_ask
-                    } else {
-                        snap.pm_up_ask
-                    };
-                    
-                    let potential_combined = limit_price + opposite_ask;
-                    let potential_edge = dec!(1) - potential_combined;
-                    
-                    if potential_edge >= MIN_EDGE_AFTER_BUFFER {
-                        debug!(
-                            market_id,
-                            asset = %signal.asset,
-                            side = ?signal.side,
-                            signal_price = %signal.price,
-                            limit_price = %limit_price,
-                            opposite_ask = %opposite_ask,
-                            potential_edge = %potential_edge,
-                            reason = ?signal.reason,
-                            "First leg signal validated"
-                        );
-                        first_leg_signals.push(signal);
-                    } else {
-                        debug!(
-                            market_id,
-                            potential_edge = %potential_edge,
-                            min_required = %MIN_EDGE_AFTER_BUFFER,
-                            "First leg signal rejected: insufficient potential edge"
-                        );
-                    }
-                } else {
-                    debug!(
-                        market_id,
-                        signal_price = %signal.price,
-                        "First leg signal rejected: no valid limit price"
-                    );
+                Side::Down => {
+                    entry.down_shares = position.size;
+                    entry.down_avg = Some(position.avg_price);
                 }
             }
+            seen.insert(market_id);
         }
 
-        let total_signals = first_leg_signals.len() + second_leg_signals.len();
-        if total_signals > 0 {
-            info!(
-                first_leg = first_leg_signals.len(),
-                second_leg = second_leg_signals.len(),
-                "Processing validated signals"
-            );
+        for (market_id, inventory) in aggregated {
+            self.inventory.insert(market_id.clone(), inventory);
         }
 
-        // Execute second legs first (close positions before opening new ones)
-        for (market_id, signal) in second_leg_signals {
-            self.execute_second_leg(&market_id, &signal).await;
-        }
-
-        // Then execute first legs
-        for signal in first_leg_signals {
-            self.execute_first_leg(&signal).await;
+        for market_id in self.markets.keys() {
+            if !seen.contains(market_id) {
+                self.inventory.insert(market_id.clone(), MarketInventory::default());
+            }
         }
     }
 
-    #[instrument(skip(self), fields(
-        market_id = %signal.market_id,
-        asset = %signal.asset,
-        side = ?signal.side,
-        price = %signal.price
-    ))]
-    async fn execute_first_leg(&mut self, signal: &BuySignal) {
-        let state = match self.markets.get(&signal.market_id) {
-            Some(s) => s,
-            None => {
-                error!(market_id = %signal.market_id, "Market not found for first leg");
-                return;
-            }
-        };
-
-        let token_id = match signal.side {
-            Side::Up => &state.info.up_token_id,
-            Side::Down => &state.info.down_token_id,
-        };
-
-        // Calculate valid limit price
-        let limit_price = match calculate_buy_limit(signal.price, LIMIT_ORDER_BUFFER, false) {
-            Some(price) => price,
-            None => {
-                warn!(
-                    signal_price = %signal.price,
-                    min_price = %MIN_PRICE,
-                    "Signal price too low - no valid limit price possible"
-                );
-                return;
-            }
-        };
-
-        info!(
-            token_id,
-            signal_price = %signal.price,
-            limit_price = %limit_price,
-            size = %self.config.arb_config.shares_per_side,
-            dry_run = self.config.dry_run,
-            "Executing first leg order"
-        );
-
-        let order_id = if self.config.dry_run {
-            debug!("Dry run mode - simulating order placement");
-            Some(format!("dry-run-{}", Utc::now().timestamp_millis()))
-        } else {
-            match self.place_order(token_id, limit_price).await {
-                Ok(oid) => {
-                    info!(order_id = %oid, "First leg order placed successfully");
-                    Some(oid)
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to place first leg order - NOT opening position");
-                    return; // Don't create position if order failed
-                }
-            }
-        };
-
-        let position = ArbPosition {
-            market_id: signal.market_id.clone(),
-            asset: signal.asset.clone(),
-            first_side: signal.side,
-            first_price: limit_price,
-            first_order_id: order_id,
-            second_side: None,
-            second_price: None,
-            second_order_id: None,
-            size: self.config.arb_config.shares_per_side,
-            created_at: Utc::now(),
-        };
-
-        info!(
-            market_id = %position.market_id,
-            asset = %position.asset,
-            side = ?position.first_side,
-            price = %position.first_price,
-            "Position opened"
-        );
-
-        self.positions.insert(signal.market_id.clone(), position);
+    async fn maintain_all_ladders(&mut self) {
+        let ids: Vec<String> = self.markets.keys().cloned().collect();
+        for id in ids {
+            self.maintain_ladder(&id).await;
+        }
     }
 
-    #[instrument(skip(self), fields(
-        market_id = %market_id,
-        side = ?signal.side,
-        price = %signal.price,
-        reason = ?signal.reason
-    ))]
-    async fn execute_second_leg(&mut self, market_id: &str, signal: &BuySignal) {
-        let (token_id, position_size, first_price) = {
+    async fn maintain_ladder(&mut self, market_id: &str) {
+        let now = Instant::now();
+        {
+            let orders = self.orders.entry(market_id.to_string()).or_default();
+            if orders
+                .last_refresh
+                .map(|t| t.elapsed() < LADDER_REFRESH_INTERVAL)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            orders.last_refresh = Some(now);
+        }
+
+        let (up_ask, down_ask) = {
             let state = match self.markets.get(market_id) {
                 Some(s) => s,
-                None => {
-                    error!(market_id, "Market not found for second leg");
-                    return;
-                }
+                None => return,
             };
-
-            let position = match self.positions.get(market_id) {
-                Some(p) => p,
-                None => {
-                    error!(market_id, "Position not found for second leg");
-                    return;
-                }
-            };
-
-            let tid = match signal.side {
-                Side::Up => state.info.up_token_id.clone(),
-                Side::Down => state.info.down_token_id.clone(),
-            };
-
-            (tid, position.size, position.first_price)
-        };
-
-        let is_emergency = signal.reason == BuyReason::EmergencyMop;
-        
-        let limit_price = if is_emergency {
-            warn!(market_id, "Emergency mop - using aggressive taker price");
-            // For emergency, we MUST fill, so be aggressive
-            match calculate_buy_limit(signal.price, EMERGENCY_TAKER_BUFFER, true) {
-                Some(price) => price,
-                None => {
-                    error!("Cannot calculate emergency price");
-                    return;
-                }
-            }
-        } else {
-            match calculate_buy_limit(signal.price, LIMIT_ORDER_BUFFER, false) {
-                Some(price) => price,
-                None => {
-                    warn!(
-                        signal_price = %signal.price,
-                        "Signal price too low for second leg - skipping"
-                    );
+            let pair = state.pair.read();
+            match (pair.latest_up_ask(), pair.latest_down_ask()) {
+                (Some(u), Some(d)) => (u, d),
+                _ => {
+                    drop(pair);
+                    self.cancel_all_orders(market_id).await;
                     return;
                 }
             }
         };
 
-        info!(
-            token_id = %token_id,
-            signal_price = %signal.price,
-            limit_price = %limit_price,
-            size = %position_size,
-            is_emergency,
-            dry_run = self.config.dry_run,
-            "Executing second leg order"
-        );
+        let inv = self.inventory.get(market_id).cloned().unwrap_or_default();
+        let max_total_cost = self.config.legging_config.max_total_cost;
+        let max_shares_per_side = self.config.legging_config.max_shares_per_side;
+        let remaining_up = (max_shares_per_side - inv.up_shares).max(Decimal::ZERO);
+        let remaining_down = (max_shares_per_side - inv.down_shares).max(Decimal::ZERO);
 
-        let order_id = if self.config.dry_run {
-            debug!("Dry run mode - simulating order placement");
-            Some(format!("dry-run-{}", Utc::now().timestamp_millis()))
-        } else {
-            match self.place_order(&token_id, limit_price).await {
-                Ok(oid) => {
-                    info!(order_id = %oid, "Second leg order placed successfully");
-                    Some(oid)
+        if let (Some(up_avg), Some(down_avg)) = (inv.up_avg, inv.down_avg) {
+            if up_avg + down_avg > max_total_cost {
+                self.cancel_all_orders(market_id).await;
+                return;
+            }
+        }
+
+        if remaining_up <= Decimal::ZERO && remaining_down <= Decimal::ZERO {
+            self.cancel_all_orders(market_id).await;
+            return;
+        }
+
+        let up_base = clamp_price(max_total_cost - down_ask);
+        let down_base = clamp_price(max_total_cost - up_ask);
+
+        let levels = self.config.legging_config.max_live_orders_per_token.max(1);
+        let size_per_order = self.config.arb_config.shares_per_side;
+
+        let mut new_up_orders = Vec::new();
+        let mut new_down_orders = Vec::new();
+
+        let mut remaining_up_size = remaining_up;
+        if remaining_up_size > Decimal::ZERO {
+            for i in 0..levels {
+                if remaining_up_size <= Decimal::ZERO {
+                    break;
                 }
-                Err(e) => {
-                    error!(error = %e, "Failed to place second leg order - position remains open");
-                    return; // Don't mark complete if order failed
+                let price = clamp_price(up_base - LADDER_PRICE_STEP * Decimal::from(i as u32));
+                let down_ref = inv.down_avg.unwrap_or(down_ask);
+                if price + down_ref > max_total_cost {
+                    continue;
                 }
+                let size = size_per_order.min(remaining_up_size);
+                new_up_orders.push((price, size));
+                remaining_up_size -= size;
+            }
+        }
+
+        let mut remaining_down_size = remaining_down;
+        if remaining_down_size > Decimal::ZERO {
+            for i in 0..levels {
+                if remaining_down_size <= Decimal::ZERO {
+                    break;
+                }
+                let price = clamp_price(down_base - LADDER_PRICE_STEP * Decimal::from(i as u32));
+                let up_ref = inv.up_avg.unwrap_or(up_ask);
+                if price + up_ref > max_total_cost {
+                    continue;
+                }
+                let size = size_per_order.min(remaining_down_size);
+                new_down_orders.push((price, size));
+                remaining_down_size -= size;
+            }
+        }
+
+        self.replace_side_orders(market_id, Side::Up, &new_up_orders).await;
+        self.replace_side_orders(market_id, Side::Down, &new_down_orders).await;
+    }
+
+    async fn replace_side_orders(
+        &mut self,
+        market_id: &str,
+        side: Side,
+        desired: &[(Decimal, Decimal)],
+    ) {
+        let mut existing = {
+            let orders = self.orders.entry(market_id.to_string()).or_default();
+            match side {
+                Side::Up => std::mem::take(&mut orders.up),
+                Side::Down => std::mem::take(&mut orders.down),
             }
         };
 
-        if let Some(position) = self.positions.get_mut(market_id) {
-            position.second_side = Some(signal.side);
-            position.second_price = Some(limit_price);
-            position.second_order_id = order_id;
+        if !existing.is_empty() {
+            let ids: Vec<String> = existing.iter().map(|o| o.order_id.clone()).collect();
+            self.cancel_orders(&ids).await;
+            existing.clear();
+        }
 
-            let total_cost = position.total_cost();
-            let profit = position.profit().unwrap_or(dec!(0));
-            
-            info!(
-                market_id,
-                first_price = %first_price,
-                second_price = %limit_price,
-                total_cost = %total_cost,
-                profit = %profit,
-                profit_pct = %(profit / total_cost * dec!(100)),
-                "Position completed successfully"
-            );
+        for (price, size) in desired {
+            if *size <= Decimal::ZERO {
+                continue;
+            }
+            if let Some(order_id) = self.place_ladder_order(market_id, side, *price, *size).await {
+                existing.push(RestingOrder {
+                    order_id,
+                    price: *price,
+                    size: *size,
+                });
+            }
+        }
+
+        let orders = self.orders.entry(market_id.to_string()).or_default();
+        match side {
+            Side::Up => orders.up = existing,
+            Side::Down => orders.down = existing,
         }
     }
 
-    #[instrument(skip(self), fields(token_id = %token_id, price = %price))]
-    async fn place_order(&self, token_id: &str, price: Decimal) -> anyhow::Result<String> {
-        let poly_price = PolyDecimal::try_from(price.to_string().as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid price format: {}", e))?;
+    async fn cancel_all_orders(&mut self, market_id: &str) {
+        let ids: Vec<String> = self
+            .orders
+            .get(market_id)
+            .map(|orders| {
+                orders
+                    .up
+                    .iter()
+                    .chain(orders.down.iter())
+                    .map(|o| o.order_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let poly_size =
-            PolyDecimal::try_from(self.config.arb_config.shares_per_side.to_string().as_str())
-                .map_err(|e| anyhow::anyhow!("Invalid size format: {}", e))?;
+        if !ids.is_empty() {
+            self.cancel_orders(&ids).await;
+        }
 
-        debug!("Building limit order");
+        if let Some(orders) = self.orders.get_mut(market_id) {
+            orders.up.clear();
+            orders.down.clear();
+        }
+    }
+
+    async fn cancel_orders(&self, order_ids: &[String]) {
+        if self.config.dry_run {
+            return;
+        }
+        let refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
+        let _ = self.client.cancel_orders(&refs).await;
+    }
+
+    async fn place_ladder_order(
+        &self,
+        market_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    ) -> Option<String> {
+        let state = self.markets.get(market_id)?;
+        let token_id = match side {
+            Side::Up => state.info.up_token_id.as_str(),
+            Side::Down => state.info.down_token_id.as_str(),
+        };
+
+        let poly_price = PolyDecimal::try_from(price.to_string().as_str()).ok()?;
+        let poly_size = PolyDecimal::try_from(size.to_string().as_str()).ok()?;
+
+        if self.config.dry_run {
+            return Some(format!("dry-{}-{}", token_id, Utc::now().timestamp_millis()));
+        }
+
         let signable = self
             .client
             .limit_order()
@@ -548,81 +476,19 @@ impl HighFreqArbBot {
             .price(poly_price)
             .size(poly_size)
             .side(ClobSide::Buy)
+            .order_type(OrderType::GTC)
             .build()
-            .await?;
+            .await
+            .ok()?;
 
-        debug!("Signing order");
         let signed = self
             .client
-            .sign(
-                &self.signer.clone().with_chain_id(Some(POLYGON)),
-                signable,
-            )
-            .await?;
+            .sign(&self.signer.clone().with_chain_id(Some(POLYGON)), signable)
+            .await
+            .ok()?;
 
-        debug!("Posting order");
-        let response = self.client.post_order(signed).await?;
-
-        if let Some(ref error_msg) = response.error_msg {
-            if !error_msg.is_empty() {
-                warn!(error_msg, order_id = %response.order_id, "Order posted with error message");
-            }
-        }
-
-        info!(order_id = %response.order_id, "Order posted successfully");
-        Ok(response.order_id)
-    }
-
-    fn build_snapshot(&self, market_id: &str, state: &MarketState) -> Option<MarketSnapshot> {
-        let open_price = match state.binance_open_price {
-            Some(price) => price,
-            None => {
-                debug!(
-                    market_id,
-                    asset = %state.info.asset,
-                    "Skipping snapshot: no open price"
-                );
-                return None;
-            }
-        };
-
-        let current_price = match self.chainlink_prices.get(&state.info.asset) {
-            Some(&price) => price,
-            None => {
-                debug!(
-                    market_id,
-                    asset = %state.info.asset,
-                    "Skipping snapshot: no chainlink price"
-                );
-                return None;
-            }
-        };
-
-        let pair = state.pair.read();
-        let up_ask = pair.latest_up_ask();
-        let down_ask = pair.latest_down_ask();
-
-        match (up_ask, down_ask) {
-            (Some(up), Some(down)) => Some(MarketSnapshot {
-                asset: state.info.asset.clone(),
-                market_id: market_id.to_string(),
-                open_price,
-                current_price,
-                pm_up_ask: up,
-                pm_down_ask: down,
-                elapsed_pct: state.elapsed_pct(Utc::now()),
-            }),
-            _ => {
-                debug!(
-                    market_id,
-                    asset = %state.info.asset,
-                    up_ask = ?up_ask,
-                    down_ask = ?down_ask,
-                    "Skipping snapshot: missing PM asks"
-                );
-                None
-            }
-        }
+        let response = self.client.post_order(signed).await.ok()?;
+        Some(response.order_id)
     }
 
     fn log_status(&self) {
@@ -632,46 +498,27 @@ impl HighFreqArbBot {
         info!(
             time_est = %est_time,
             markets = self.markets.len(),
-            active_positions = self.positions.values().filter(|p| !p.is_complete()).count(),
-            complete_positions = self.positions.values().filter(|p| p.is_complete()).count(),
             "Status update"
         );
 
         for (market_id, state) in &self.markets {
             let pair = state.pair.read();
-            let current_price = self
-                .chainlink_prices
-                .get(&state.info.asset)
-                .copied()
-                .unwrap_or(dec!(0));
-
-            let move_bps = state.binance_open_price
-                .filter(|open| !open.is_zero())
-                .map(|open| ((current_price - open) / open) * dec!(10000));
-
-            let position_status = match self.positions.get(market_id) {
-                Some(p) if p.is_complete() => {
-                    let profit = p.profit().unwrap_or(dec!(0));
-                    format!("COMPLETE cost={:.3} profit={:+.3}", p.total_cost(), profit)
-                }
-                Some(p) => {
-                    format!(
-                        "ASYNC {:?}@{:.3} age={}s",
-                        p.first_side,
-                        p.first_price,
-                        p.age_seconds(now)
-                    )
-                }
-                None => "IDLE".to_string(),
+            let inv = self.inventory.get(market_id).cloned().unwrap_or_default();
+            let combined = match (inv.up_avg, inv.down_avg) {
+                (Some(u), Some(d)) => Some(u + d),
+                _ => None,
             };
+            let edge = combined.map(|c| dec!(1.0) - c);
 
             info!(
                 asset = %state.info.asset.to_uppercase(),
                 elapsed_pct = format!("{:.1}%", state.elapsed_pct(now) * 100.0),
-                move_bps = move_bps.map(|b| format!("{:+.1}", b)).unwrap_or_else(|| "---".to_string()),
                 up_ask = pair.rest_up_ask.map(|p| format!("{:.3}", p)).unwrap_or_else(|| "---".to_string()),
                 down_ask = pair.rest_down_ask.map(|p| format!("{:.3}", p)).unwrap_or_else(|| "---".to_string()),
-                position = %position_status,
+                up_shares = %inv.up_shares.round_dp(2),
+                down_shares = %inv.down_shares.round_dp(2),
+                combined = combined.map(|c| format!("{:.3}", c)).unwrap_or_else(|| "---".to_string()),
+                edge = edge.map(|e| format!("{:.3}", e)).unwrap_or_else(|| "---".to_string()),
                 "Market status"
             );
         }
@@ -710,13 +557,13 @@ impl HighFreqArbBot {
 
         self.markets.clear();
         self.trading_pairs.clear();
+        self.token_to_market.clear();
+        self.token_to_side.clear();
 
         for (asset, info) in selected {
             let market_id = info.id.clone();
             let pair = Arc::new(RwLock::new(info.to_trading_pair()));
             let open_time = Utc::now();
-
-            let open_price = self.fetch_open_price_with_retry(&asset, open_time).await;
 
             let state = MarketState {
                 pair: pair.clone(),
@@ -724,19 +571,26 @@ impl HighFreqArbBot {
                 binance_symbol: String::new(),
                 start_time: open_time,
                 end_time: open_time + DEFAULT_WINDOW_DURATION,
-                binance_open_price: open_price,
+                binance_open_price: None,
             };
 
             info!(
                 market_id = %market_id,
                 asset = %asset,
-                open_price = ?open_price,
                 end_time = %state.end_time,
                 "Market registered"
             );
 
             self.markets.insert(market_id.clone(), state);
             self.trading_pairs.insert(market_id, pair);
+            self.token_to_market
+                .insert(info.up_token_id.clone(), info.id.clone());
+            self.token_to_market
+                .insert(info.down_token_id.clone(), info.id.clone());
+            self.token_to_side
+                .insert(info.up_token_id.clone(), Side::Up);
+            self.token_to_side
+                .insert(info.down_token_id.clone(), Side::Down);
         }
 
         self.current_window_end = self.markets.values().map(|s| s.end_time).min();
@@ -746,65 +600,6 @@ impl HighFreqArbBot {
             window_end = ?self.current_window_end,
             "Market discovery complete"
         );
-    }
-
-    async fn fetch_open_price_with_retry(
-        &self,
-        asset: &str,
-        open_time: DateTime<Utc>,
-    ) -> Option<Decimal> {
-        for attempt in 1..=OPEN_PRICE_MAX_RETRIES {
-            debug!(
-                asset,
-                attempt,
-                max_retries = OPEN_PRICE_MAX_RETRIES,
-                "Fetching open price"
-            );
-
-            let result = tokio::time::timeout(
-                OPEN_PRICE_FETCH_TIMEOUT,
-                self.chainlink.get_price_at(asset, open_time),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(price_data)) => {
-                    info!(
-                        asset,
-                        price = %price_data.price,
-                        "Open price fetched successfully"
-                    );
-                    return Some(price_data.price);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        asset,
-                        attempt,
-                        error = %e,
-                        "Open price fetch failed"
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        asset,
-                        attempt,
-                        timeout_secs = OPEN_PRICE_FETCH_TIMEOUT.as_secs(),
-                        "Open price fetch timed out"
-                    );
-                }
-            }
-
-            if attempt < OPEN_PRICE_MAX_RETRIES {
-                tokio::time::sleep(OPEN_PRICE_RETRY_DELAY).await;
-            }
-        }
-
-        warn!(
-            asset,
-            attempts = OPEN_PRICE_MAX_RETRIES,
-            "Failed to fetch open price after all retries"
-        );
-        None
     }
 
     #[instrument(skip(self), fields(markets = self.markets.len()))]
@@ -822,22 +617,6 @@ impl HighFreqArbBot {
                 )
             })
             .collect();
-
-        // Update Chainlink prices
-        for (_, asset, _, _) in &market_info {
-            match self.chainlink.get_latest_price(asset).await {
-                Ok(price_data) => {
-                    self.chainlink_prices.insert(asset.clone(), price_data.price);
-                }
-                Err(e) => {
-                    debug!(
-                        asset = %asset,
-                        error = %e,
-                        "Failed to fetch Chainlink price"
-                    );
-                }
-            }
-        }
 
         // Update Polymarket prices
         let client = reqwest::Client::new();

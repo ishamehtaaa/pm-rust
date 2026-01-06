@@ -6,7 +6,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Strategy {
-    /// Legacy bot based on Chainlink + window open price.
+    /// Orderbook laddering bot.
     Arb,
     /// Buy both sides when combined ask < 1.00 (configurable).
     Legging,

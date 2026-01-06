@@ -31,4 +31,4 @@ anyhow = "1"
 
 parking_lot = "0.12"
 once_cell = "1"
-polymarket-client-sdk = {version = "0.3.1", features = ["gamma", "rtds"]}
+polymarket-client-sdk = {version = "0.3.1", features = ["gamma", "rtds", "data"]}

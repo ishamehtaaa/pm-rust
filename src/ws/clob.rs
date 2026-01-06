@@ -110,16 +110,15 @@ async fn run_clob_ws(
                 info!("Connected to Polymarket RTDS WS");
                 let (mut write, mut read) = ws_stream.split();
 
-                // Subscribe to crypto_prices and Chainlink price updates
+                // Subscribe to crypto_prices updates
                 let sub = serde_json::json!({
                     "action": "subscribe",
                     "subscriptions": [
-                        {"topic": "crypto_prices", "type": "update"},
-                        {"topic": "crypto_prices_chainlink", "type": "update"}
+                        {"topic": "crypto_prices", "type": "update"}
                     ]
                 });
                 let sub_str = sub.to_string();
-                info!("Sending WS subscribe for topics: crypto_prices, crypto_prices_chainlink");
+                info!("Sending WS subscribe for topics: crypto_prices");
                 if let Err(e) = write.send(Message::Text(sub_str.clone())).await {
                     error!("Failed to send subscribe: {}", e);
                 }

@@ -13,29 +13,27 @@ pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> =
 pub struct AssetInfo {
     pub asset: String,
     pub prefixes: Vec<String>,
-    pub chainlink: String,
     pub binance: String,
 }
 
-pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str], &str, &str)>> = Lazy::new(|| {
+pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str], &str)>> = Lazy::new(|| {
     vec![
-        ("bitcoin", &["btc", "bitcoin"], "btc/usd", "btcusdt"),
-        ("ethereum", &["eth", "ethereum"], "eth/usd", "ethusdt"),
-        ("solana", &["sol", "solana"], "sol/usd", "solusdt"),
-        ("xrp", &["xrp", "xrp"], "xrp/usd", "xrpusdt"),
+        ("bitcoin", &["btc", "bitcoin"], "btcusdt"),
+        ("ethereum", &["eth", "ethereum"], "ethusdt"),
+        ("solana", &["sol", "solana"], "solusdt"),
+        ("xrp", &["xrp", "xrp"], "xrpusdt"),
     ]
 });
 
 pub static ASSETS_BY_NAME: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     ASSET_CONFIG
         .iter()
-        .map(|(asset, prefixes, chainlink, binance)| {
+        .map(|(asset, prefixes, binance)| {
             (
                 asset.to_string(),
                 AssetInfo {
                     asset: asset.to_string(),
                     prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
-                    chainlink: chainlink.to_string(),
                     binance: binance.to_string(),
                 },
             )
@@ -77,6 +75,8 @@ impl Default for ArbConfig {
 
 #[derive(Debug, Clone)]
 pub struct LeggingConfig {
+    /// Max filled shares per side for a market.
+    pub max_shares_per_side: Decimal,
     /// Max combined cost to buy both outcomes (after rounding/buffers).
     pub max_total_cost: Decimal,
     /// Extra price buffer added to the observed ask to improve fill probability.
@@ -106,9 +106,10 @@ pub struct LeggingConfig {
 impl Default for LeggingConfig {
     fn default() -> Self {
         Self {
-            max_total_cost: dec!(0.98),
+            max_shares_per_side: dec!(40),
+            max_total_cost: dec!(0.95),
             taker_buffer: dec!(0.00),
-            cooldown_secs: 1,
+            cooldown_secs: 10,
             max_price_age_ms: 2_500,
             mop_start_secs: 90,
             mop_max_total_cost: dec!(1.00),
@@ -148,6 +149,10 @@ impl Config {
         if let Ok(v) = std::env::var("LEGGING_MAX_TOTAL_COST") {
             legging_config.max_total_cost = Decimal::from_str_exact(&v)
                 .map_err(|e| anyhow::anyhow!("Invalid LEGGING_MAX_TOTAL_COST: {}", e))?;
+        }
+        if let Ok(v) = std::env::var("LEGGING_MAX_SHARES_PER_SIDE") {
+            legging_config.max_shares_per_side = Decimal::from_str_exact(&v)
+                .map_err(|e| anyhow::anyhow!("Invalid LEGGING_MAX_SHARES_PER_SIDE: {}", e))?;
         }
         if let Ok(v) = std::env::var("LEGGING_TAKER_BUFFER") {
             legging_config.taker_buffer = Decimal::from_str_exact(&v)
@@ -201,6 +206,12 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "LEGGING_MAX_TOTAL_COST must be in (0, 1.00], got {}",
                 legging_config.max_total_cost
+            ));
+        }
+        if legging_config.max_shares_per_side <= Decimal::ZERO {
+            return Err(anyhow::anyhow!(
+                "LEGGING_MAX_SHARES_PER_SIDE must be > 0, got {}",
+                legging_config.max_shares_per_side
             ));
         }
         if legging_config.taker_buffer < Decimal::ZERO {
