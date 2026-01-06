@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::str::FromStr;
 use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::filter::Directive;
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
@@ -60,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging with tracing-subscriber
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let filter = filter
+        .add_directive("hyper_util::client::legacy::pool=off".parse::<Directive>()?)
+        .add_directive("tungstenite=off".parse::<Directive>()?);
     fmt().with_env_filter(filter).init();
 
     // Load configuration from environment

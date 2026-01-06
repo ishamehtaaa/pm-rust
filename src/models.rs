@@ -173,6 +173,7 @@ pub struct OrderEvent {
     pub price: Decimal,
     pub size_matched: Decimal,
     pub msg_type: String,
+    pub trade_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +269,8 @@ pub struct ExecutionState {
     pub taker_in_flight: bool,
     pub last_taker_time: Option<Instant>,
     pub balance_error: bool,
+    pub last_ladder_refresh: Option<Instant>,
+    pub last_positions_update: Option<Instant>,
     pub up_bid: Option<Decimal>,
     pub up_ask: Option<Decimal>,
     pub down_bid: Option<Decimal>,

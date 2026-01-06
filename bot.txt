@@ -570,23 +570,13 @@ impl LeggingBot {
         let mut summary = Vec::new();
         for (gamma_id, inventory) in aggregated {
             let asset = self.asset_name(&gamma_id);
-            let combined = match (
-                inventory.avg_price(Side::Up),
-                inventory.avg_price(Side::Down),
-            ) {
-                (Some(up_avg), Some(down_avg)) => Some(up_avg + down_avg),
-                _ => None,
-            };
-            let edge = combined.map(|c| dec!(1.0) - c);
             summary.push(format!(
-                "[{}] positions | up: {} @ {:?} | down: {} @ {:?} | combined: {:?} | edge: {:?}",
+                "[{}] positions | up: {} @ {:?} | down: {} @ {:?}",
                 asset,
                 inventory.up_shares.round_dp(2),
                 inventory.avg_price(Side::Up).map(|p| p.round_dp(3)),
                 inventory.down_shares.round_dp(2),
                 inventory.avg_price(Side::Down).map(|p| p.round_dp(3)),
-                combined.map(|c| c.round_dp(3)),
-                edge.map(|e| e.round_dp(3)),
             ));
             let st = self.state.entry(gamma_id.clone()).or_default();
             *st.inventory_mut() = inventory;
@@ -678,13 +668,12 @@ impl LeggingBot {
                 .map(|o| o.remaining())
                 .sum();
             let capacity = cfg.target_shares_per_market - (current_shares + resting);
-            let remaining = (settings.max_filled_per_side - current_shares).max(Decimal::ZERO);
             let min_size = self.min_shares_for_notional(ask);
             let desired = floor_size(imb.abs()).max(min_size);
             let size = if capacity >= settings.min_order_size {
-                desired.min(capacity).min(remaining)
+                desired.min(capacity)
             } else {
-                desired.min(remaining)
+                desired
             };
             if size < settings.min_order_size {
                 return;
@@ -766,13 +755,12 @@ impl LeggingBot {
                 .map(|o| o.remaining())
                 .sum();
             let capacity = cfg.target_shares_per_market - (current_shares + resting);
-            let remaining = (settings.max_filled_per_side - current_shares).max(Decimal::ZERO);
             let min_size = self.min_shares_for_notional(taker_price);
             let desired = floor_size(imb.abs()).max(min_size);
             let size = if capacity >= settings.min_order_size {
-                desired.min(capacity).min(remaining)
+                desired.min(capacity)
             } else {
-                desired.min(remaining)
+                desired
             };
             if size < settings.min_order_size {
                 return;
@@ -1056,7 +1044,6 @@ impl LeggingBot {
         let cfg = &self.config.legging_config;
         let target_shares = cfg.target_shares_per_market;
         let target_combined = cfg.target_combined;
-        let max_filled_per_side = self.settings().max_filled_per_side;
 
         let market = match self.markets.get(gamma_id) {
             Some(m) => m.info.clone(),
@@ -1090,10 +1077,8 @@ impl LeggingBot {
             let up_resting: Decimal = st.quotes.up_orders.iter().map(|o| o.remaining()).sum();
             let down_resting: Decimal = st.quotes.down_orders.iter().map(|o| o.remaining()).sum();
 
-            let up_remaining = (max_filled_per_side - inv.up_shares).max(Decimal::ZERO);
-            let down_remaining = (max_filled_per_side - inv.down_shares).max(Decimal::ZERO);
-            let up_cap = (target_shares - (inv.up_shares + up_resting)).min(up_remaining);
-            let down_cap = (target_shares - (inv.down_shares + down_resting)).min(down_remaining);
+            let up_cap = target_shares - (inv.up_shares + up_resting);
+            let down_cap = target_shares - (inv.down_shares + down_resting);
 
             (
                 up_ask, down_ask, up_target, down_target, up_cap, down_cap,
@@ -1104,11 +1089,9 @@ impl LeggingBot {
         let near_end = (market.end_time - Utc::now()).num_milliseconds() <= 60_000;
         let need_up = imb < -imbalance_threshold;
         let need_down = imb > imbalance_threshold;
-        let over_max_up = inv.up_shares > max_filled_per_side;
-        let over_max_down = inv.down_shares > max_filled_per_side;
+        let over_max_up = inv.up_shares > target_shares;
+        let over_max_down = inv.down_shares > target_shares;
         let over_max = over_max_up || over_max_down;
-        let up_avg = inv.avg_price(Side::Up);
-        let down_avg = inv.avg_price(Side::Down);
 
         let up_aggressive = need_up
             && (near_end
@@ -1141,39 +1124,15 @@ impl LeggingBot {
         }
 
         if imb <= imbalance_threshold && up_cap >= min_order_size {
-            if let Some(down_avg) = down_avg {
-                if up_base + down_avg > target_combined {
-                    self.cancel_side(gamma_id, Side::Up).await;
-                } else {
-                    self.maintain_side_ladder(gamma_id, Side::Up, &market.ids, up_base, up_cap)
-                        .await;
-                }
-            } else {
-                self.maintain_side_ladder(gamma_id, Side::Up, &market.ids, up_base, up_cap)
-                    .await;
-            }
+            self.maintain_side_ladder(gamma_id, Side::Up, &market.ids, up_base, up_cap)
+                .await;
         } else {
             self.cancel_side(gamma_id, Side::Up).await;
         }
 
         if imb >= -imbalance_threshold && down_cap >= min_order_size {
-            if let Some(up_avg) = up_avg {
-                if down_base + up_avg > target_combined {
-                    self.cancel_side(gamma_id, Side::Down).await;
-                } else {
-                    self.maintain_side_ladder(
-                        gamma_id,
-                        Side::Down,
-                        &market.ids,
-                        down_base,
-                        down_cap,
-                    )
-                    .await;
-                }
-            } else {
-                self.maintain_side_ladder(gamma_id, Side::Down, &market.ids, down_base, down_cap)
-                    .await;
-            }
+            self.maintain_side_ladder(gamma_id, Side::Down, &market.ids, down_base, down_cap)
+                .await;
         } else {
             self.cancel_side(gamma_id, Side::Down).await;
         }
@@ -1194,13 +1153,7 @@ impl LeggingBot {
         let levels_per_side = self.settings().levels_per_side;
         let min_order_size = self.settings().min_order_size;
         let min_notional = self.settings().min_notional;
-        let max_resting_per_side = self.settings().max_resting_per_side;
         let base = self.clamp_price(base_price);
-        let current_resting: Decimal = self
-            .state
-            .get(gamma_id)
-            .map(|s| s.quotes.side_orders(side).iter().map(|o| o.remaining()).sum())
-            .unwrap_or(Decimal::ZERO);
 
         if base < min_price + price_tick || base > max_price - price_tick {
             self.cancel_side(gamma_id, side).await;
@@ -1208,8 +1161,7 @@ impl LeggingBot {
         }
 
         let mut levels: Vec<Decimal> = Vec::new();
-        let mut cap_left = capacity
-            .min((max_resting_per_side - current_resting).max(Decimal::ZERO));
+        let mut cap_left = capacity;
         for i in 0..levels_per_side {
             let p = self.clamp_price(base - price_tick * Decimal::from(i as u32));
             if p < min_price + price_tick || cap_left < min_order_size {
@@ -1247,23 +1199,7 @@ impl LeggingBot {
                 }
             }
 
-            let mut kept = k;
-            let mut stale_ids = s;
-            let mut kept_sum: Decimal = kept.iter().map(|o| o.remaining()).sum();
-
-            if kept_sum > max_resting_per_side {
-                kept.sort_by_key(|o| o.posted_at);
-                for o in kept.iter() {
-                    if kept_sum <= max_resting_per_side {
-                        break;
-                    }
-                    kept_sum -= o.remaining();
-                    stale_ids.push(o.order_id.clone());
-                }
-                kept.retain(|o| !stale_ids.contains(&o.order_id));
-            }
-
-            (kept, stale_ids)
+            (k, s)
         };
 
         if !stale.is_empty() {
@@ -1717,7 +1653,6 @@ impl LeggingBot {
 
     fn log_status(&self) {
         info!("=== STATUS: {} markets ===", self.markets.len());
-        let mut total_pnl = Decimal::ZERO;
 
         for (gid, market) in &self.markets {
             let asset = market.info.asset.to_uppercase();
@@ -1735,7 +1670,6 @@ impl LeggingBot {
             } else {
                 dec!(0)
             };
-            total_pnl += pnl;
 
             let up_avg = inv.avg_price(Side::Up).map(|p| p.round_dp(3));
             let down_avg = inv.avg_price(Side::Down).map(|p| p.round_dp(3));
@@ -1764,8 +1698,6 @@ impl LeggingBot {
                 asset, up_ladder, down_ladder, st.taker_in_flight
             );
         }
-
-        info!("TOTAL pnl: ${:.2}", total_pnl);
     }
 
     pub fn market_count(&self) -> usize {

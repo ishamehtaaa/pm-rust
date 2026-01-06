@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+const ATOMIC_PRICE_SCALE: f64 = 1_000_000.0;
 
 pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> = Lazy::new(|| HashSet::from(["ethereum"]));
 
@@ -88,6 +89,10 @@ pub struct BotSettings {
     pub rollover_interval: Duration,
     pub cleanup_interval: Duration,
     pub positions_poll_interval: Duration,
+    pub positions_poll_fast: Duration,
+    pub positions_poll_slow: Duration,
+    pub max_resting_per_side: Decimal,
+    pub max_filled_per_side: Decimal,
     pub min_price: Decimal,
     pub max_price: Decimal,
     pub price_tick: Decimal,
@@ -109,6 +114,10 @@ impl Default for BotSettings {
             rollover_interval: Duration::from_secs(1),
             cleanup_interval: Duration::from_secs(300),
             positions_poll_interval: Duration::from_secs(30),
+            positions_poll_fast: Duration::from_secs(2),
+            positions_poll_slow: Duration::from_secs(10),
+            max_resting_per_side: dec!(16.0),
+            max_filled_per_side: dec!(50.0),
             min_price: dec!(0.01),
             max_price: dec!(0.99),
             price_tick: dec!(0.01),
@@ -176,4 +185,12 @@ impl Config {
             bot_settings: BotSettings::default(),
         })
     }
+}
+
+pub fn to_atomic_price(price: f64) -> u64 {
+    (price * ATOMIC_PRICE_SCALE).round() as u64
+}
+
+pub fn from_atomic_price(price: u64) -> f64 {
+    price as f64 / ATOMIC_PRICE_SCALE
 }
