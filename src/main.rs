@@ -79,10 +79,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!(
-        "Starting Powerful Polymarket Bot (dry_run={}, targets={:?})",
+        "Starting Powerful Polymarket Bot (dry_run={}, targets={:?}, shares_per_market={})",
         config.dry_run,
-        config.target_assets
+        config.target_assets,
+        config.legging_config.target_shares_per_market
     );
+    tracing::debug!(settings = ?config.bot_settings, "Bot settings");
 
     // Initialize the bot
     let mut bot = LeggingBot::new(config).await?;

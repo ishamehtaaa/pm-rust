@@ -17,7 +17,8 @@ use polymarket_client_sdk::clob::types::{OrderType, Side as ClobSide, SignatureT
 use polymarket_client_sdk::clob::ws::{self, BookUpdate, WsMessage};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::data::{
-    Client as DataClient, types::request::PositionsRequest, types::response::Position,
+    Client as DataClient,
+    types::{request::PositionsRequest, response::Position},
 };
 use polymarket_client_sdk::types::Address;
 use polymarket_client_sdk::types::Decimal as PolyDecimal;
@@ -147,6 +148,7 @@ impl LeggingBot {
             trader.clone(),
             positions_interval,
         );
+        info!("Automated positions polling every {:?}", positions_interval);
 
         let (order_tx, order_rx) = mpsc::channel(256);
         let (price_tx, price_rx) = mpsc::channel(2048); // Increased buffer
@@ -244,13 +246,15 @@ impl LeggingBot {
 
     fn cleanup_history(&mut self) {
         let now = Instant::now();
-        let max_age = Duration::from_secs(3600); // Keep 1 hour of history
+        let settings = self.settings();
+        let retention = settings.order_history_retention;
+        let prefill_retention = settings.prefill_retention;
 
         for st in self.state.values_mut() {
             st.processed_trade_ids
-                .retain(|_, time| now.duration_since(*time) < max_age);
+                .retain(|_, time| now.duration_since(*time) < retention);
             st.prefilled
-                .retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(15));
+                .retain(|_, (_, time)| now.duration_since(*time) < prefill_retention);
         }
     }
 
@@ -829,6 +833,19 @@ impl LeggingBot {
         });
     }
 
+    fn build_positions_request(user: &Address) -> Option<PositionsRequest> {
+        let builder = PositionsRequest::builder().user(user.clone());
+        let builder = match builder.limit(500) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Positions request limit invalid: {}", e);
+                return None;
+            }
+        };
+
+        Some(builder.build())
+    }
+
     fn spawn_positions_poller(
         client: DataClient,
         tx: mpsc::Sender<Vec<Position>>,
@@ -840,15 +857,10 @@ impl LeggingBot {
 
             loop {
                 interval.tick().await;
-                let builder = match PositionsRequest::builder().user(user.clone()).limit(500) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("Failed to set limit on positions request: {}", e);
-                        continue;
-                    }
+                let request = match Self::build_positions_request(&user) {
+                    Some(req) => req,
+                    None => continue,
                 };
-
-                let request = builder.build();
 
                 match client.positions(&request).await {
                     Ok(positions) => {

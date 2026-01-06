@@ -97,6 +97,8 @@ pub struct BotSettings {
     pub levels_per_side: usize,
     pub taker_cooldown: Duration,
     pub balance_error_cooldown: Duration,
+    pub order_history_retention: Duration,
+    pub prefill_retention: Duration,
 }
 
 impl Default for BotSettings {
@@ -116,6 +118,8 @@ impl Default for BotSettings {
             levels_per_side: 5,
             taker_cooldown: Duration::from_secs(2),
             balance_error_cooldown: Duration::from_secs(30),
+            order_history_retention: Duration::from_secs(3600),
+            prefill_retention: Duration::from_secs(15),
         }
     }
 }
