@@ -19,16 +19,17 @@ pub struct BotConfig {
     pub assets_override: Option<Vec<String>>,
     pub log_level: Option<String>,
     pub cycle_interval_override: Option<u64>,
+    pub max_shares_per_side: rust_decimal::Decimal,
 }
 
 impl BotConfig {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        let private_key = std::env::var("POLY_PRIVATE_KEY")
-            .context("POLY_PRIVATE_KEY is required")?;
-        let proxy_address = std::env::var("POLY_PROXY_ADDRESS")
-            .context("POLY_PROXY_ADDRESS is required")?;
+        let private_key =
+            std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY is required")?;
+        let proxy_address =
+            std::env::var("POLY_PROXY_ADDRESS").context("POLY_PROXY_ADDRESS is required")?;
 
         let clob_host = std::env::var("POLYMARKET_CLOB_HOST")
             .unwrap_or_else(|_| POLYMARKET_CLOB_HOST.to_string());
@@ -46,6 +47,7 @@ impl BotConfig {
             assets_override: None,
             log_level: None,
             cycle_interval_override: None,
+            max_shares_per_side: rust_decimal_macros::dec!(50.0),
         })
     }
 

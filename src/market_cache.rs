@@ -1,12 +1,12 @@
 use chrono::{DateTime, Utc};
-use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market as GammaMarket;
+use polymarket_client_sdk::gamma::Client as GammaClient;
 use std::collections::HashSet;
 use tracing::info;
 
 use crate::config::assets::ASSETS_BY_PREFIX;
-use crate::models::{MarketIds, MarketInfo, duration_label};
+use crate::models::{duration_label, MarketIds, MarketInfo};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MarketCacheError {

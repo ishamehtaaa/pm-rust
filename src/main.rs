@@ -3,7 +3,8 @@ use chrono::Utc;
 use clap::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{error, info, warn, debug};
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, error, info, warn};
 
 use polymarket_client_sdk::clob::types::Side;
 use polymarket_ladder_bot::config::BotConfig;
@@ -11,7 +12,7 @@ use polymarket_ladder_bot::execution::ExecutionEngine;
 use polymarket_ladder_bot::inventory::{fetch_balances, reconcile_positions, InventorySnapshot};
 use polymarket_ladder_bot::market_cache::MarketCache;
 use polymarket_ladder_bot::risk::{OrderBudget, RiskManager};
-use polymarket_ladder_bot::strategy::{LadderStrategy, OrderBookSnapshot, OrderKind};
+use polymarket_ladder_bot::strategy::{LadderStrategy, MarketStage, OrderBookSnapshot, OrderKind};
 use polymarket_ladder_bot::utils::{clamp_decimal, round_down_2dp, round_down_for_tick};
 
 #[derive(Parser, Debug)]
@@ -29,6 +30,12 @@ struct Cli {
     /// Max exposure per market (USDC)
     #[arg(long)]
     max_exposure_per_market: Option<Decimal>,
+    /// Cycle interval (seconds)
+    #[arg(long)]
+    cycle_interval: Option<u64>,
+    /// Max shares per side
+    #[arg(long)]
+    max_shares_per_side: Option<Decimal>,
 }
 
 #[tokio::main]
@@ -48,6 +55,12 @@ async fn main() -> Result<()> {
     if let Some(exposure) = cli.max_exposure_per_market {
         config.max_exposure_per_market = exposure;
     }
+    if let Some(interval) = cli.cycle_interval {
+        config.cycle_interval_override = Some(interval);
+    }
+    if let Some(shares) = cli.max_shares_per_side {
+        config.max_shares_per_side = shares;
+    }
 
     let log_level = config
         .log_level
@@ -58,10 +71,8 @@ async fn main() -> Result<()> {
         log_level
     );
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
-    let (inventory_tx, mut inventory_rx) = mpsc::unbounded_channel();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (inventory_tx, mut inventory_rx) = unbounded_channel();
     let market_cache = MarketCache::new(config.target_assets());
     let executor = ExecutionEngine::new(&config, Some(inventory_tx))
         .await
@@ -71,6 +82,7 @@ async fn main() -> Result<()> {
         config.order_size,
         config.rebalance_threshold,
         dec!(5.0),
+        config.max_shares_per_side,
     );
 
     info!(
@@ -84,9 +96,11 @@ async fn main() -> Result<()> {
     );
 
     let mut cached_markets = Vec::new();
-    let mut balance_cache: std::collections::HashMap<String, CachedBalance> = std::collections::HashMap::new();
-    let equity_baseline: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, EquityBaseline>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut balance_cache: std::collections::HashMap<String, CachedBalance> =
+        std::collections::HashMap::new();
+    let equity_baseline: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, EquityBaseline>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let mut last_market_fetch = tokio::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(600))
         .unwrap_or_else(tokio::time::Instant::now);
@@ -96,7 +110,9 @@ async fn main() -> Result<()> {
 
     loop {
         let now = Utc::now();
-        if last_market_fetch.elapsed() >= std::time::Duration::from_secs(600) || cached_markets.is_empty() {
+        if last_market_fetch.elapsed() >= std::time::Duration::from_secs(600)
+            || cached_markets.is_empty()
+        {
             match market_cache.get_markets(now).await {
                 Ok(markets) => {
                     cached_markets = markets;
@@ -104,10 +120,7 @@ async fn main() -> Result<()> {
                     let token_ids: Vec<String> = cached_markets
                         .iter()
                         .flat_map(|market| {
-                            vec![
-                                market.ids.up_token.clone(),
-                                market.ids.down_token.clone(),
-                            ]
+                            vec![market.ids.up_token.clone(), market.ids.down_token.clone()]
                         })
                         .collect();
                     if let Err(err) = executor.update_ws_tokens(token_ids).await {
@@ -144,7 +157,8 @@ async fn main() -> Result<()> {
                 }
                 Err(err) => {
                     error!(error = %err, "Failed to fetch markets");
-                    tokio::time::sleep(std::time::Duration::from_secs(config.cycle_interval_secs)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(config.cycle_interval_secs))
+                        .await;
                     continue;
                 }
             };
@@ -226,14 +240,15 @@ async fn process_market(
     market: &polymarket_ladder_bot::models::MarketInfo,
     now: chrono::DateTime<Utc>,
     cached_balance: Option<CachedBalance>,
-    equity_baseline: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, EquityBaseline>>>,
+    equity_baseline: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, EquityBaseline>>,
+    >,
     log_summary: bool,
 ) -> Result<()> {
     let up_book = executor.order_book(&market.ids.up_token).await?;
     let down_book = executor.order_book(&market.ids.down_token).await?;
 
-    let (up_bid, up_ask) =
-        resolve_best_prices(executor, &market.ids.up_token, &up_book).await?;
+    let (up_bid, up_ask) = resolve_best_prices(executor, &market.ids.up_token, &up_book).await?;
     let (down_bid, down_ask) =
         resolve_best_prices(executor, &market.ids.down_token, &down_book).await?;
 
@@ -270,11 +285,13 @@ async fn process_market(
         Some(cache) if cache.fetched_at.elapsed() < std::time::Duration::from_secs(30) => {
             cache.snapshot
         }
-        _ => {
-            fetch_balances(executor.client(), &market.ids.up_token, &market.ids.down_token)
-                .await
-                .context("Failed to fetch balances")?
-        }
+        _ => fetch_balances(
+            executor.client(),
+            &market.ids.up_token,
+            &market.ids.down_token,
+        )
+        .await
+        .context("Failed to fetch balances")?,
     };
 
     debug!(
@@ -345,13 +362,43 @@ async fn process_market(
             "Inventory summary"
         );
     }
-    let orders = strategy.build_orders(
+    let mut orders = strategy.build_orders(
         market,
         &snapshot,
         stage,
         balances.up_balance,
         balances.down_balance,
     );
+    let mut projected_up = balances.up_balance;
+    let mut projected_down = balances.down_balance;
+    let mut iteration = 0;
+    while iteration < 3 {
+        let delta = projected_up - projected_down;
+        if delta.abs() <= strategy.equilibrium_buffer() {
+            break;
+        }
+        let extra = strategy.build_orders(
+            market,
+            &snapshot,
+            MarketStage::Early,
+            projected_up,
+            projected_down,
+        );
+        if extra.is_empty() {
+            break;
+        }
+        for intent in &extra {
+            if intent.token_id == market.ids.up_token {
+                projected_up += intent.size;
+            } else {
+                projected_down += intent.size;
+            }
+        }
+        orders.extend(extra);
+        iteration += 1;
+    }
+    orders =
+        strategy.apply_share_limits(orders, balances.up_balance, balances.down_balance, market);
 
     if orders.is_empty() {
         if log_summary {
@@ -369,8 +416,12 @@ async fn process_market(
         "Generated ladder orders"
     );
 
-    executor.cancel_orders_for_token(&market.ids.up_token).await?;
-    executor.cancel_orders_for_token(&market.ids.down_token).await?;
+    executor
+        .cancel_orders_for_token(&market.ids.up_token)
+        .await?;
+    executor
+        .cancel_orders_for_token(&market.ids.down_token)
+        .await?;
 
     let budget_limit = risk.budget_limit_per_market(balances.usdc_balance);
     let mut budget = OrderBudget::new(budget_limit);
@@ -415,11 +466,15 @@ async fn process_market(
     Ok(())
 }
 
-fn best_bid(book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse) -> Option<Decimal> {
+fn best_bid(
+    book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse,
+) -> Option<Decimal> {
     book.bids.iter().map(|level| level.price).max()
 }
 
-fn best_ask(book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse) -> Option<Decimal> {
+fn best_ask(
+    book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse,
+) -> Option<Decimal> {
     book.asks.iter().map(|level| level.price).min()
 }
 

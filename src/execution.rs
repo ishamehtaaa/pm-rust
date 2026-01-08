@@ -8,24 +8,26 @@ use tracing::{debug, info, warn};
 
 use futures::StreamExt;
 
-use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer as _;
+use polymarket_client_sdk::auth::state::{Authenticated, Unauthenticated};
+use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::request::{
     MidpointRequest, OrderBookSummaryRequest, OrdersRequest, PriceRequest,
 };
 use polymarket_client_sdk::clob::types::{Amount, Side, SignatureType};
-use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::ws::types::response::{OrderMessage, TradeMessage};
-use polymarket_client_sdk::auth::state::{Authenticated, Unauthenticated};
-use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal};
 use polymarket_client_sdk::POLYGON;
 
 use crate::config::BotConfig;
 
 pub struct ExecutionEngine {
-    client: ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    client: ClobClient<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
     signer: PrivateKeySigner,
     api_key: polymarket_client_sdk::auth::ApiKey,
     rate_limiter: OrderRateLimiter,
@@ -73,8 +75,8 @@ impl ExecutionEngine {
             .context("Invalid POLY_PRIVATE_KEY")?
             .with_chain_id(Some(POLYGON));
 
-        let funder = Address::from_str(&config.proxy_address)
-            .context("Invalid POLY_PROXY_ADDRESS")?;
+        let funder =
+            Address::from_str(&config.proxy_address).context("Invalid POLY_PROXY_ADDRESS")?;
 
         let client = ClobClient::new(&config.clob_host, ClobConfig::default())?
             .authentication_builder(&signer)
@@ -89,7 +91,8 @@ impl ExecutionEngine {
             Err(_) => unauth_client.create_api_key(&signer, None).await?,
         };
 
-        let ws_user_client = WsClient::default().authenticate(credentials.clone(), signer.address())?;
+        let ws_user_client =
+            WsClient::default().authenticate(credentials.clone(), signer.address())?;
 
         let rate_limiter = OrderRateLimiter::new(config.max_orders_per_second);
 
@@ -114,7 +117,11 @@ impl ExecutionEngine {
         })
     }
 
-    pub fn client(&self) -> &ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>> {
+    pub fn client(
+        &self,
+    ) -> &ClobClient<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    > {
         &self.client
     }
 
@@ -244,7 +251,10 @@ impl ExecutionEngine {
         }
     }
 
-    pub async fn order_book(&self, token_id: &str) -> Result<polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse> {
+    pub async fn order_book(
+        &self,
+        token_id: &str,
+    ) -> Result<polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse> {
         let request = OrderBookSummaryRequest::builder()
             .token_id(token_id)
             .build();
@@ -379,7 +389,7 @@ impl ExecutionEngine {
                 match self.client.cancel_order(&order.id).await {
                     Ok(_) => {
                         cancelled += 1;
-                        info!(order_id = %order.id, "Cancelled open order");
+                        debug!(order_id = %order.id, "Cancelled open order");
                     }
                     Err(err) => {
                         warn!(order_id = %order.id, error = %err, "Failed to cancel order");
@@ -442,7 +452,7 @@ async fn handle_trade_message(
     stats.last_trade_market = Some(msg.market.clone());
     stats.last_trade_size = Some(msg.size);
     stats.matched_size_total += msg.size;
-    info!(
+    debug!(
         market = %msg.market,
         side = ?msg.side,
         size = %msg.size,

@@ -48,6 +48,7 @@ pub struct LadderStrategy {
     rebalance_chunk: Decimal,
     combined_cap: Decimal,
     equilibrium_buffer: Decimal,
+    max_shares_per_side: Decimal,
 }
 
 impl LadderStrategy {
@@ -55,6 +56,7 @@ impl LadderStrategy {
         base_size: Decimal,
         rebalance_threshold: Decimal,
         rebalance_chunk: Decimal,
+        max_shares_per_side: Decimal,
     ) -> Self {
         Self {
             base_size,
@@ -62,6 +64,7 @@ impl LadderStrategy {
             rebalance_chunk,
             combined_cap: dec!(0.98),
             equilibrium_buffer: dec!(5.0),
+            max_shares_per_side,
         }
     }
 
@@ -106,7 +109,9 @@ impl LadderStrategy {
         up_balance: Decimal,
         down_balance: Decimal,
     ) -> Vec<OrderIntent> {
-        let target_total = self.target_total_shares(Utc::now(), market);
+        let target_total = self
+            .target_total_shares(Utc::now(), market)
+            .min(self.max_shares_per_side * dec!(2.0));
         let target_side = target_total / dec!(2.0);
         let equilibrium_buffer = self.equilibrium_buffer;
         if (up_balance - target_side).abs() <= equilibrium_buffer
@@ -163,7 +168,8 @@ impl LadderStrategy {
             }
 
             up_price = round_down_for_tick(up_price.max(snapshot.tick_size), snapshot.tick_size);
-            down_price = round_down_for_tick(down_price.max(snapshot.tick_size), snapshot.tick_size);
+            down_price =
+                round_down_for_tick(down_price.max(snapshot.tick_size), snapshot.tick_size);
 
             let min_size = snapshot.up_min_size.max(snapshot.down_min_size);
             let size = round_down_2dp((self.base_size * weight).max(min_size));
@@ -201,9 +207,7 @@ impl LadderStrategy {
 
         let up_delta = effective_target_side - up_balance;
         let down_delta = effective_target_side - down_balance;
-        let drift_threshold = snapshot
-            .up_min_size
-            .max(snapshot.down_min_size);
+        let drift_threshold = snapshot.up_min_size.max(snapshot.down_min_size);
 
         if up_delta.abs() >= drift_threshold {
             let price = if up_delta.is_sign_positive() {
@@ -211,7 +215,8 @@ impl LadderStrategy {
             } else {
                 snapshot.up_ask
             };
-            let mut size = round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(up_delta.abs())));
+            let mut size =
+                round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(up_delta.abs())));
             let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
             let notional = size * price;
             let market_usdc = if up_delta.is_sign_positive() && notional < min_notional {
@@ -237,7 +242,8 @@ impl LadderStrategy {
             } else {
                 snapshot.down_ask
             };
-            let mut size = round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(down_delta.abs())));
+            let mut size =
+                round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(down_delta.abs())));
             let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
             let notional = size * price;
             let market_usdc = if down_delta.is_sign_positive() && notional < min_notional {
@@ -265,7 +271,8 @@ impl LadderStrategy {
                 (market.ids.up_token.clone(), snapshot.up_bid)
             };
 
-            let rebalance_size = round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(imbalance.abs())));
+            let rebalance_size =
+                round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(imbalance.abs())));
             let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
             let min_size = if token_id == market.ids.up_token {
                 snapshot.up_min_size
@@ -292,5 +299,46 @@ impl LadderStrategy {
         }
 
         orders
+    }
+
+    pub fn apply_share_limits(
+        &self,
+        orders: Vec<OrderIntent>,
+        up_balance: Decimal,
+        down_balance: Decimal,
+        market: &MarketInfo,
+    ) -> Vec<OrderIntent> {
+        let mut projected_up = up_balance;
+        let mut projected_down = down_balance;
+        let mut filtered = Vec::new();
+
+        for mut order in orders {
+            let available = if order.token_id == market.ids.up_token {
+                (self.max_shares_per_side - projected_up).max(Decimal::ZERO)
+            } else {
+                (self.max_shares_per_side - projected_down).max(Decimal::ZERO)
+            };
+
+            if available <= Decimal::ZERO {
+                continue;
+            }
+
+            if order.size > available {
+                order.size = round_down_2dp(available);
+                if order.size.is_zero() {
+                    continue;
+                }
+            }
+
+            if order.token_id == market.ids.up_token {
+                projected_up += order.size;
+            } else {
+                projected_down += order.size;
+            }
+
+            filtered.push(order);
+        }
+
+        filtered
     }
 }

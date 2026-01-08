@@ -40,7 +40,10 @@ pub struct OrderBudget {
 
 impl OrderBudget {
     pub fn new(limit: Decimal) -> Self {
-        Self { limit, used: Decimal::ZERO }
+        Self {
+            limit,
+            used: Decimal::ZERO,
+        }
     }
 
     pub fn remaining(&self) -> Decimal {

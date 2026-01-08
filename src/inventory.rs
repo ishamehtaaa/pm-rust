@@ -1,9 +1,9 @@
 use anyhow::Result;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk::clob::types::AssetType;
 use polymarket_client_sdk::clob::Client;
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::types::Decimal;
 
 #[derive(Debug, Clone)]
@@ -19,8 +19,7 @@ pub async fn reconcile_positions(
 ) -> Result<std::collections::HashMap<String, InventorySnapshot>> {
     let mut snapshots = std::collections::HashMap::new();
     for market in markets {
-        let snapshot =
-            fetch_balances(client, &market.ids.up_token, &market.ids.down_token).await?;
+        let snapshot = fetch_balances(client, &market.ids.up_token, &market.ids.down_token).await?;
         snapshots.insert(market.ids.condition_id.clone(), snapshot);
     }
     Ok(snapshots)
