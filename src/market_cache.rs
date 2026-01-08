@@ -1,11 +1,12 @@
-use crate::config::ASSETS_BY_PREFIX;
-use crate::models::{MarketIds, MarketInfo, duration_label};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market as GammaMarket;
 use std::collections::HashSet;
 use tracing::info;
+
+use crate::config::assets::ASSETS_BY_PREFIX;
+use crate::models::{MarketIds, MarketInfo, duration_label};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MarketCacheError {
@@ -36,11 +37,18 @@ impl MarketCache {
         let raw_markets = self.fetch_raw_markets().await?;
         info!("Fetched {} raw markets from Gamma API", raw_markets.len());
 
-        let active_markets: Vec<MarketInfo> = raw_markets
-            .into_iter()
-            .filter_map(|m| self.convert_market(m))
-            .filter(|info| info.start_time <= now && info.end_time > now)
-            .collect();
+        let mut seen_assets: HashSet<String> = HashSet::new();
+        let mut active_markets = Vec::new();
+
+        for market in raw_markets.into_iter() {
+            if let Some(info) = self.convert_market(market) {
+                if info.start_time <= now && info.end_time > now {
+                    if seen_assets.insert(info.asset.clone()) {
+                        active_markets.push(info);
+                    }
+                }
+            }
+        }
 
         info!("Filtered to {} valid markets", active_markets.len());
         Ok(active_markets)
