@@ -10,8 +10,6 @@ pub struct BotConfig {
     pub clob_host: String,
     pub private_key: String,
     pub proxy_address: String,
-    pub max_exposure: rust_decimal::Decimal,
-    pub max_exposure_per_market: rust_decimal::Decimal,
     pub max_orders_per_second: u32,
     pub order_size: rust_decimal::Decimal,
     pub rebalance_threshold: rust_decimal::Decimal,
@@ -20,6 +18,7 @@ pub struct BotConfig {
     pub log_level: Option<String>,
     pub cycle_interval_override: Option<u64>,
     pub max_shares_per_side: rust_decimal::Decimal,
+    pub book_stale_ms: u64,
 }
 
 impl BotConfig {
@@ -38,8 +37,6 @@ impl BotConfig {
             clob_host,
             private_key,
             proxy_address,
-            max_exposure: rust_decimal_macros::dec!(20.0),
-            max_exposure_per_market: rust_decimal_macros::dec!(20.0),
             max_orders_per_second: 5,
             order_size: rust_decimal_macros::dec!(1.0),
             rebalance_threshold: rust_decimal_macros::dec!(20.0),
@@ -48,6 +45,7 @@ impl BotConfig {
             log_level: None,
             cycle_interval_override: None,
             max_shares_per_side: rust_decimal_macros::dec!(50.0),
+            book_stale_ms: 2000,
         })
     }
 

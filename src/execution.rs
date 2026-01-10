@@ -12,15 +12,15 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer as _;
 use polymarket_client_sdk::auth::state::{Authenticated, Unauthenticated};
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::request::{
-    MidpointRequest, OrderBookSummaryRequest, OrdersRequest, PriceRequest,
-};
+use polymarket_client_sdk::clob::types::request::{OrderBookSummaryRequest, OrdersRequest};
 use polymarket_client_sdk::clob::types::{Amount, Side, SignatureType};
+use polymarket_client_sdk::clob::types::response::PostOrderResponse;
 use polymarket_client_sdk::clob::ws::types::response::{OrderMessage, TradeMessage};
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal};
 use polymarket_client_sdk::POLYGON;
+use std::collections::VecDeque;
 
 use crate::config::BotConfig;
 
@@ -32,19 +32,35 @@ pub struct ExecutionEngine {
     api_key: polymarket_client_sdk::auth::ApiKey,
     rate_limiter: OrderRateLimiter,
     ws_client: WsClient<Unauthenticated>,
-    best_prices: std::sync::Arc<RwLock<std::collections::HashMap<String, BestPrice>>>,
+    orderbooks: std::sync::Arc<RwLock<std::collections::HashMap<String, BookSnapshot>>>,
+    price_history: std::sync::Arc<RwLock<std::collections::HashMap<String, VecDeque<Decimal>>>>,
     ws_state: Mutex<WsState>,
     ws_user_client: WsClient<Authenticated<Normal>>,
     user_state: Mutex<UserWsState>,
     user_stats: std::sync::Arc<RwLock<UserStats>>,
+    open_orders: std::sync::Arc<RwLock<std::collections::HashMap<String, OpenOrder>>>,
+    token_meta: std::sync::Arc<RwLock<std::collections::HashMap<String, TokenMeta>>>,
     inventory_update_tx: Option<UnboundedSender<String>>,
+    book_update_tx: Option<UnboundedSender<String>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct BestPrice {
-    pub bid: Decimal,
-    pub ask: Decimal,
+pub struct BookLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookSnapshot {
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenMeta {
+    pub tick_size: Decimal,
+    pub min_order_size: Decimal,
 }
 
 struct WsState {
@@ -66,10 +82,35 @@ pub struct UserStats {
     pub matched_size_total: Decimal,
 }
 
+#[derive(Debug, Clone)]
+struct OpenOrder {
+    asset_id: String,
+    price: Decimal,
+    remaining: Decimal,
+    side: Side,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenOrderView {
+    pub id: String,
+    pub token_id: String,
+    pub price: Decimal,
+    pub remaining: Decimal,
+    pub side: Side,
+}
+
+#[derive(Debug, Clone)]
+pub struct LimitOrderRequest {
+    pub token_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
 impl ExecutionEngine {
     pub async fn new(
         config: &BotConfig,
         inventory_update_tx: Option<UnboundedSender<String>>,
+        book_update_tx: Option<UnboundedSender<String>>,
     ) -> Result<Self> {
         let signer = PrivateKeySigner::from_str(&config.private_key)
             .context("Invalid POLY_PRIVATE_KEY")?
@@ -102,7 +143,8 @@ impl ExecutionEngine {
             api_key: credentials.key(),
             rate_limiter,
             ws_client: WsClient::default(),
-            best_prices: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            orderbooks: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            price_history: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
             ws_state: Mutex::new(WsState {
                 tokens: std::collections::HashSet::new(),
                 task: None,
@@ -113,7 +155,10 @@ impl ExecutionEngine {
                 task: None,
             }),
             user_stats: std::sync::Arc::new(RwLock::new(UserStats::default())),
+            open_orders: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            token_meta: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
             inventory_update_tx,
+            book_update_tx,
         })
     }
 
@@ -139,33 +184,72 @@ impl ExecutionEngine {
         state.tokens = new_set.clone();
 
         let ws_client = self.ws_client.clone();
-        let prices = self.best_prices.clone();
+        let books = self.orderbooks.clone();
+        let history = self.price_history.clone();
         let token_ids = token_ids.clone();
+        let book_tx = self.book_update_tx.clone();
 
         state.task = Some(tokio::spawn(async move {
-            let stream = match ws_client.subscribe_best_bid_ask(token_ids) {
+            let stream = match ws_client.subscribe_orderbook(token_ids) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    debug!(error = %err, "Failed to subscribe to best bid/ask");
+                    debug!(error = %err, "Failed to subscribe to orderbook");
                     return;
                 }
             };
             let mut stream = Box::pin(stream);
             while let Some(update) = stream.next().await {
                 match update {
-                    Ok(bba) => {
-                        let mut cache = prices.write().await;
+                    Ok(book) => {
+                        let mut cache = books.write().await;
+                        let mut bids: Vec<BookLevel> = book
+                            .bids
+                            .iter()
+                            .map(|level| BookLevel {
+                                price: level.price,
+                                size: level.size,
+                            })
+                            .collect();
+                        bids.sort_by(|a, b| b.price.cmp(&a.price));
+                        bids.truncate(5);
+
+                        let mut asks: Vec<BookLevel> = book
+                            .asks
+                            .iter()
+                            .map(|level| BookLevel {
+                                price: level.price,
+                                size: level.size,
+                            })
+                            .collect();
+                        asks.sort_by(|a, b| a.price.cmp(&b.price));
+                        asks.truncate(5);
                         cache.insert(
-                            bba.asset_id.clone(),
-                            BestPrice {
-                                bid: bba.best_bid,
-                                ask: bba.best_ask,
-                                updated_at: bba.timestamp,
+                            book.asset_id.clone(),
+                            BookSnapshot {
+                                bids,
+                                asks,
+                                updated_at: book.timestamp,
                             },
                         );
+                        if let Some(best_bid) = cache
+                            .get(&book.asset_id)
+                            .and_then(|snap| snap.bids.first().map(|level| level.price))
+                        {
+                            let mut history = history.write().await;
+                            let entry = history
+                                .entry(book.asset_id.clone())
+                                .or_insert_with(VecDeque::new);
+                            entry.push_back(best_bid);
+                            while entry.len() > 5 {
+                                entry.pop_front();
+                            }
+                        }
+                        if let Some(tx) = &book_tx {
+                            let _ = tx.send(book.asset_id.clone());
+                        }
                     }
                     Err(err) => {
-                        debug!(error = %err, "Best bid/ask stream error");
+                        debug!(error = %err, "Orderbook stream error");
                     }
                 }
             }
@@ -174,9 +258,39 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    pub async fn cached_best_prices(&self, token_id: &str) -> Option<(Decimal, Decimal)> {
-        let cache = self.best_prices.read().await;
-        cache.get(token_id).map(|price| (price.bid, price.ask))
+    pub async fn cached_book(&self, token_id: &str) -> Option<BookSnapshot> {
+        let cache = self.orderbooks.read().await;
+        cache.get(token_id).cloned()
+    }
+
+    pub async fn momentum(&self, token_id: &str) -> Option<Decimal> {
+        let history = self.price_history.read().await;
+        let series = history.get(token_id)?;
+        if series.len() < 2 {
+            return None;
+        }
+        let first = series.front()?;
+        let last = series.back()?;
+        Some(*last - *first)
+    }
+
+    pub async fn token_meta(&self, token_id: &str) -> Result<TokenMeta> {
+        if let Some(meta) = self.token_meta.read().await.get(token_id).cloned() {
+            return Ok(meta);
+        }
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(token_id)
+            .build();
+        let response = self.client.order_book(&request).await?;
+        let meta = TokenMeta {
+            tick_size: Decimal::from(response.tick_size),
+            min_order_size: response.min_order_size,
+        };
+        self.token_meta
+            .write()
+            .await
+            .insert(token_id.to_string(), meta.clone());
+        Ok(meta)
     }
 
     pub async fn update_user_ws_markets(&self, market_ids: Vec<String>) -> Result<()> {
@@ -195,6 +309,7 @@ impl ExecutionEngine {
         let ws_user_client = self.ws_user_client.clone();
         let markets = market_ids.clone();
         let stats = self.user_stats.clone();
+        let open_orders = self.open_orders.clone();
         let api_key = self.api_key;
         let inventory_tx = self.inventory_update_tx.clone();
 
@@ -222,7 +337,13 @@ impl ExecutionEngine {
                 tokio::select! {
                     order = orders_stream.next() => {
                         match order {
-                            Some(Ok(msg)) => handle_order_message(&stats, api_key, inventory_tx.clone(), msg).await,
+                            Some(Ok(msg)) => handle_order_message(
+                                &stats,
+                                open_orders.clone(),
+                                api_key,
+                                inventory_tx.clone(),
+                                msg,
+                            ).await,
                             Some(Err(err)) => debug!(error = %err, "User order stream error"),
                             None => break,
                         }
@@ -245,6 +366,44 @@ impl ExecutionEngine {
         self.user_stats.read().await.clone()
     }
 
+    pub async fn pending_size(&self, token_id: &str) -> Decimal {
+        let cache = self.open_orders.read().await;
+        cache
+            .values()
+            .filter(|order| order.asset_id == token_id)
+            .fold(Decimal::ZERO, |acc, order| acc + order.remaining)
+    }
+
+    pub async fn open_order_count(&self, token_ids: &[&str]) -> usize {
+        let cache = self.open_orders.read().await;
+        cache
+            .values()
+            .filter(|order| token_ids.iter().any(|id| *id == order.asset_id))
+            .count()
+    }
+
+    pub async fn open_orders_for_tokens(&self, token_ids: &[&str]) -> Vec<OpenOrderView> {
+        let cache = self.open_orders.read().await;
+        cache
+            .iter()
+            .filter_map(|(id, order)| {
+                if !token_ids.iter().any(|token| *token == order.asset_id) {
+                    return None;
+                }
+                if order.side != Side::Buy {
+                    return None;
+                }
+                Some(OpenOrderView {
+                    id: id.clone(),
+                    token_id: order.asset_id.clone(),
+                    price: order.price,
+                    remaining: order.remaining,
+                    side: order.side,
+                })
+            })
+            .collect()
+    }
+
     pub fn notify_inventory_changed(&self, market_id: String) {
         if let Some(tx) = &self.inventory_update_tx {
             let _ = tx.send(market_id);
@@ -259,19 +418,6 @@ impl ExecutionEngine {
             .token_id(token_id)
             .build();
         Ok(self.client.order_book(&request).await?)
-    }
-
-    pub async fn price(&self, token_id: &str, side: Side) -> Result<Decimal> {
-        let request = PriceRequest::builder()
-            .token_id(token_id)
-            .side(side)
-            .build();
-        Ok(self.client.price(&request).await?.price)
-    }
-
-    pub async fn midpoint(&self, token_id: &str) -> Result<Decimal> {
-        let request = MidpointRequest::builder().token_id(token_id).build();
-        Ok(self.client.midpoint(&request).await?.mid)
     }
 
     pub async fn place_limit_order(
@@ -319,9 +465,47 @@ impl ExecutionEngine {
             ));
         }
 
-        info!(order_id = %response.order_id, "Order accepted");
+        debug!(order_id = %response.order_id, "Order accepted");
 
         Ok(response.order_id)
+    }
+
+    pub async fn place_limit_orders(
+        &self,
+        orders: Vec<LimitOrderRequest>,
+    ) -> Result<Vec<PostOrderResponse>> {
+        let mut signed_orders = Vec::with_capacity(orders.len());
+        for order in orders {
+            self.rate_limiter.wait().await;
+            let signable = self
+                .client
+                .limit_order()
+                .token_id(&order.token_id)
+                .side(Side::Buy)
+                .price(order.price)
+                .size(order.size)
+                .build()
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to build limit order: price={} size={}",
+                        order.price, order.size
+                    )
+                })?;
+
+            let signed = self
+                .client
+                .sign(&self.signer, signable)
+                .await
+                .context("Failed to sign order")?;
+
+            signed_orders.push(signed);
+        }
+
+        self.client
+            .post_orders(signed_orders)
+            .await
+            .context("Failed to submit batch orders")
     }
 
     pub async fn place_market_order_usdc(
@@ -405,6 +589,23 @@ impl ExecutionEngine {
 
         Ok(cancelled)
     }
+
+    pub async fn cancel_orders(&self, order_ids: &[String]) -> Result<usize> {
+        let mut cancelled = 0usize;
+        for order_id in order_ids {
+            self.rate_limiter.wait().await;
+            match self.client.cancel_order(order_id).await {
+                Ok(_) => {
+                    cancelled += 1;
+                    debug!(order_id = %order_id, "Cancelled open order");
+                }
+                Err(err) => {
+                    warn!(order_id = %order_id, error = %err, "Failed to cancel order");
+                }
+            }
+        }
+        Ok(cancelled)
+    }
 }
 
 struct OrderRateLimiter {
@@ -414,6 +615,7 @@ struct OrderRateLimiter {
 
 async fn handle_order_message(
     stats: &std::sync::Arc<RwLock<UserStats>>,
+    open_orders: std::sync::Arc<RwLock<std::collections::HashMap<String, OpenOrder>>>,
     api_key: polymarket_client_sdk::auth::ApiKey,
     inventory_tx: Option<UnboundedSender<String>>,
     msg: OrderMessage,
@@ -430,12 +632,49 @@ async fn handle_order_message(
         price = %msg.price,
         size = ?msg.original_size,
         matched = ?msg.size_matched,
+        msg_type = ?msg.msg_type,
         "User order update"
     );
+
+    track_open_order(&open_orders, &msg).await;
 
     if let Some(tx) = inventory_tx {
         let _ = tx.send(msg.market.clone());
     }
+}
+
+async fn track_open_order(
+    open_orders: &std::sync::Arc<RwLock<std::collections::HashMap<String, OpenOrder>>>,
+    msg: &OrderMessage,
+) {
+    let msg_type = msg.msg_type.as_deref().unwrap_or("");
+    let mut cache = open_orders.write().await;
+
+    if msg_type.eq_ignore_ascii_case("CANCELLATION") {
+        cache.remove(&msg.id);
+        return;
+    }
+
+    let Some(original_size) = msg.original_size else {
+        return;
+    };
+    let matched = msg.size_matched.unwrap_or(Decimal::ZERO);
+    let remaining = (original_size - matched).max(Decimal::ZERO);
+
+    if remaining.is_zero() {
+        cache.remove(&msg.id);
+        return;
+    }
+
+    cache.insert(
+        msg.id.clone(),
+        OpenOrder {
+            asset_id: msg.asset_id.clone(),
+            price: msg.price,
+            remaining,
+            side: msg.side,
+        },
+    );
 }
 
 async fn handle_trade_message(

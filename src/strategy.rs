@@ -4,6 +4,7 @@ use rust_decimal_macros::dec;
 use tracing::{debug, warn};
 
 use crate::models::MarketInfo;
+use crate::balances::EffectiveBalances;
 use crate::utils::{clamp_decimal, round_down_2dp, round_down_for_tick, round_up_2dp};
 
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +23,8 @@ pub struct OrderBookSnapshot {
     pub up_min_size: Decimal,
     pub down_min_size: Decimal,
     pub tick_size: Decimal,
+    pub up_momentum: Decimal,
+    pub down_momentum: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,70 @@ pub enum OrderKind {
     Rebalance,
 }
 
+pub trait Strategy: Send + Sync {
+    fn equilibrium_buffer(&self) -> Decimal;
+    fn rebalance_threshold(&self) -> Decimal;
+    fn stage_for_market(&self, now: DateTime<Utc>, market: &MarketInfo) -> MarketStage;
+    fn target_total_shares(&self, now: DateTime<Utc>, market: &MarketInfo) -> Decimal;
+    fn build_orders(
+        &self,
+        market: &MarketInfo,
+        snapshot: &OrderBookSnapshot,
+        stage: MarketStage,
+        balances: EffectiveBalances,
+    ) -> Vec<OrderIntent>;
+    fn apply_share_limits(
+        &self,
+        orders: Vec<OrderIntent>,
+        balances: EffectiveBalances,
+        market: &MarketInfo,
+    ) -> Vec<OrderIntent>;
+
+    fn build_orders_with_result(
+        &self,
+        market: &MarketInfo,
+        snapshot: &OrderBookSnapshot,
+        stage: MarketStage,
+        balances: EffectiveBalances,
+    ) -> StrategyResult {
+        let orders = self.build_orders(market, snapshot, stage, balances);
+        let outcome = if orders.is_empty() {
+            StrategyOutcome::Converged
+        } else {
+            StrategyOutcome::Generated
+        };
+        StrategyResult {
+            orders,
+            outcome,
+            iterations: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyOutcome {
+    Generated,
+    Converged,
+    NoLiquidity,
+    MaxIterations,
+}
+
+#[derive(Debug, Clone)]
+pub struct StrategyResult {
+    pub orders: Vec<OrderIntent>,
+    pub outcome: StrategyOutcome,
+    pub iterations: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct StrategyParams {
+    pub base_size: Decimal,
+    pub rebalance_threshold: Decimal,
+    pub rebalance_chunk: Decimal,
+    pub max_shares_per_side: Decimal,
+    pub equilibrium_buffer: Decimal,
+}
+
 #[derive(Debug, Clone)]
 pub struct LadderStrategy {
     base_size: Decimal,
@@ -52,19 +119,14 @@ pub struct LadderStrategy {
 }
 
 impl LadderStrategy {
-    pub fn new(
-        base_size: Decimal,
-        rebalance_threshold: Decimal,
-        rebalance_chunk: Decimal,
-        max_shares_per_side: Decimal,
-    ) -> Self {
+    pub fn new(params: StrategyParams) -> Self {
         Self {
-            base_size,
-            rebalance_threshold,
-            rebalance_chunk,
+            base_size: params.base_size,
+            rebalance_threshold: params.rebalance_threshold,
+            rebalance_chunk: params.rebalance_chunk,
             combined_cap: dec!(0.98),
-            equilibrium_buffer: dec!(5.0),
-            max_shares_per_side,
+            equilibrium_buffer: params.equilibrium_buffer,
+            max_shares_per_side: params.max_shares_per_side,
         }
     }
 
@@ -85,6 +147,7 @@ impl LadderStrategy {
     }
 
     pub fn target_total_shares(&self, now: DateTime<Utc>, market: &MarketInfo) -> Decimal {
+        // Scale total target inventory from 100 down to 10 as the market approaches end.
         let total_minutes = (market.end_time - market.start_time).num_minutes().max(1);
         let remaining_minutes = (market.end_time - now).num_minutes().max(0);
         if remaining_minutes >= total_minutes {
@@ -106,19 +169,13 @@ impl LadderStrategy {
         market: &MarketInfo,
         snapshot: &OrderBookSnapshot,
         stage: MarketStage,
-        up_balance: Decimal,
-        down_balance: Decimal,
+        balances: EffectiveBalances,
     ) -> Vec<OrderIntent> {
+        // Size rungs by base_size with a decay factor, honoring min order sizes.
         let target_total = self
             .target_total_shares(Utc::now(), market)
             .min(self.max_shares_per_side * dec!(2.0));
         let target_side = target_total / dec!(2.0);
-        let equilibrium_buffer = self.equilibrium_buffer;
-        if (up_balance - target_side).abs() <= equilibrium_buffer
-            && (down_balance - target_side).abs() <= equilibrium_buffer
-        {
-            return Vec::new();
-        }
         let min_notional = dec!(1.0);
         let min_shares_up = if snapshot.up_bid > Decimal::ZERO {
             round_up_2dp(min_notional / snapshot.up_bid)
@@ -131,6 +188,17 @@ impl LadderStrategy {
             Decimal::ZERO
         };
         let effective_target_side = target_side.max(min_shares_up).max(min_shares_down);
+        let equilibrium_buffer = self.equilibrium_buffer;
+        if (balances.up - target_side).abs() <= equilibrium_buffer
+            && (balances.down - target_side).abs() <= equilibrium_buffer
+        {
+            return Vec::new();
+        }
+        if balances.up >= effective_target_side + equilibrium_buffer
+            && balances.down >= effective_target_side + equilibrium_buffer
+        {
+            return Vec::new();
+        }
         let rungs = match stage {
             MarketStage::Early => 6,
             MarketStage::Mid => 4,
@@ -205,16 +273,12 @@ impl LadderStrategy {
             });
         }
 
-        let up_delta = effective_target_side - up_balance;
-        let down_delta = effective_target_side - down_balance;
+        let up_delta = effective_target_side - balances.up;
+        let down_delta = effective_target_side - balances.down;
         let drift_threshold = snapshot.up_min_size.max(snapshot.down_min_size);
 
         if up_delta.abs() >= drift_threshold {
-            let price = if up_delta.is_sign_positive() {
-                snapshot.up_bid
-            } else {
-                snapshot.up_ask
-            };
+            let price = snapshot.up_bid;
             let mut size =
                 round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(up_delta.abs())));
             let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
@@ -237,11 +301,7 @@ impl LadderStrategy {
         }
 
         if down_delta.abs() >= drift_threshold {
-            let price = if down_delta.is_sign_positive() {
-                snapshot.down_bid
-            } else {
-                snapshot.down_ask
-            };
+            let price = snapshot.down_bid;
             let mut size =
                 round_down_2dp(drift_threshold.max(self.rebalance_chunk.min(down_delta.abs())));
             let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
@@ -263,7 +323,7 @@ impl LadderStrategy {
             });
         }
 
-        let imbalance = up_balance - down_balance;
+        let imbalance = balances.up - balances.down;
         if imbalance.abs() >= self.rebalance_threshold {
             let (token_id, price) = if imbalance > dec!(0.0) {
                 (market.ids.down_token.clone(), snapshot.down_bid)
@@ -304,12 +364,11 @@ impl LadderStrategy {
     pub fn apply_share_limits(
         &self,
         orders: Vec<OrderIntent>,
-        up_balance: Decimal,
-        down_balance: Decimal,
+        balances: EffectiveBalances,
         market: &MarketInfo,
     ) -> Vec<OrderIntent> {
-        let mut projected_up = up_balance;
-        let mut projected_down = down_balance;
+        let mut projected_up = balances.up;
+        let mut projected_down = balances.down;
         let mut filtered = Vec::new();
 
         for mut order in orders {
@@ -340,5 +399,267 @@ impl LadderStrategy {
         }
 
         filtered
+    }
+}
+
+impl Strategy for LadderStrategy {
+    fn equilibrium_buffer(&self) -> Decimal {
+        self.equilibrium_buffer()
+    }
+
+    fn rebalance_threshold(&self) -> Decimal {
+        self.rebalance_threshold
+    }
+
+    fn stage_for_market(&self, now: DateTime<Utc>, market: &MarketInfo) -> MarketStage {
+        self.stage_for_market(now, market)
+    }
+
+    fn target_total_shares(&self, now: DateTime<Utc>, market: &MarketInfo) -> Decimal {
+        self.target_total_shares(now, market)
+    }
+
+    fn build_orders(
+        &self,
+        market: &MarketInfo,
+        snapshot: &OrderBookSnapshot,
+        stage: MarketStage,
+        balances: EffectiveBalances,
+    ) -> Vec<OrderIntent> {
+        self.build_orders(market, snapshot, stage, balances)
+    }
+
+    fn apply_share_limits(
+        &self,
+        orders: Vec<OrderIntent>,
+        balances: EffectiveBalances,
+        market: &MarketInfo,
+    ) -> Vec<OrderIntent> {
+        self.apply_share_limits(orders, balances, market)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SportsStrategy {
+    inner: LadderStrategy,
+}
+
+impl SportsStrategy {
+    pub fn new(params: StrategyParams) -> Self {
+        Self {
+            inner: LadderStrategy::new(params),
+        }
+    }
+}
+
+impl Strategy for SportsStrategy {
+    fn equilibrium_buffer(&self) -> Decimal {
+        self.inner.equilibrium_buffer()
+    }
+
+    fn rebalance_threshold(&self) -> Decimal {
+        self.inner.rebalance_threshold
+    }
+
+    fn stage_for_market(&self, now: DateTime<Utc>, market: &MarketInfo) -> MarketStage {
+        self.inner.stage_for_market(now, market)
+    }
+
+    fn target_total_shares(&self, now: DateTime<Utc>, market: &MarketInfo) -> Decimal {
+        self.inner.target_total_shares(now, market)
+    }
+
+    fn build_orders(
+        &self,
+        market: &MarketInfo,
+        snapshot: &OrderBookSnapshot,
+        stage: MarketStage,
+        balances: EffectiveBalances,
+    ) -> Vec<OrderIntent> {
+        build_sports_orders(self, market, snapshot, stage, balances)
+    }
+
+    fn apply_share_limits(
+        &self,
+        orders: Vec<OrderIntent>,
+        balances: EffectiveBalances,
+        market: &MarketInfo,
+    ) -> Vec<OrderIntent> {
+        self.inner
+            .apply_share_limits(orders, balances, market)
+    }
+}
+
+fn build_sports_orders(
+    strategy: &SportsStrategy,
+    market: &MarketInfo,
+    snapshot: &OrderBookSnapshot,
+    stage: MarketStage,
+    balances: EffectiveBalances,
+) -> Vec<OrderIntent> {
+    let target_total = strategy
+        .inner
+        .target_total_shares(Utc::now(), market)
+        .min(strategy.inner.max_shares_per_side * dec!(2.0));
+    let target_side = target_total / dec!(2.0);
+    let equilibrium_buffer = strategy.inner.equilibrium_buffer;
+    if (balances.up - target_side).abs() <= equilibrium_buffer
+        && (balances.down - target_side).abs() <= equilibrium_buffer
+    {
+        return Vec::new();
+    }
+
+    let min_notional = dec!(1.0);
+    let min_shares_up = if snapshot.up_bid > Decimal::ZERO {
+        round_up_2dp(min_notional / snapshot.up_bid)
+    } else {
+        Decimal::ZERO
+    };
+    let min_shares_down = if snapshot.down_bid > Decimal::ZERO {
+        round_up_2dp(min_notional / snapshot.down_bid)
+    } else {
+        Decimal::ZERO
+    };
+    let effective_target_side = target_side.max(min_shares_up).max(min_shares_down);
+    if balances.up >= effective_target_side + equilibrium_buffer
+        && balances.down >= effective_target_side + equilibrium_buffer
+    {
+        return Vec::new();
+    }
+
+    let (preferred_token, preferred_bid, other_token, other_bid) =
+        choose_preferred_side(market, snapshot);
+    let tick = snapshot.tick_size;
+    let rungs = match stage {
+        MarketStage::Early => 2,
+        MarketStage::Mid => 2,
+        MarketStage::Late => 1,
+    };
+
+    let mut orders = Vec::new();
+    for rung in 0..rungs {
+        let rung_offset = Decimal::from(rung as u32);
+        let preferred_price = round_down_for_tick(
+            (preferred_bid - tick * (rung_offset + dec!(1.0))).max(tick),
+            tick,
+        );
+        let other_price = round_down_for_tick(
+            (other_bid - tick * (rung_offset + dec!(2.0))).max(tick),
+            tick,
+        );
+
+        let min_size = snapshot.up_min_size.max(snapshot.down_min_size);
+        let base_size = strategy.inner.base_size.max(min_size);
+        let preferred_size = round_down_2dp(base_size);
+        let other_size = round_down_2dp(base_size * dec!(0.8));
+
+        orders.push(OrderIntent {
+            token_id: preferred_token.clone(),
+            price: preferred_price,
+            size: preferred_size,
+            reason: format!("ladder_rung_{rung}"),
+            market_usdc: None,
+            kind: OrderKind::Ladder,
+        });
+
+        orders.push(OrderIntent {
+            token_id: other_token.clone(),
+            price: other_price,
+            size: other_size,
+            reason: format!("ladder_rung_{rung}"),
+            market_usdc: None,
+            kind: OrderKind::Ladder,
+        });
+    }
+
+    let up_delta = effective_target_side - balances.up;
+    let down_delta = effective_target_side - balances.down;
+    let drift_threshold = snapshot.up_min_size.max(snapshot.down_min_size);
+
+    if up_delta.abs() >= drift_threshold {
+        let price = snapshot.up_bid;
+        let mut size = round_down_2dp(
+            drift_threshold.max(strategy.inner.rebalance_chunk.min(up_delta.abs())),
+        );
+        let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
+        let notional = size * price;
+        let market_usdc = if up_delta.is_sign_positive() && notional < min_notional {
+            size = round_up_2dp(min_notional / price);
+            Some(min_notional)
+        } else {
+            None
+        };
+
+        orders.push(OrderIntent {
+            token_id: market.ids.up_token.clone(),
+            price,
+            size,
+            reason: "drift_correction_up".to_string(),
+            market_usdc,
+            kind: OrderKind::Drift,
+        });
+    }
+
+    if down_delta.abs() >= drift_threshold {
+        let price = snapshot.down_bid;
+        let mut size = round_down_2dp(
+            drift_threshold.max(strategy.inner.rebalance_chunk.min(down_delta.abs())),
+        );
+        let price = round_down_for_tick(price.max(snapshot.tick_size), snapshot.tick_size);
+        let notional = size * price;
+        let market_usdc = if down_delta.is_sign_positive() && notional < min_notional {
+            size = round_up_2dp(min_notional / price);
+            Some(min_notional)
+        } else {
+            None
+        };
+
+        orders.push(OrderIntent {
+            token_id: market.ids.down_token.clone(),
+            price,
+            size,
+            reason: "drift_correction_down".to_string(),
+            market_usdc,
+            kind: OrderKind::Drift,
+        });
+    }
+
+    orders
+}
+
+fn choose_preferred_side(
+    market: &MarketInfo,
+    snapshot: &OrderBookSnapshot,
+) -> (String, Decimal, String, Decimal) {
+    let up_mom = snapshot.up_momentum;
+    let down_mom = snapshot.down_momentum;
+    if up_mom > down_mom {
+        (
+            market.ids.up_token.clone(),
+            snapshot.up_bid,
+            market.ids.down_token.clone(),
+            snapshot.down_bid,
+        )
+    } else if down_mom > up_mom {
+        (
+            market.ids.down_token.clone(),
+            snapshot.down_bid,
+            market.ids.up_token.clone(),
+            snapshot.up_bid,
+        )
+    } else if snapshot.up_bid >= snapshot.down_bid {
+        (
+            market.ids.up_token.clone(),
+            snapshot.up_bid,
+            market.ids.down_token.clone(),
+            snapshot.down_bid,
+        )
+    } else {
+        (
+            market.ids.down_token.clone(),
+            snapshot.down_bid,
+            market.ids.up_token.clone(),
+            snapshot.up_bid,
+        )
     }
 }

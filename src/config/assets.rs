@@ -10,30 +10,26 @@ pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> =
 pub struct AssetInfo {
     pub asset: String,
     pub prefixes: Vec<String>,
-    pub chainlink: String,
-    pub binance: String,
 }
 
-pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str], &str, &str)>> = Lazy::new(|| {
+pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str])>> = Lazy::new(|| {
     vec![
-        ("bitcoin", &["btc", "bitcoin"], "btc/usd", "btcusdt"),
-        ("ethereum", &["eth", "ethereum"], "eth/usd", "ethusdt"),
-        ("solana", &["sol", "solana"], "sol/usd", "solusdt"),
-        ("xrp", &["xrp"], "xrp/usd", "xrpusdt"),
+        ("bitcoin", &["btc", "bitcoin"]),
+        ("ethereum", &["eth", "ethereum"]),
+        ("solana", &["sol", "solana"]),
+        ("xrp", &["xrp"]),
     ]
 });
 
 pub static ASSETS_BY_NAME: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     ASSET_CONFIG
         .iter()
-        .map(|(asset, prefixes, chainlink, binance)| {
+        .map(|(asset, prefixes)| {
             (
                 asset.to_string(),
                 AssetInfo {
                     asset: asset.to_string(),
                     prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
-                    chainlink: chainlink.to_string(),
-                    binance: binance.to_string(),
                 },
             )
         })
@@ -49,3 +45,14 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     }
     map
 });
+
+pub static SPORTS_SERIES_BY_NAME: Lazy<HashMap<&'static str, &'static [&'static str]>> =
+    Lazy::new(|| {
+        HashMap::from([
+            ("nba", &["10345"][..]),
+            ("nhl", &["10346"][..]),
+            ("cbb", &["10470"][..]),
+        ])
+    });
+
+pub const SPORTS_SERIES_DEFAULT: &[&str] = &["10345", "10346", "10470"];
