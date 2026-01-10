@@ -94,35 +94,12 @@ impl MarketCache {
             id: m.id,
             slug: slug.to_string(),
             asset: asset_info.asset.clone(),
-            binance_symbol: asset_info.binance.clone(),
             duration,
             start_time,
             end_time,
             up_token_id: clob_token_ids[up_idx].to_string(),
             down_token_id: clob_token_ids[down_idx].to_string(),
         })
-    }
-
-
-
-    pub async fn fetch_market_by_id(&self, market_id: &str) -> Result<Option<GammaMarket>, MarketCacheError> {
-        use polymarket_client_sdk::gamma::types::request::MarketByIdRequest;
-        
-        let request = MarketByIdRequest::builder()
-            .id(market_id)
-            .build();
-
-        match self.client.market_by_id(&request).await {
-            Ok(market) => Ok(Some(market)),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("404") || err_str.contains("not found") {
-                    Ok(None)
-                } else {
-                    Err(MarketCacheError::Api(err_str))
-                }
-            }
-        }
     }
 }
 
@@ -135,9 +112,6 @@ fn is_15m_market(slug: &str) -> bool {
     }
     parts.get(1) == Some(&"updown") && parts.get(2) == Some(&"15m")
 }
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
