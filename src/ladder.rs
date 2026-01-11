@@ -1,8 +1,8 @@
 // ladder.rs - FIXED VERSION
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::{collections::HashMap, f32::MIN};
-use tracing::{debug, info, trace, warn};
+use std::collections::HashMap;
+use tracing::{debug, info, trace};
 
 use crate::{
     constants::round_size,

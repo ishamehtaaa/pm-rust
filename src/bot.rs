@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::constants::to_shares;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketState, TradingPair};
@@ -7,7 +6,6 @@ use crate::poller::{InventoryLedger, MarketSide, spawn_order_poller};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use chrono::Timelike;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::clob::types::response::NotificationResponse;
 use rust_decimal::Decimal;
 
 use alloy::signers::Signer;

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
+use chrono::Utc;
 
 use crate::ladder::OpenOrderInfo;
 
@@ -39,6 +40,8 @@ pub struct InventoryLedger {
     tracked_orders: HashMap<String, TrackedOrder>,
     /// Maps asset_id -> (market_id, side) for quick notification processing
     asset_to_market: HashMap<String, (String, MarketSide)>,
+    /// Track processed notification IDs to avoid duplicates (order_id -> last_matched_size)
+    processed_notifications: HashMap<String, Decimal>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -57,6 +60,13 @@ impl InventoryLedger {
         up_token_id: String,
         down_token_id: String,
     ) {
+        debug!(
+            market_id = %market_id,
+            up_token = %up_token_id,
+            down_token = %down_token_id,
+            "Registering market tokens"
+        );
+
         self.asset_to_market.insert(
             up_token_id,
             (market_id.clone(), MarketSide::Up),
@@ -76,6 +86,10 @@ impl InventoryLedger {
         size: Decimal,
         price: Decimal,
     ) {
+        // Register token_id -> (market_id, side) if not already registered
+        self.asset_to_market.entry(token_id.clone())
+            .or_insert((market_id.clone(), side));
+
         self.tracked_orders.insert(
             order_id.clone(),
             TrackedOrder {
@@ -90,6 +104,7 @@ impl InventoryLedger {
         );
 
         debug!(
+            token_id = %token_id,
             side = ?side,
             size = %size,
             price = %price,
@@ -119,6 +134,27 @@ impl InventoryLedger {
     pub fn process_notification(&mut self, notif: &NotificationPayload) {
         let order_id = &notif.order_id;
 
+        // Parse notification sizes
+        let matched: Decimal = notif.matched_size.to_string().parse().unwrap_or_default();
+        let remaining: Decimal = notif.remaining_size.to_string().parse().unwrap_or_default();
+        let original: Decimal = notif.original_size.to_string().parse().unwrap_or_default();
+
+        // Check if we've already processed this exact notification state
+        if let Some(&last_matched) = self.processed_notifications.get(order_id) {
+            if last_matched == matched {
+                // Already processed this notification, skip
+                debug!(
+                    order_id = %order_id,
+                    matched = %matched,
+                    "Skipping duplicate notification"
+                );
+                return;
+            }
+        }
+
+        // Record that we've processed this notification state
+        self.processed_notifications.insert(order_id.clone(), matched);
+
         // Determine market_id and side from asset_id
         let (market_id, side) = match self.asset_to_market.get(&notif.asset_id) {
             Some((m, s)) => (m.clone(), *s),
@@ -131,10 +167,6 @@ impl InventoryLedger {
             }
         };
 
-        // Parse notification sizes
-        let matched: Decimal = notif.matched_size.to_string().parse().unwrap_or_default();
-        let remaining: Decimal = notif.remaining_size.to_string().parse().unwrap_or_default();
-        let original: Decimal = notif.original_size.to_string().parse().unwrap_or_default();
         let price: Decimal = notif.price.to_string().parse().unwrap_or_default();
 
         info!(
@@ -184,7 +216,7 @@ impl InventoryLedger {
             );
         }
 
-        // Update order state
+        // Update order state using remaining_size
         tracked.filled_size = new_filled;
         tracked.is_open = remaining > Decimal::ZERO;
 
@@ -246,36 +278,107 @@ impl InventoryLedger {
 pub fn spawn_order_poller(
     client: Arc<AuthenticatedClient>,
     ledger: Arc<RwLock<InventoryLedger>>,
-    _token_pairs: Arc<RwLock<Vec<(String, String)>>>, 
+    _token_pairs: Arc<RwLock<Vec<(String, String)>>>, // Unused now, kept for compatibility
     poll_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        info!("Notification poller started (interval: {:?})", poll_interval);
+        info!("Notification & trades poller started (interval: {:?})", poll_interval);
 
         loop {
             interval.tick().await;
 
-            match client.notifications().await {
+            // Fetch notifications
+            let notification_count = match client.notifications().await {
                 Ok(notifications) => {
-                    if notifications.is_empty() {
-                        debug!("No new notifications");
-                        continue;
+                    let count = notifications.len();
+                    if count > 0 {
+                        info!("📬 Processing {} notifications", count);
+                        let mut ledger_write = ledger.write();
+                        for notif in notifications {
+                            ledger_write.process_notification(&notif.payload);
+                        }
                     }
-
-                    info!("Processing {} notifications", notifications.len());
-
-                    let mut ledger_write = ledger.write();
-                    for notif in notifications {
-                        ledger_write.process_notification(&notif.payload);
-                    }
+                    count
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to fetch notifications");
+                    0
                 }
+            };
+
+            // Fetch recent trades for comparison
+            if let Err(e) = fetch_and_log_trades(&client, &ledger).await {
+                warn!(error = %e, "Failed to fetch trades");
+            }
+
+            if notification_count == 0 {
+                debug!("No new notifications or trades");
             }
         }
     })
+}
+
+async fn fetch_and_log_trades(
+    client: &AuthenticatedClient,
+    ledger: &Arc<RwLock<InventoryLedger>>,
+) -> anyhow::Result<()> {
+    use polymarket_client_sdk::clob::types::request::TradesRequest;
+
+    // Fetch trades from last 60 seconds
+    let after = (Utc::now().timestamp() - 60) * 1000; // milliseconds
+    
+    let request = TradesRequest::builder()
+        .after(after)
+        .build();
+
+    let page = client.trades(&request, None).await?;
+    
+    if page.data.is_empty() {
+        return Ok(());
+    }
+
+    info!("🔄 Fetched {} recent trades for comparison", page.data.len());
+
+    // Build a map of our tracked orders for quick lookup
+    let tracked_map: HashMap<String, (Decimal, Decimal, MarketSide)> = {
+        let ledger_read = ledger.read();
+        ledger_read.tracked_orders
+            .iter()
+            .filter(|(_, o)| o.is_open)
+            .map(|(id, o)| (id.clone(), (o.filled_size, o.original_size, o.side)))
+            .collect()
+    };
+
+    if tracked_map.is_empty() {
+        return Ok(());
+    }
+
+    for trade in &page.data {
+        // Check if this trade is for one of our tracked orders
+        if let Some((known_filled, original_size, side)) = tracked_map.get(&trade.taker_order_id) {
+            let trade_size: Decimal = trade.size.to_string().parse().unwrap_or_default();
+            let price: Decimal = trade.price.to_string().parse().unwrap_or_default();
+            
+            info!("🔍 TRADE COMPARISON for order {}", trade.taker_order_id);
+            info!("   Side: {:?} | Price: {}", side, price);
+            info!("   Trade API shows: size={}", trade_size);
+            info!("   Our ledger has: filled={}/{}", known_filled, original_size);
+            
+            if trade_size > *known_filled {
+                warn!(
+                    "⚠️  DISCREPANCY: Trade API shows {} but we only have {} filled - missing {}",
+                    trade_size,
+                    known_filled,
+                    trade_size - known_filled
+                );
+            } else if trade_size == *known_filled {
+                debug!("✅ Trade data matches our ledger");
+            }
+        }
+    }
+
+    Ok(())
 }
