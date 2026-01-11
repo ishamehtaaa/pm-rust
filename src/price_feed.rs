@@ -52,8 +52,14 @@ pub fn spawn_price_feed(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(book) => {
-                    let best_bid = book.bids.first().map(|l| l.price);
-                    let best_ask = book.asks.first().map(|l| l.price);
+                    let best_bid = book.bids.iter()
+                        .map(|l| l.price)
+                        .max();
+
+                    // Best ask = lowest ask (cheapest offer to sell)
+                    let best_ask = book.asks.iter()
+                        .map(|l| l.price)
+                        .min();
 
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                         let bid_dec: Decimal = bid.to_string().parse().unwrap_or_default();

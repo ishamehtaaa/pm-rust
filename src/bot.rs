@@ -1,8 +1,13 @@
 use crate::config::Config;
+use crate::constants::to_shares;
+use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketState, TradingPair};
-use crate::poller::{InventoryLedger, spawn_order_poller, MarketSide};
-use crate::clob_rest::{spawn_price_feed, PriceCache};
+use crate::poller::{InventoryLedger, MarketSide, spawn_order_poller};
+use crate::price_feed::{PriceCache, spawn_price_feed};
+use chrono::Timelike;
+use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use rust_decimal::Decimal;
 
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
@@ -11,12 +16,11 @@ use parking_lot::RwLock;
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType};
+use polymarket_client_sdk::clob::types::{AssetType, Side as ClobSide, SignatureType, SignedOrder};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,15 +29,8 @@ use tracing::{debug, error, info, instrument, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
 const LOOP_DELAY: Duration = Duration::from_millis(200);
-const MARKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const STATUS_PRINT_INTERVAL: Duration = Duration::from_secs(5);
 
-const TICK_SIZE_DP: u32 = 2;
-const MIN_PRICE: Decimal = dec!(0.01);
-const MAX_PRICE: Decimal = dec!(0.99);
-const MIN_ORDER_NOTIONAL: Decimal = dec!(1.00);
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
-
 
 pub struct SimpleBot {
     config: Config,
@@ -44,12 +41,15 @@ pub struct SimpleBot {
     trading_pairs: HashMap<String, Arc<RwLock<TradingPair>>>,
     last_market_refresh: Instant,
     last_order_by_market: HashMap<String, Instant>,
-    last_status_print: Instant,
 
     ledger: Arc<RwLock<InventoryLedger>>,
     price_cache: Arc<RwLock<PriceCache>>,
     _order_poller: tokio::task::JoinHandle<()>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
+    active_market_ids: Arc<RwLock<Vec<String>>>,
+
+    ladder_engine: LadderEngine,
+    ladder_state: LadderState,
 }
 
 impl SimpleBot {
@@ -60,14 +60,17 @@ impl SimpleBot {
         let market_cache = MarketCache::new(config.target_assets.clone());
         let price_cache = Arc::new(RwLock::new(PriceCache::default()));
 
+        let ladder_engine = LadderEngine::new(LadderConfig::default());
+        let ladder_state = LadderState::default();
+
         let signer = PrivateKeySigner::from_str(&config.polymarket_private_key)
             .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
 
         let signer_with_chain = signer.clone().with_chain_id(Some(POLYGON));
-        
+
         let addr = Address::from_str(config.polymarket_proxy_address.trim())
             .map_err(|e| anyhow::anyhow!("Invalid POLYMARKET_PROXY_ADDRESS: {}", e))?;
-        
+
         let client = Client::new(crate::config::POLYMARKET_CLOB_HOST, ClobConfig::default())?
             .authentication_builder(&signer_with_chain)
             .funder(addr)
@@ -78,7 +81,14 @@ impl SimpleBot {
         let client = Arc::new(client);
 
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
-        let poller = spawn_order_poller(client.clone(), ledger.clone(), Duration::from_millis(500));
+        let active_market_ids = Arc::new(RwLock::new(Vec::new()));
+
+        let poller = spawn_order_poller(
+            client.clone(),
+            ledger.clone(),
+            active_market_ids.clone(),
+            Duration::from_millis(3000),
+        );
 
         Ok(Self {
             config,
@@ -89,11 +99,13 @@ impl SimpleBot {
             trading_pairs: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
-            last_status_print: Instant::now(),
+            active_market_ids,
             ledger,
             _order_poller: poller,
             price_cache,
             _price_feed: None,
+            ladder_engine,
+            ladder_state,
         })
     }
 
@@ -102,20 +114,53 @@ impl SimpleBot {
         info!("Entering main loop...");
 
         loop {
-            if self.last_market_refresh.elapsed() > MARKET_REFRESH_INTERVAL {
+            if self.should_refresh_markets() {
                 self.discover_markets().await;
                 self.last_market_refresh = Instant::now();
-            }
-
-            if self.last_status_print.elapsed() > STATUS_PRINT_INTERVAL {
-                self.log_status();
-                self.last_status_print = Instant::now();
             }
 
             self.scan().await;
 
             tokio::time::sleep(LOOP_DELAY).await;
         }
+    }
+    async fn fetch_token_balances(
+        &self,
+        up_token_id: &str,
+        down_token_id: &str,
+    ) -> anyhow::Result<(Decimal, Decimal)> {
+        let up_req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(up_token_id)
+            .build();
+
+        let down_req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(down_token_id)
+            .build();
+
+        let up_resp = self.client.balance_allowance(up_req).await?;
+        let down_resp = self.client.balance_allowance(down_req).await?;
+
+        let up_raw: Decimal = up_resp.balance.to_string().parse().unwrap_or_default();
+        let down_raw: Decimal = down_resp.balance.to_string().parse().unwrap_or_default();
+
+        debug!(
+            up_raw = %up_raw,
+            down_raw = %down_raw,
+            "Raw balances from API"
+        );
+
+        let up_bal = up_raw / dec!(1_000_000);
+        let down_bal = down_raw / dec!(1_000_000);
+
+        debug!(
+            up_bal = %up_bal,
+            down_bal = %down_bal,
+            "fetch_token_balances returning"
+        );
+
+        Ok((up_bal, down_bal))
     }
 
     #[instrument(skip(self), fields(markets = self.markets.len()))]
@@ -164,15 +209,43 @@ impl SimpleBot {
             self.trading_pairs.insert(market_id, pair);
         }
 
-        let token_ids: Vec<String> = self.markets.values().flat_map(|m| vec![
-            m.info.up_token_id.clone(),
-            m.info.down_token_id.clone()
-        ]).collect();
-        
+        // Update active market IDs after processing all markets
+        {
+            let mut ids = self.active_market_ids.write();
+            *ids = self.markets.keys().cloned().collect();
+        }
+
+        let token_ids: Vec<String> = self
+            .markets
+            .values()
+            .flat_map(|m| vec![m.info.up_token_id.clone(), m.info.down_token_id.clone()])
+            .collect();
+
         if let Some(handle) = self._price_feed.take() {
             handle.abort();
         }
 
+        for (market_id, state) in &self.markets {
+            match self
+                .fetch_token_balances(&state.info.up_token_id, &state.info.down_token_id)
+                .await
+            {
+                Ok((up_bal, down_bal)) => {
+                    self.ledger
+                        .write()
+                        .set_initial_position(market_id.clone(), up_bal, down_bal);
+                    info!(
+                        market_id,
+                        up_shares = %up_bal,
+                        down_shares = %down_bal,
+                        "Position initialized"
+                    );
+                }
+                Err(e) => {
+                    warn!(market_id, error = %e, "Failed to fetch initial position");
+                }
+            }
+        }
         match spawn_price_feed(WS_SUB_URL, token_ids, self.price_cache.clone()) {
             Ok(handle) => {
                 self._price_feed = Some(handle);
@@ -183,165 +256,19 @@ impl SimpleBot {
             }
         }
     }
-
-    async fn scan(&mut self) {
-        let market_ids: Vec<String> = self.markets.keys().cloned().collect();
-
-        for market_id in market_ids {
-
-            let (up_token_id, down_token_id) = match self.markets.get(&market_id) {
-                Some(s) => (s.info.up_token_id.clone(), s.info.down_token_id.clone()),
-                None => continue,
-            };
-
-            let price_cache = self.price_cache.read();
-
-            let (up_ask, down_ask) = match (
-                price_cache.get(&up_token_id),
-                price_cache.get(&down_token_id),
-             ) {
-                (Some((_, up_ask)), Some((_, down_ask))) => (up_ask, down_ask),
-                _ => {
-                    debug!(market_id, "Missing price data");
-                    continue;
-                }
-             };
-             drop(price_cache);
-
-            // Get inventory from the ledger (non-blocking read)
-            let pos = self.ledger.read().effective_position(&market_id);
-            let target = self.config.shares_target_per_side;
-            let missing_up = (target - pos.up_shares - pos.pending_up).max(Decimal::ZERO);
-            let missing_down = (target - pos.down_shares - pos.pending_down).max(Decimal::ZERO);
-
-            if missing_up.is_zero() && missing_down.is_zero() {
-                continue;
-            }
-
-            if !self.cooldown_elapsed(&market_id) {
-                continue;
-            }
-
-            // Place orders based on what's missing
-            if missing_up > Decimal::ZERO && missing_down > Decimal::ZERO {
-                let size = self.config.order_size.min(missing_up).min(missing_down);
-                let (up_price, down_price) = split_target_prices(
-                    up_ask,
-                    down_ask,
-                    self.config.target_total_cost,
-                    self.config.maker_price_offset,
-                );
-                let min_size = min_size_for_notional(up_price).max(min_size_for_notional(down_price));
-
-                if size < min_size {
-                    debug!(
-                        market_id,
-                        size = %size,
-                        min_size = %min_size,
-                        "Paired order size too small"
-                    );
-                    continue;
-                }
-
-                let up_id = self.place_order(&up_token_id, up_price, size, &market_id, "up").await;
-                let down_id = self.place_order(&down_token_id, down_price, size, &market_id, "down").await;
-
-                // Record in ledger for optimistic tracking
-                if let Some(ref id) = up_id {
-                    self.ledger.write().record_order_placed(
-                        id.clone(),
-                        market_id.clone(),
-                        up_token_id.clone(),
-                        MarketSide::Up,
-                        size,
-                        up_price,
-                    );
-                }
-                if let Some(ref id) = down_id {
-                    self.ledger.write().record_order_placed(
-                        id.clone(),
-                        market_id.clone(),
-                        down_token_id.clone(),
-                        MarketSide::Down,
-                        size,
-                        down_price,
-                    );
-                }
-
-                info!(
-                    market_id,
-                    up_price = %up_price,
-                    down_price = %down_price,
-                    size = %size,
-                    "Placed paired orders"
-                );
-                self.last_order_by_market.insert(market_id.clone(), Instant::now());
-
-            } else if missing_up > Decimal::ZERO {
-                let size = self.config.order_size.min(missing_up);
-                let Some(price) = single_target_price(
-                    up_ask,
-                    down_ask,
-                    self.config.target_total_cost,
-                    self.config.maker_price_offset,
-                ) else {
-                    continue;
-                };
-
-                if size < min_size_for_notional(price) {
-                    debug!(market_id, size = %size, "Up order too small");
-                    continue;
-                }
-
-                let order_id = self.place_order(&up_token_id, price, size, &market_id, "up").await;
-
-                if let Some(ref id) = order_id {
-                    self.ledger.write().record_order_placed(
-                        id.clone(),
-                        market_id.clone(),
-                        up_token_id.clone(),
-                        MarketSide::Up,
-                        size,
-                        price,
-                    );
-                }
-
-                info!(market_id, price = %price, size = %size, order = ?order_id, "Placed up order");
-                self.last_order_by_market.insert(market_id.clone(), Instant::now());
-
-            } else if missing_down > Decimal::ZERO {
-                let size = self.config.order_size.min(missing_down);
-                let Some(price) = single_target_price(
-                    down_ask,
-                    up_ask,
-                    self.config.target_total_cost,
-                    self.config.maker_price_offset,
-                ) else {
-                    continue;
-                };
-
-                if size < min_size_for_notional(price) {
-                    debug!(market_id, size = %size, "Down order too small");
-                    continue;
-                }
-
-                let order_id = self.place_order(&down_token_id, price, size, &market_id, "down").await;
-
-                if let Some(ref id) = order_id {
-                    self.ledger.write().record_order_placed(
-                        id.clone(),
-                        market_id.clone(),
-                        down_token_id.clone(),
-                        MarketSide::Down,
-                        size,
-                        price,
-                    );
-                }
-
-                info!(market_id, price = %price, size = %size, order = ?order_id, "Placed down order");
-                self.last_order_by_market.insert(market_id.clone(), Instant::now());
-            }
+    fn should_refresh_markets(&self) -> bool {
+        if self.last_market_refresh.elapsed() < Duration::from_secs(30) {
+            return false;
         }
+
+        let now = Utc::now();
+        let total_seconds = now.minute() * 60 + now.second();
+
+        // Seconds into each 15-minute window where we should refresh
+        // 15 min = 900 seconds, refresh at 840-870 seconds (14:00-14:30)
+        let position_in_window = total_seconds % 900;
+
+        (840..870).contains(&position_in_window)
     }
 
     fn cooldown_elapsed(&self, market_id: &str) -> bool {
@@ -351,106 +278,6 @@ impl SimpleBot {
         }
     }
 
-    async fn place_order(
-        &self,
-        token_id: &str,
-        price: Decimal,
-        size: Decimal,
-        market_id: &str,
-        label: &str,
-    ) -> Option<String> {
-        info!(
-            market_id,
-            price = %price,
-            size = %size,
-            dry_run = self.config.dry_run,
-            label,
-            "Placing order"
-        );
-
-        if self.config.dry_run {
-            return Some(format!(
-                "dry-run-{}-{}",
-                label,
-                Utc::now().timestamp_millis()
-            ));
-        }
-
-        let poly_price = match PolyDecimal::try_from(price.to_string().as_str()) {
-            Ok(p) => p,
-            Err(e) => {
-                error!(market_id, error = %e, "Invalid price format");
-                return None;
-            }
-        };
-
-        let poly_size = match PolyDecimal::try_from(size.to_string().as_str()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(market_id, error = %e, "Invalid size format");
-                return None;
-            }
-        };
-
-        let signable = match self
-            .client
-            .limit_order()
-            .token_id(token_id)
-            .price(poly_price)
-            .size(poly_size)
-            .side(ClobSide::Buy)
-            .build()
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!(market_id, error = %e, "Failed to build order");
-                return None;
-            }
-        };
-
-        let signed = match self
-            .client
-            .sign(&self.signer.clone().with_chain_id(Some(POLYGON)), signable)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!(market_id, error = %e, "Failed to sign order");
-                return None;
-            }
-        };
-
-        match self.client.post_order(signed).await {
-            Ok(response) => {
-                if let Some(ref error_msg) = response.error_msg {
-                    if !error_msg.is_empty() {
-                        warn!(
-                            market_id,
-                            token_id = %token_id,
-                            error_msg,
-                            order_id = %response.order_id,
-                            "Order posted with error message"
-                        );
-                    }
-                }
-                Some(response.order_id)
-            }
-            Err(e) => {
-                error!(market_id, error = %e, "Order post failed");
-                None
-            }
-        }
-    }
-
-    fn log_status(&self) {
-        info!(
-            markets = self.markets.len(),
-            target = %self.config.shares_target_per_side,
-            "Status update"
-        );
-    }
-
     pub fn markets(&self) -> &HashMap<String, MarketState> {
         &self.markets
     }
@@ -458,47 +285,225 @@ impl SimpleBot {
     pub fn market_count(&self) -> usize {
         self.markets.len()
     }
-}
 
-fn split_target_prices(
-    up_ask: Decimal,
-    down_ask: Decimal,
-    target_total: Decimal,
-    offset: Decimal,
-) -> (Decimal, Decimal) {
-    let denom = (up_ask + down_ask).max(dec!(0.001));
-    let up_target = target_total * (up_ask / denom);
-    let down_target = target_total - up_target;
+    async fn scan(&mut self) {
+        let market_ids: Vec<String> = self.markets.keys().cloned().collect();
 
-    let up_price = maker_price(up_target, up_ask, offset);
-    let down_price = maker_price(down_target, down_ask, offset);
+        for market_id in market_ids {
+            let (up_token_id, down_token_id) = match self.markets.get(&market_id) {
+                Some(s) => (s.info.up_token_id.clone(), s.info.down_token_id.clone()),
+                None => continue,
+            };
 
-    (up_price, down_price)
-}
+            let (up_ask, down_ask) = {
+                let cache = self.price_cache.read();
+                match (cache.get(&up_token_id), cache.get(&down_token_id)) {
+                    (Some((_, up_ask)), Some((_, down_ask))) => (up_ask, down_ask),
+                    _ => {
+                        debug!(market_id, "Missing price data");
+                        continue;
+                    }
+                }
+            };
 
-fn single_target_price(
-    ask: Decimal,
-    other_ask: Decimal,
-    target_total: Decimal,
-    offset: Decimal,
-) -> Option<Decimal> {
-    let target = target_total - other_ask;
-    if target <= MIN_PRICE {
-        return None;
+            let should_reladder = self.ladder_state.should_reladder(
+                &market_id,
+                up_ask,
+                down_ask,
+                self.ladder_engine.config().reladder_threshold,
+            );
+
+            if !should_reladder && !self.cooldown_elapsed(&market_id) {
+                continue;
+            }
+
+            // Get position and open orders
+            let (pos, open_orders) = {
+                let ledger = self.ledger.read();
+                (
+                    ledger.effective_position(&market_id),
+                    ledger.open_orders_for_market(&market_id),
+                )
+            };
+
+            let plan = self
+                .ladder_engine
+                .compute_ladder(up_ask, down_ask, &pos, &open_orders);
+
+            if plan.cancellations.is_empty() && plan.orders.is_empty() {
+                continue;
+            }
+
+            // Cancel stale orders first
+            if !plan.cancellations.is_empty() {
+                match self.cancel_orders(&plan.cancellations).await {
+                    Ok(cancelled) => {
+                        info!(market_id, count = cancelled.len(), "Cancelled stale orders");
+                        self.ledger.write().mark_orders_cancelled(&cancelled);
+                    }
+                    Err(e) => {
+                        error!(market_id, error = %e, "Failed to cancel orders");
+                    }
+                }
+            }
+
+            if !plan.orders.is_empty() {
+                let signed_orders = self
+                    .build_signed_orders(&plan.orders, &up_token_id, &down_token_id)
+                    .await;
+
+                if !signed_orders.is_empty() {
+                    match self.client.post_orders(signed_orders).await {
+                        Ok(responses) => {
+                            let mut placed = 0;
+                            for (resp, order) in responses.iter().zip(plan.orders.iter()) {
+                                if resp
+                                    .error_msg
+                                    .as_ref()
+                                    .map(|s| s.is_empty())
+                                    .unwrap_or(true)
+                                {
+                                    let token_id = match order.side {
+                                        MarketSide::Up => &up_token_id,
+                                        MarketSide::Down => &down_token_id,
+                                    };
+                                    self.ledger.write().record_order_placed(
+                                        resp.order_id.clone(),
+                                        market_id.clone(),
+                                        token_id.clone(),
+                                        order.side,
+                                        order.size,
+                                        order.price,
+                                    );
+                                    placed += 1;
+                                } else {
+                                    warn!(
+                                        market_id,
+                                        order_id = %resp.order_id,
+                                        error = ?resp.error_msg,
+                                        "Order rejected"
+                                    );
+                                }
+                            }
+
+                            info!(
+                                market_id,
+                                up_ask = %up_ask,
+                                down_ask = %down_ask,
+                                cancelled = plan.cancellations.len(),
+                                placed,
+                                "Ladder updated"
+                            );
+
+                            self.ladder_state
+                                .record_ladder(market_id.clone(), up_ask, down_ask);
+                        }
+                        Err(e) => {
+                            error!(market_id, error = %e, "Batch order submission failed");
+                        }
+                    }
+                }
+            }
+
+            self.last_order_by_market
+                .insert(market_id.clone(), Instant::now());
+        }
     }
-    Some(maker_price(target, ask, offset))
-}
+    async fn build_signed_orders(
+        &self,
+        orders: &[LadderOrder],
+        up_token_id: &str,
+        down_token_id: &str,
+    ) -> Vec<SignedOrder> {
+        let mut signed = Vec::with_capacity(orders.len());
 
-fn maker_price(target: Decimal, ask: Decimal, offset: Decimal) -> Decimal {
-    let maker_cap = (ask - offset).max(MIN_PRICE).min(MAX_PRICE);
-    let desired = target.min(maker_cap).max(MIN_PRICE).min(MAX_PRICE);
-    desired.round_dp_with_strategy(TICK_SIZE_DP, rust_decimal::RoundingStrategy::ToZero)
-}
+        for order in orders {
+            let token_id = match order.side {
+                MarketSide::Up => up_token_id,
+                MarketSide::Down => down_token_id,
+            };
 
-fn min_size_for_notional(price: Decimal) -> Decimal {
-    if price <= Decimal::ZERO {
-        return Decimal::ZERO;
+            let poly_price = match PolyDecimal::try_from(order.price.to_string().as_str()) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, "Invalid price format");
+                    continue;
+                }
+            };
+
+            let poly_size = match PolyDecimal::try_from(order.size.to_string().as_str()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "Invalid size format");
+                    continue;
+                }
+            };
+
+            info!(
+                "Placing order for {} shares @ {} for side {:?}",
+                poly_size, poly_price, order.side
+            );
+
+            let signable = match self
+                .client
+                .limit_order()
+                .token_id(token_id)
+                .price(poly_price)
+                .size(poly_size)
+                .side(ClobSide::Buy)
+                .build()
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "Failed to build order");
+                    continue;
+                }
+            };
+
+            match self
+                .client
+                .sign(&self.signer.clone().with_chain_id(Some(POLYGON)), signable)
+                .await
+            {
+                Ok(s) => signed.push(s),
+                Err(e) => {
+                    error!(error = %e, "Failed to sign order");
+                }
+            }
+        }
+
+        signed
     }
-    let raw = MIN_ORDER_NOTIONAL / price;
-    raw.round_dp_with_strategy(TICK_SIZE_DP, rust_decimal::RoundingStrategy::AwayFromZero)
+
+    async fn cancel_orders(&self, order_ids: &[String]) -> anyhow::Result<Vec<String>> {
+        if order_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.config.dry_run {
+            info!(count = order_ids.len(), "Dry run: would cancel orders");
+            return Ok(order_ids.to_vec());
+        }
+
+        /* The SDK expects a list of order IDs to cancel */
+        let order_id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
+
+        match self.client.cancel_orders(&order_id_refs).await {
+            Ok(response) => {
+                info!(
+                    requested = order_ids.len(),
+                    cancelled = response.canceled.len(),
+                    not_cancelled = response.not_canceled.len(),
+                    "Batch cancel complete"
+                );
+
+                Ok(response.canceled)
+            }
+            Err(e) => {
+                error!(error = %e, "Batch cancel failed");
+                Err(e.into())
+            }
+        }
+    }
 }

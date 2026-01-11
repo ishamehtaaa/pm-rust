@@ -1,7 +1,7 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
 use polymarket::config::Config;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt::{self, time::ChronoLocal}};
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
@@ -20,12 +20,24 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    fmt().with_env_filter(filter).init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(&args.log_level)
+            .add_directive("hyper_util=warn".parse().unwrap())
+            .add_directive("h2=warn".parse().unwrap())
+            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("reqwest=info".parse().unwrap())
+            .add_directive("tungstenite=warn".parse().unwrap())
+            .add_directive("tokio_tungstenite=warn".parse().unwrap())
+    });
 
     let mut config = Config::from_env()?;
-    // Command-line flag takes precedence: set dry_run directly from args.
     config.dry_run = args.dry_run;
+    
+    /* Initialize the logger with a custom timestamp and quieting noisy logs. */
+    tracing_subscriber::fmt()
+    .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
+    .with_env_filter(filter)
+    .init();
 
     tracing::info!(
         "Starting Polymarket bot (dry_run={}, targets={:?})",
@@ -43,12 +55,10 @@ async fn main() -> anyhow::Result<()> {
     for (market_id, state) in bot.markets() {
         let pair = state.pair.read();
         tracing::info!(
-            "Market: {} | {} | {} | up={} down={}",
+            "Market: {} | {} | {}",
             state.info.asset,
             state.info.duration,
             market_id,
-            pair.up_token_id,
-            pair.down_token_id
         );
     }
 

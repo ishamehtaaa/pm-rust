@@ -16,7 +16,7 @@ rust_decimal_macros = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
@@ -27,5 +27,5 @@ anyhow = "1"
 
 parking_lot = "0.12"
 once_cell = "1"
-polymarket-client-sdk = {version = "0.3.1", features = ["gamma", "rtds", "ws"]}
+polymarket-client-sdk = {version = "0.3.3", features = ["gamma", "rtds", "ws"]}
 futures = "0.3.31"
