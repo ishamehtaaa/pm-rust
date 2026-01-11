@@ -1,43 +1,55 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
 use polymarket::config::Config;
-use tracing_subscriber::{EnvFilter, fmt::{self, time::ChronoLocal}};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{self, time::ChronoLocal},
+};
 
 #[derive(Parser)]
-#[command(name = "polymarket-arb")]
-#[command(about = "Polymarket arbitrage bot")]
+#[command(name = "polymarket-arb", about = "Polymarket arbitrage bot")]
 struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    #[arg(long, help = "Run in dry-run mode (no real orders)")]
+    #[arg(long)]
     dry_run: bool,
 }
 
+fn init_tracing(log_level: &str) {
+    let filter = build_log_filter(log_level);
+
+    fmt::Subscriber::builder()
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
+        .with_env_filter(filter)
+        .init();
+}
+
+fn build_log_filter(log_level: &str) -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let mut filter = EnvFilter::new(log_level);
+        for directive in [
+            "hyper_util=warn",
+            "h2=warn",
+            "hyper=warn",
+            "reqwest=info",
+            "tungstenite=warn",
+            "tokio_tungstenite=warn",
+        ] {
+            filter = filter.add_directive(directive.parse().unwrap());
+        }
+        filter
+    })
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(&args.log_level)
-            .add_directive("hyper_util=warn".parse().unwrap())
-            .add_directive("h2=warn".parse().unwrap())
-            .add_directive("hyper=warn".parse().unwrap())
-            .add_directive("reqwest=info".parse().unwrap())
-            .add_directive("tungstenite=warn".parse().unwrap())
-            .add_directive("tokio_tungstenite=warn".parse().unwrap())
-    });
+    init_tracing(&args.log_level);
 
     let mut config = Config::from_env()?;
     config.dry_run = args.dry_run;
-    
-    /* Initialize the logger with a custom timestamp and quieting noisy logs. */
-    tracing_subscriber::fmt()
-    .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
-    .with_env_filter(filter)
-    .init();
 
     tracing::info!(
         "Starting Polymarket bot (dry_run={}, targets={:?})",
@@ -53,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for (market_id, state) in bot.markets() {
-        let pair = state.pair.read();
         tracing::info!(
             "Market: {} | {} | {}",
             state.info.asset,
@@ -63,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     bot.run().await;
-
     Ok(())
 }
+
+

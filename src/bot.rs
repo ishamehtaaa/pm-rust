@@ -7,6 +7,7 @@ use crate::poller::{InventoryLedger, MarketSide, spawn_order_poller};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use chrono::Timelike;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk::clob::types::response::NotificationResponse;
 use rust_decimal::Decimal;
 
 use alloy::signers::Signer;
@@ -47,6 +48,7 @@ pub struct SimpleBot {
     _order_poller: tokio::task::JoinHandle<()>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
     active_market_ids: Arc<RwLock<Vec<String>>>,
+    active_token_pairs: Arc<RwLock<Vec<(String, String)>>>,
 
     ladder_engine: LadderEngine,
     ladder_state: LadderState,
@@ -82,11 +84,12 @@ impl SimpleBot {
 
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
         let active_market_ids = Arc::new(RwLock::new(Vec::new()));
+        let active_token_pairs = Arc::new(RwLock::new(Vec::new()));
 
         let poller = spawn_order_poller(
             client.clone(),
             ledger.clone(),
-            active_market_ids.clone(),
+            active_token_pairs.clone(),
             Duration::from_millis(3000),
         );
 
@@ -99,6 +102,7 @@ impl SimpleBot {
             trading_pairs: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
+            active_token_pairs,
             active_market_ids,
             ledger,
             _order_poller: poller,
@@ -113,6 +117,7 @@ impl SimpleBot {
         self.discover_markets().await;
         info!("Entering main loop...");
 
+
         loop {
             if self.should_refresh_markets() {
                 self.discover_markets().await;
@@ -120,9 +125,15 @@ impl SimpleBot {
             }
 
             self.scan().await;
-
             tokio::time::sleep(LOOP_DELAY).await;
+
+            loop {
+                self.notifications().await;
+                let notification_delay = Duration::new(3, 0);
+                tokio::time::sleep(notification_delay).await;
+            }
         }
+
     }
     async fn fetch_token_balances(
         &self,
@@ -213,6 +224,42 @@ impl SimpleBot {
         {
             let mut ids = self.active_market_ids.write();
             *ids = self.markets.keys().cloned().collect();
+        }
+
+        {
+            let mut pairs = self.active_token_pairs.write();
+            *pairs = self
+                .markets
+                .values()
+                .map(|state| {
+                    (
+                        state.info.up_token_id.clone(),
+                        state.info.down_token_id.clone(),
+                    )
+                })
+                .collect();
+        }
+
+        for (market_id, state) in &self.markets {
+            match self
+                .fetch_token_balances(&state.info.up_token_id, &state.info.down_token_id)
+                .await
+            {
+                Ok((up_bal, down_bal)) => {
+                    self.ledger
+                        .write()
+                        .set_initial_position(market_id.clone(), up_bal, down_bal);
+                    info!(
+                        market_id = %market_id,
+                        up_shares = %up_bal,
+                        down_shares = %down_bal,
+                        "Initialized position from balances"
+                    );
+                }
+                Err(e) => {
+                    error!(market_id = %market_id, error = %e, "Failed to fetch initial balances");
+                }
+            }
         }
 
         let token_ids: Vec<String> = self
@@ -505,5 +552,25 @@ impl SimpleBot {
                 Err(e.into())
             }
         }
+    }
+
+    pub async fn notifications(&self) -> Vec<String> {
+        let Ok(responses) = self.client.notifications().await else {
+            info!("Called notifications API but none were returned :(");
+            return Vec::new();
+        };
+
+        responses
+            .into_iter()
+            .map(|n| {
+                let payload = &n.payload;
+                info!(?payload, "Notification received.");
+
+                format!(
+                    "ASSET: {} MATCHED {}",
+                    payload.asset_id, payload.matched_size
+                )
+            })
+            .collect()
     }
 }
