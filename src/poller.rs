@@ -8,9 +8,9 @@ use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::ws::types::response::OrderMessage;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -21,7 +21,6 @@ use crate::ladder::OpenOrderInfo;
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const MISSING_THRESHOLD: u32 = 3;
 const ORDER_STATUS_CHECK_CONCURRENCY: usize = 4;
 
 /// Messages sent to the ledger actor
@@ -35,6 +34,7 @@ pub enum LedgerCommand {
         side: MarketSide,
         size: Decimal,
         price: Decimal,
+        placed_at: Instant,
     },
     /// WebSocket reported an order update
     OrderUpdate(OrderMessage),
@@ -53,9 +53,8 @@ pub enum LedgerCommand {
     },
     /// HTTP reconciliation data
     Reconcile(HashMap<String, OpenOrderResponse>),
-    /// Request orders missing from remote for multiple polls
+    /// Request orders that were assumed complete
     MissingCandidates {
-        threshold: u32,
         reply: tokio::sync::oneshot::Sender<Vec<String>>,
     },
     /// Apply order status fetched directly by ID
@@ -104,7 +103,9 @@ struct TrackedOrder {
     original_size: Decimal,
     filled_size: Decimal,
     is_open: bool,
-    missing_count: u32,
+    assumed_complete: bool,
+    placed_at: Instant,
+    first_update_logged: bool,
 }
 
 /// The single source of truth for inventory.
@@ -147,6 +148,7 @@ impl LedgerActor {
                 side,
                 size,
                 price,
+                placed_at,
             } => {
                 let rounded_size = round_size(size);
                 debug!(
@@ -168,7 +170,9 @@ impl LedgerActor {
                         filled_size: Decimal::ZERO,
                         price,
                         is_open: true,
-                        missing_count: 0,
+                        assumed_complete: false,
+                        placed_at,
+                        first_update_logged: false,
                     },
                 );
             }
@@ -217,11 +221,11 @@ impl LedgerActor {
             LedgerCommand::Reconcile(remote_orders) => {
                 self.reconcile_with_remote(&remote_orders);
             }
-            LedgerCommand::MissingCandidates { threshold, reply } => {
+            LedgerCommand::MissingCandidates { reply } => {
                 let candidates = self
                     .tracked_orders
                     .values()
-                    .filter(|o| o.is_open && o.missing_count >= threshold)
+                    .filter(|o| o.assumed_complete)
                     .map(|o| o.order_id.clone())
                     .collect();
                 let _ = reply.send(candidates);
@@ -232,14 +236,14 @@ impl LedgerActor {
                 still_open,
             } => {
                 if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
-                    if let Some(filled_normalized) = filled_size {
-                        let fill_delta = filled_normalized - tracked.filled_size;
+                    if let Some(actual_filled) = filled_size {
+                        let fill_delta = actual_filled - tracked.filled_size;
 
-                        if fill_delta > Decimal::ZERO {
+                        if fill_delta != Decimal::ZERO {
                             warn!(
                                 order_id = %short_id(&order_id, 8),
                                 fill_delta = %fill_delta,
-                                "Catching up missed fill via order lookup"
+                                "Reconciling fill via order lookup"
                             );
 
                             let pos = self.positions.entry(tracked.market_id.clone()).or_default();
@@ -247,18 +251,14 @@ impl LedgerActor {
                                 MarketSide::Up => pos.up_shares += fill_delta,
                                 MarketSide::Down => pos.down_shares += fill_delta,
                             }
-                            tracked.filled_size = filled_normalized;
+                            tracked.filled_size = actual_filled;
                         }
                     }
 
                     if let Some(is_open) = still_open {
-                        if !is_open && tracked.is_open {
-                            tracked.is_open = false;
-                        }
-                        if is_open {
-                            tracked.missing_count = 0;
-                        }
+                        tracked.is_open = is_open;
                     }
+                    tracked.assumed_complete = false;
                 }
             }
         }
@@ -270,17 +270,24 @@ impl LedgerActor {
 
         // Try to find in our tracked orders first
         if let Some(tracked) = self.tracked_orders.get_mut(order_id) {
-            tracked.missing_count = 0;
-            // Normalize filled amount (API returns raw units, we track shares)
+            if !tracked.first_update_logged {
+                let elapsed_ms = tracked.placed_at.elapsed().as_millis();
+                info!(
+                    order_id = %short_id(order_id, 8),
+                    elapsed_ms,
+                    "Order update latency"
+                );
+                tracked.first_update_logged = true;
+            }
+            // Filled size already in shares from API
             if let Some(size_matched) = msg.size_matched {
-                let new_filled_normalized = size_matched / dec!(1_000_000);
-                let fill_delta = new_filled_normalized - tracked.filled_size;
+                let fill_delta = size_matched - tracked.filled_size;
 
                 if fill_delta > Decimal::ZERO {
                     info!(
                         order_id = %short_id(order_id, 8),
                         fill_delta = %fill_delta,
-                        total_filled = %new_filled_normalized,
+                        total_filled = %size_matched,
                         side = ?tracked.side,
                         "Fill detected via WebSocket"
                     );
@@ -291,7 +298,7 @@ impl LedgerActor {
                         MarketSide::Up => pos.up_shares += fill_delta,
                         MarketSide::Down => pos.down_shares += fill_delta,
                     }
-                    tracked.filled_size = new_filled_normalized;
+                    tracked.filled_size = size_matched;
                 }
             }
 
@@ -333,12 +340,8 @@ impl LedgerActor {
 
         for order_id in tracked_ids {
             if let Some(remote) = remote_orders.get(&order_id) {
-                let filled: Decimal = remote.size_matched.to_string().parse().unwrap_or_default();
-                let filled_normalized = filled / dec!(1_000_000);
-
                 if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
-                    tracked.missing_count = 0;
-                    let fill_delta = filled_normalized - tracked.filled_size;
+                    let fill_delta = remote.size_matched - tracked.filled_size;
 
                     if fill_delta > Decimal::ZERO {
                         // Missed a fill from WebSocket, catch up now
@@ -353,7 +356,7 @@ impl LedgerActor {
                             MarketSide::Up => pos.up_shares += fill_delta,
                             MarketSide::Down => pos.down_shares += fill_delta,
                         }
-                        tracked.filled_size = filled_normalized;
+                        tracked.filled_size = remote.size_matched;
                     }
 
                     let still_open = matches!(remote.status, OrderStatusType::Live);
@@ -362,13 +365,29 @@ impl LedgerActor {
                     }
                 }
             } else {
-                // Order not in remote - defer close until we confirm by ID
+                // Order not in remote - optimistically assume complete, then verify by ID
                 if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
-                    if tracked.is_open {
-                        tracked.missing_count += 1;
+                    if tracked.is_open && !tracked.assumed_complete {
+                        let remaining = tracked.original_size - tracked.filled_size;
+                        if remaining > Decimal::ZERO {
+                            warn!(
+                                order_id = %short_id(&order_id, 8),
+                                remaining = %remaining,
+                                "Order not in remote, assuming filled"
+                            );
+
+                            let pos = self.positions.entry(tracked.market_id.clone()).or_default();
+                            match tracked.side {
+                                MarketSide::Up => pos.up_shares += remaining,
+                                MarketSide::Down => pos.down_shares += remaining,
+                            }
+                            tracked.filled_size = tracked.original_size;
+                        }
+                        tracked.is_open = false;
+                        tracked.assumed_complete = true;
+                    } else if tracked.is_open {
                         debug!(
                             order_id = %short_id(&order_id, 8),
-                            missing_count = tracked.missing_count,
                             "Order not in remote"
                         );
                     }
@@ -435,6 +454,7 @@ impl LedgerHandle {
                 side,
                 size,
                 price,
+                placed_at: Instant::now(),
             })
             .await;
     }
@@ -484,14 +504,11 @@ impl LedgerHandle {
     }
 
     /// Get missing orders that need direct status checks
-    pub async fn missing_candidates(&self, threshold: u32) -> Vec<String> {
+    pub async fn missing_candidates(&self) -> Vec<String> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let _ = self
             .tx
-            .send(LedgerCommand::MissingCandidates {
-                threshold,
-                reply: reply_tx,
-            })
+            .send(LedgerCommand::MissingCandidates { reply: reply_tx })
             .await;
         reply_rx.await.unwrap_or_default()
     }
@@ -604,7 +621,7 @@ pub fn spawn_reconciliation_poller(
                     debug!(count = orders.len(), "HTTP reconciliation");
                     ledger.reconcile(orders).await;
 
-                    let missing = ledger.missing_candidates(MISSING_THRESHOLD).await;
+                    let missing = ledger.missing_candidates().await;
                     if !missing.is_empty() {
                         stream::iter(missing)
                             .map(|order_id| {
@@ -613,18 +630,12 @@ pub fn spawn_reconciliation_poller(
                                 async move {
                                     match client.order(&order_id).await {
                                         Ok(order) => {
-                                            let filled_raw: Decimal = order
-                                                .size_matched
-                                                .to_string()
-                                                .parse()
-                                                .unwrap_or_default();
-                                            let filled_normalized = filled_raw / dec!(1_000_000);
                                             let still_open =
                                                 matches!(order.status, OrderStatusType::Live);
                                             ledger
                                                 .apply_order_status(
                                                     order_id,
-                                                    Some(filled_normalized),
+                                                    Some(order.size_matched),
                                                     Some(still_open),
                                                 )
                                                 .await;

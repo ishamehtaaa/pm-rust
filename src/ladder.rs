@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tracing::{debug, info, trace};
 
 use crate::{
-    constants::round_size,
+    constants::{round_size, short_id},
     poller::{MarketPosition, MarketSide},
 };
 const MIN_ORDER_SIZE: Decimal = dec!(5);
@@ -16,8 +16,6 @@ pub struct LadderConfig {
     pub size_per_level: Decimal,
     pub top_offset: Decimal,
     pub target_per_side: Decimal,
-    pub max_position_per_side: Decimal,
-    pub max_pending_per_side: Decimal,
     pub reladder_threshold: Decimal,
     pub stale_order_distance: Decimal,
 }
@@ -25,13 +23,11 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 1,
+            levels: 2,
             spacing: dec!(0.01),
             size_per_level: dec!(5),
-            top_offset: dec!(0.01),
+            top_offset: dec!(0.02),
             target_per_side: dec!(15),
-            max_position_per_side: dec!(50),
-            max_pending_per_side: dec!(20),
             reladder_threshold: dec!(0.02),
             stale_order_distance: dec!(0.05),
         }
@@ -113,6 +109,13 @@ impl LadderEngine {
 
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
+        let target = self.config.target_per_side;
+        let min_side = position.up_shares.min(position.down_shares);
+        let desired_per_side = if min_side >= target {
+            position.up_shares.max(position.down_shares)
+        } else {
+            target
+        };
 
         trace!(
             up_shares = %position.up_shares,
@@ -122,11 +125,12 @@ impl LadderEngine {
             total_up = %total_up,
             total_down = %total_down,
             target = %self.config.target_per_side,
+            desired = %desired_per_side,
             "Position state"
         );
 
         // Cancel orders on sides that are at/over target
-        if position.up_shares >= self.config.target_per_side {
+        if position.up_shares >= desired_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 info!(
                     order_id = %order.order_id,
@@ -136,7 +140,7 @@ impl LadderEngine {
             }
         }
 
-        if position.down_shares >= self.config.target_per_side {
+        if position.down_shares >= desired_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Down) {
                 info!(
                     order_id = %order.order_id,
@@ -170,18 +174,16 @@ impl LadderEngine {
         let effective_pending_down = (pending_down - cancelled_down).max(Decimal::ZERO);
 
         // Calculate room for new orders
-        let up_room = if position.up_shares >= self.config.target_per_side {
+        let up_room = if position.up_shares >= desired_per_side {
             Decimal::ZERO
         } else {
-            (self.config.target_per_side - position.up_shares - effective_pending_up)
-                .max(Decimal::ZERO)
+            (desired_per_side - position.up_shares - effective_pending_up).max(Decimal::ZERO)
         };
 
-        let down_room = if position.down_shares >= self.config.target_per_side {
+        let down_room = if position.down_shares >= desired_per_side {
             Decimal::ZERO
         } else {
-            (self.config.target_per_side - position.down_shares - effective_pending_down)
-                .max(Decimal::ZERO)
+            (desired_per_side - position.down_shares - effective_pending_down).max(Decimal::ZERO)
         };
 
         trace!(
@@ -227,8 +229,9 @@ impl LadderEngine {
             /* If a pending order is too far below the current ask, it's stale. */
             let distance = current_ask - order.price;
             if distance > self.config.stale_order_distance {
+                let short_id = short_id(&order.order_id, 8);
                 info!(
-                    order_id = %order.order_id,
+                    order_id = short_id,
                     price = %order.price,
                     current_ask = %current_ask,
                     distance = %distance,
@@ -276,7 +279,7 @@ impl LadderEngine {
     }
 }
 
-/// Info about an open order, used for stale detection
+/* The structure of an open order. Used to help categorize stale orders. */
 #[derive(Debug, Clone)]
 pub struct OpenOrderInfo {
     pub order_id: String,

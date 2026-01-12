@@ -410,14 +410,24 @@ impl SimpleBot {
     }
 
     async fn place_orders(&self, market: &ActiveMarket, orders: &[LadderOrder]) -> usize {
+        let build_start = Instant::now();
         let signed = self.build_signed_orders(orders, market).await;
+        let build_ms = build_start.elapsed().as_millis();
 
         if signed.is_empty() {
             return 0;
         }
 
+        let post_start = Instant::now();
         match self.client.post_orders(signed).await {
             Ok(responses) => {
+                let post_ms = post_start.elapsed().as_millis();
+                debug!(
+                    market_id = %market.market_id,
+                    build_ms,
+                    post_ms,
+                    "Order batch timing"
+                );
                 let mut placed = 0;
 
                 for (resp, order) in responses.iter().zip(orders.iter()) {
