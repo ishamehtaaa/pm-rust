@@ -3,15 +3,17 @@ use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::Client;
 use polymarket_client_sdk::clob::types::OrderStatusType;
-use polymarket_client_sdk::clob::types::request::{OrdersRequest, TradesRequest};
+use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error};
 
-use crate::constants::{round_size, short_id, to_raw, to_shares};
+use crate::clob_api::get_trades;
+use crate::constants::{round_size, short_id};
 use crate::ladder::OpenOrderInfo;
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
@@ -22,6 +24,7 @@ const MISSING_THRESHOLD: u32 = 3;
 #[derive(Debug, Clone)]
 struct TrackedOrder {
     order_id: String,
+    token_id: String,
     market_id: String,
     side: MarketSide,
     price: Decimal,
@@ -43,12 +46,17 @@ pub struct InventoryLedger {
     tracked_orders: HashMap<String, TrackedOrder>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MarketTokens {
+    pub market_id: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MarketPosition {
     pub up_shares: Decimal,
     pub down_shares: Decimal,
-    pub pending_up: Decimal,
-    pub pending_down: Decimal,
 }
 
 impl InventoryLedger {
@@ -61,23 +69,26 @@ impl InventoryLedger {
         size: Decimal,
         price: Decimal,
     ) {
-        let pos = self.positions.entry(market_id.clone()).or_default();
         let rounded_size = round_size(size);
 
-        match side {
-            MarketSide::Up => pos.pending_up += size,
-            MarketSide::Down => pos.pending_down += size,
-        }
+        debug!(
+            order_id = %order_id,
+            market_id = %market_id,
+            side = ?side,
+            size = %rounded_size,
+            "Recording order placed"
+        );
 
         self.tracked_orders.insert(
             order_id.clone(),
             TrackedOrder {
                 order_id,
+                token_id,
                 market_id,
                 side,
                 original_size: rounded_size,
                 filled_size: Decimal::ZERO,
-                price: price,
+                price,
                 is_open: true,
                 missing_count: 0,
             },
@@ -101,70 +112,36 @@ impl InventoryLedger {
         pos.up_shares = up_shares;
         pos.down_shares = down_shares;
     }
-
-    pub fn effective_position(&self, market_id: &str) -> MarketPosition {
-        let pos = self.positions.get(market_id).cloned().unwrap_or_default();
-
-        let normalized = MarketPosition {
-            up_shares: pos.up_shares,
-            down_shares: pos.down_shares,
-            pending_up: pos.pending_up,
-            pending_down: pos.pending_down,
-        };
-
-        trace!(
-            market_id = %market_id,
-            up_shares = %normalized.up_shares,
-            down_shares = %normalized.down_shares,
-            pending_up = %normalized.pending_up,
-            pending_down = %normalized.pending_down,
-            "Effective position read"
-        );
-
-        return normalized;
+    pub fn effective_position(&self, market_id: &str) -> (MarketPosition, Decimal, Decimal) {
+        let pos = self.confirmed_position(market_id);
+        let (pending_up, pending_down) = self.pending_for_market(market_id);
+        (pos, pending_up, pending_down)
     }
 
     pub fn open_orders_for_market(&self, market_id: &str) -> Vec<OpenOrderInfo> {
-        let orders: Vec<OpenOrderInfo> = self
-            .tracked_orders
+        self.tracked_orders
             .values()
             .filter(|o| o.is_open && o.market_id == market_id)
             .map(|o| OpenOrderInfo {
                 order_id: o.order_id.clone(),
                 side: o.side,
                 price: o.price,
-                remaining_size: (o.original_size - o.filled_size),
+                remaining_size: o.original_size - o.filled_size,
             })
-            .collect();
-
-        debug!(
-            market_id = %market_id,
-            open_order_count = orders.len(),
-            total_up_pending = %orders.iter().filter(|o| o.side == MarketSide::Up).map(|o| o.remaining_size).sum::<Decimal>(),
-            total_down_pending = %orders.iter().filter(|o| o.side == MarketSide::Down).map(|o| o.remaining_size).sum::<Decimal>(),
-            "Open orders for market"
-        );
-
-        orders
+            .collect()
     }
 
     pub fn mark_orders_cancelled(&mut self, order_ids: &[String]) {
         for order_id in order_ids {
             if let Some(tracked) = self.tracked_orders.get_mut(order_id) {
                 if tracked.is_open {
+                    debug!(
+                        order_id = %order_id,
+                        side = ?tracked.side,
+                        remaining = %(tracked.original_size - tracked.filled_size),
+                        "Marking order cancelled"
+                    );
                     tracked.is_open = false;
-                    let unfilled = tracked.original_size - tracked.filled_size;
-                    if unfilled > Decimal::ZERO {
-                        let pos = self.positions.entry(tracked.market_id.clone()).or_default();
-                        match tracked.side {
-                            MarketSide::Up => {
-                                pos.pending_up = (pos.pending_up - unfilled).max(Decimal::ZERO)
-                            }
-                            MarketSide::Down => {
-                                pos.pending_down = (pos.pending_down - unfilled).max(Decimal::ZERO)
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -172,41 +149,36 @@ impl InventoryLedger {
 
     fn reconcile_order(&mut self, order_id: &str, new_filled: Decimal, still_open: bool) {
         let Some(tracked) = self.tracked_orders.get_mut(order_id) else {
-            debug!("Tried to reconcile order, but it does not exist in tracked orders list.");
             return;
         };
 
-        let fill_delta = new_filled - tracked.filled_size;
-        if fill_delta > Decimal::ZERO {
-            let pos = self.positions.entry(tracked.market_id.clone()).or_default();
+        // Normalize filled amount from API (raw units to shares)
+        let new_filled_normalized = new_filled / dec!(1_000_000);
 
+        let fill_delta = new_filled_normalized - tracked.filled_size;
+
+        if fill_delta > Decimal::ZERO {
+            debug!(
+                order_id = %order_id,
+                fill_delta = %fill_delta,
+                side = ?tracked.side,
+                "Fill detected"
+            );
+
+            let pos = self.positions.entry(tracked.market_id.clone()).or_default();
             match tracked.side {
-                MarketSide::Up => {
-                    pos.up_shares += fill_delta;
-                    pos.pending_up = (pos.pending_up - fill_delta).max(Decimal::ZERO);
-                }
-                MarketSide::Down => {
-                    pos.down_shares += fill_delta;
-                    pos.pending_down = (pos.pending_down - fill_delta).max(Decimal::ZERO);
-                }
+                MarketSide::Up => pos.up_shares += fill_delta,
+                MarketSide::Down => pos.down_shares += fill_delta,
             }
-            tracked.filled_size = new_filled;
+            tracked.filled_size = new_filled_normalized;
         }
 
         if !still_open && tracked.is_open {
+            debug!(
+                order_id = %order_id,
+                "Order closed"
+            );
             tracked.is_open = false;
-            let unfilled = tracked.original_size - tracked.filled_size;
-            if unfilled > Decimal::ZERO {
-                let pos = self.positions.entry(tracked.market_id.clone()).or_default();
-                match tracked.side {
-                    MarketSide::Up => {
-                        pos.pending_up = (pos.pending_up - unfilled).max(Decimal::ZERO)
-                    }
-                    MarketSide::Down => {
-                        pos.pending_down = (pos.pending_down - unfilled).max(Decimal::ZERO)
-                    }
-                }
-            }
         }
     }
 
@@ -293,18 +265,32 @@ impl InventoryLedger {
             }
         }
     }
-    pub fn confirmed_position(&self, market_id: &str) -> (Decimal, Decimal) {
-        self.positions
-            .get(market_id)
-            .map(|p| (p.up_shares, p.down_shares))
-            .unwrap_or_default()
+    pub fn confirmed_position(&self, market_id: &str) -> MarketPosition {
+        self.positions.get(market_id).cloned().unwrap_or_default()
+    }
+
+    pub fn pending_for_market(&self, market_id: &str) -> (Decimal, Decimal) {
+        let mut pending_up = Decimal::ZERO;
+        let mut pending_down = Decimal::ZERO;
+
+        for order in self.tracked_orders.values() {
+            if order.is_open && order.market_id == market_id {
+                let remaining = order.original_size - order.filled_size;
+                match order.side {
+                    MarketSide::Up => pending_up += remaining,
+                    MarketSide::Down => pending_down += remaining,
+                }
+            }
+        }
+
+        (pending_up, pending_down)
     }
 }
 
 pub fn spawn_order_poller(
     client: Arc<AuthenticatedClient>,
     ledger: Arc<RwLock<InventoryLedger>>,
-    market_ids: Arc<RwLock<Vec<String>>>,
+    market_tokens: Arc<RwLock<Vec<MarketTokens>>>,
     poll_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -314,11 +300,19 @@ pub fn spawn_order_poller(
         loop {
             interval.tick().await;
 
-            let markets = market_ids.read().clone();
+            let markets = market_tokens.read().clone();
 
-            for market_id in markets {
-                if let Err(e) = poll_market_orders(&client, &ledger, &market_id).await {
-                    tracing::debug!(market_id = %market_id, error = %e, "Order poll failed");
+            for market in markets {
+                if let Err(e) = poll_market_orders(
+                    &client,
+                    &ledger,
+                    &market.market_id,
+                    &market.up_token_id,
+                    &market.down_token_id,
+                )
+                .await
+                {
+                    tracing::debug!(market_id = %market.market_id, error = %e, "Order poll failed");
                 }
             }
         }
@@ -329,6 +323,8 @@ async fn poll_market_orders(
     client: &AuthenticatedClient,
     ledger: &Arc<RwLock<InventoryLedger>>,
     market_id: &str,
+    up_token_id: &str,
+    down_token_id: &str,
 ) -> anyhow::Result<()> {
     let req = OrdersRequest::builder().build();
 
@@ -341,33 +337,7 @@ async fn poll_market_orders(
             );
         }
         Err(e) => {
-            error!(error = %e, "Orders query failed");
-        }
-    }
-
-    debug!(market_id = %market_id, "Checking trades");
-
-    let trades_req = TradesRequest::builder().market(market_id).build();
-
-    match client.trades(&trades_req, None).await {
-        Ok(page) => {
-            debug!(
-                market_id = %market_id,
-                trades_count = page.data.len(),
-                "Trades response"
-            );
-            for trade in &page.data {
-                debug!(
-                    trade_id = ?trade.id,
-                    size = ?trade.size,
-                    price = ?trade.price,
-                    side = ?trade.side,
-                    "Trade"
-                );
-            }
-        }
-        Err(e) => {
-            error!(error = %e, "Trades query failed");
+            error!(error = %e, "Polling orders failed.");
         }
     }
 

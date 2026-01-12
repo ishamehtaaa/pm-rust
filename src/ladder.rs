@@ -4,7 +4,10 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::{constants::round_size, poller::{MarketPosition, MarketSide}};
+use crate::{
+    constants::round_size,
+    poller::{MarketPosition, MarketSide},
+};
 const MIN_ORDER_SIZE: Decimal = dec!(5);
 
 pub struct LadderConfig {
@@ -74,7 +77,8 @@ impl LadderState {
     }
 
     pub fn record_ladder(&mut self, market_id: String, up_ask: Decimal, down_ask: Decimal) {
-        self.last_ladder_prices.insert(market_id, (up_ask, down_ask));
+        self.last_ladder_prices
+            .insert(market_id, (up_ask, down_ask));
     }
 
     pub fn clear_market(&mut self, market_id: &str) {
@@ -101,14 +105,55 @@ impl LadderEngine {
         up_ask: Decimal,
         down_ask: Decimal,
         position: &MarketPosition,
+        pending_up: Decimal,
+        pending_down: Decimal,
         open_orders: &[OpenOrderInfo],
     ) -> LadderPlan {
         let mut plan = LadderPlan::default();
 
-        /* Check for stale orders first so we take cancellations into account. */
-        plan.cancellations = self.find_stale_orders(up_ask, down_ask, open_orders);
+        let total_up = position.up_shares + pending_up;
+        let total_down = position.down_shares + pending_down;
 
-        /* After cancellations, how much exposure do we have left? */
+        debug!(
+            up_shares = %position.up_shares,
+            down_shares = %position.down_shares,
+            pending_up = %pending_up,
+            pending_down = %pending_down,
+            total_up = %total_up,
+            total_down = %total_down,
+            target = %self.config.target_per_side,
+            "Position state"
+        );
+
+        // Cancel orders on sides that are at/over target
+        if position.up_shares >= self.config.target_per_side {
+            for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
+                info!(
+                    order_id = %order.order_id,
+                    "Cancelling UP order - position at target"
+                );
+                plan.cancellations.push(order.order_id.clone());
+            }
+        }
+
+        if position.down_shares >= self.config.target_per_side {
+            for order in open_orders.iter().filter(|o| o.side == MarketSide::Down) {
+                info!(
+                    order_id = %order.order_id,
+                    "Cancelling DOWN order - position at target"
+                );
+                plan.cancellations.push(order.order_id.clone());
+            }
+        }
+
+        // Cancel stale orders (too far from market)
+        for order_id in self.find_stale_orders(up_ask, down_ask, open_orders) {
+            if !plan.cancellations.contains(&order_id) {
+                plan.cancellations.push(order_id);
+            }
+        }
+
+        // Calculate pending after cancellations
         let cancelled_up: Decimal = open_orders
             .iter()
             .filter(|o| o.side == MarketSide::Up && plan.cancellations.contains(&o.order_id))
@@ -121,41 +166,49 @@ impl LadderEngine {
             .map(|o| o.remaining_size)
             .sum();
 
-        let effective_pending_up = (position.pending_up - cancelled_up).max(Decimal::ZERO);
-        let effective_pending_down = (position.pending_down - cancelled_down).max(Decimal::ZERO);
+        let effective_pending_up = (pending_up - cancelled_up).max(Decimal::ZERO);
+        let effective_pending_down = (pending_down - cancelled_down).max(Decimal::ZERO);
 
-        let up_total = position.up_shares + effective_pending_up;
-        let down_total = position.down_shares + effective_pending_down;
+        // Calculate room for new orders
+        let up_room = if position.up_shares >= self.config.target_per_side {
+            Decimal::ZERO
+        } else {
+            (self.config.target_per_side - position.up_shares - effective_pending_up)
+                .max(Decimal::ZERO)
+        };
 
-        /* Calculate room to target. */
-        let up_room = (self.config.target_per_side - up_total).max(Decimal::ZERO);
-        let down_room = (self.config.target_per_side - down_total).max(Decimal::ZERO);
+        let down_room = if position.down_shares >= self.config.target_per_side {
+            Decimal::ZERO
+        } else {
+            (self.config.target_per_side - position.down_shares - effective_pending_down)
+                .max(Decimal::ZERO)
+        };
 
-        /* If we have no room, or maybe even negative room, we return. */
-        if (up_room <= dec!(0)) && (down_room <= dec!(0))
-        {
-            info!("Returning as we have met or exceeded the target # of shares per side: UP: {} DOWN: {}", up_total, down_total);
+        debug!(
+            effective_pending_up = %effective_pending_up,
+            effective_pending_down = %effective_pending_down,
+            up_room = %up_room,
+            down_room = %down_room,
+            "Room calculation"
+        );
+
+        if up_room.is_zero() && down_room.is_zero() {
             return plan;
         }
 
-        // Respect pending limits
-        let up_pending_room =
-            (self.config.max_pending_per_side - effective_pending_up).max(Decimal::ZERO);
-        let down_pending_room =
-            (self.config.max_pending_per_side - effective_pending_down).max(Decimal::ZERO);
-
         // Generate ladders
-        let up_orders =
-            self.generate_side_ladder(MarketSide::Up, up_ask, up_room.min(up_pending_room));
-        plan.orders.extend(up_orders);
+        if up_room >= MIN_ORDER_SIZE {
+            plan.orders
+                .extend(self.generate_side_ladder(MarketSide::Up, up_ask, up_room));
+        }
 
-        let down_orders =
-            self.generate_side_ladder(MarketSide::Down, down_ask, down_room.min(down_pending_room));
-        plan.orders.extend(down_orders);
+        if down_room >= MIN_ORDER_SIZE {
+            plan.orders
+                .extend(self.generate_side_ladder(MarketSide::Down, down_ask, down_room));
+        }
 
         plan
     }
-
 
     fn find_stale_orders(
         &self,
@@ -212,7 +265,7 @@ impl LadderEngine {
             }
 
             let size = round_size(self.config.size_per_level.min(remaining_room));
-            if size < MIN_ORDER_SIZE { 
+            if size < MIN_ORDER_SIZE {
                 break;
             }
 

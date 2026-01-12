@@ -1,14 +1,11 @@
 use crate::config::Config;
-use crate::constants::to_shares;
+use crate::clob_api::fetch_token_balances;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketState, TradingPair};
-use crate::poller::{InventoryLedger, MarketSide, spawn_order_poller};
+use crate::poller::{InventoryLedger, MarketSide, MarketTokens, spawn_order_poller};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use chrono::Timelike;
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use rust_decimal::Decimal;
-
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
@@ -16,10 +13,9 @@ use parking_lot::RwLock;
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{AssetType, Side as ClobSide, SignatureType, SignedOrder};
+use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType, SignedOrder};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
-use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -46,7 +42,7 @@ pub struct SimpleBot {
     price_cache: Arc<RwLock<PriceCache>>,
     _order_poller: tokio::task::JoinHandle<()>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
-    active_market_ids: Arc<RwLock<Vec<String>>>,
+    active_market_tokens: Arc<RwLock<Vec<MarketTokens>>>,
 
     ladder_engine: LadderEngine,
     ladder_state: LadderState,
@@ -81,12 +77,12 @@ impl SimpleBot {
         let client = Arc::new(client);
 
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
-        let active_market_ids = Arc::new(RwLock::new(Vec::new()));
+        let active_market_tokens = Arc::new(RwLock::new(Vec::new()));
 
         let poller = spawn_order_poller(
             client.clone(),
             ledger.clone(),
-            active_market_ids.clone(),
+            active_market_tokens.clone(),
             Duration::from_millis(3000),
         );
 
@@ -99,7 +95,7 @@ impl SimpleBot {
             trading_pairs: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
-            active_market_ids,
+            active_market_tokens,
             ledger,
             _order_poller: poller,
             price_cache,
@@ -124,45 +120,6 @@ impl SimpleBot {
             tokio::time::sleep(LOOP_DELAY).await;
         }
     }
-    async fn fetch_token_balances(
-        &self,
-        up_token_id: &str,
-        down_token_id: &str,
-    ) -> anyhow::Result<(Decimal, Decimal)> {
-        let up_req = BalanceAllowanceRequest::builder()
-            .asset_type(AssetType::Conditional)
-            .token_id(up_token_id)
-            .build();
-
-        let down_req = BalanceAllowanceRequest::builder()
-            .asset_type(AssetType::Conditional)
-            .token_id(down_token_id)
-            .build();
-
-        let up_resp = self.client.balance_allowance(up_req).await?;
-        let down_resp = self.client.balance_allowance(down_req).await?;
-
-        let up_raw: Decimal = up_resp.balance.to_string().parse().unwrap_or_default();
-        let down_raw: Decimal = down_resp.balance.to_string().parse().unwrap_or_default();
-
-        debug!(
-            up_raw = %up_raw,
-            down_raw = %down_raw,
-            "Raw balances from API"
-        );
-
-        let up_bal = up_raw / dec!(1_000_000);
-        let down_bal = down_raw / dec!(1_000_000);
-
-        debug!(
-            up_bal = %up_bal,
-            down_bal = %down_bal,
-            "fetch_token_balances returning"
-        );
-
-        Ok((up_bal, down_bal))
-    }
-
     #[instrument(skip(self), fields(markets = self.markets.len()))]
     pub async fn discover_markets(&mut self) {
         info!("Discovering markets");
@@ -209,10 +166,18 @@ impl SimpleBot {
             self.trading_pairs.insert(market_id, pair);
         }
 
-        // Update active market IDs after processing all markets
+        // Update active market tokens after processing all markets
         {
-            let mut ids = self.active_market_ids.write();
-            *ids = self.markets.keys().cloned().collect();
+            let mut tokens = self.active_market_tokens.write();
+            *tokens = self
+                .markets
+                .values()
+                .map(|m| MarketTokens {
+                    market_id: m.info.id.clone(),
+                    up_token_id: m.info.up_token_id.clone(),
+                    down_token_id: m.info.down_token_id.clone(),
+                })
+                .collect();
         }
 
         let token_ids: Vec<String> = self
@@ -226,9 +191,12 @@ impl SimpleBot {
         }
 
         for (market_id, state) in &self.markets {
-            match self
-                .fetch_token_balances(&state.info.up_token_id, &state.info.down_token_id)
-                .await
+            match fetch_token_balances(
+                &self.client,
+                &state.info.up_token_id,
+                &state.info.down_token_id,
+            )
+            .await
             {
                 Ok((up_bal, down_bal)) => {
                     self.ledger
@@ -264,8 +232,7 @@ impl SimpleBot {
         let now = Utc::now();
         let total_seconds = now.minute() * 60 + now.second();
 
-        // Seconds into each 15-minute window where we should refresh
-        // 15 min = 900 seconds, refresh at 840-870 seconds (14:00-14:30)
+        /* The seconds into each 15 min window where we must refresh. */
         let position_in_window = total_seconds % 900;
 
         (840..870).contains(&position_in_window)
@@ -295,6 +262,7 @@ impl SimpleBot {
                 None => continue,
             };
 
+            // Get prices from WebSocket cache
             let (up_ask, down_ask) = {
                 let cache = self.price_cache.read();
                 match (cache.get(&up_token_id), cache.get(&down_token_id)) {
@@ -305,7 +273,18 @@ impl SimpleBot {
                     }
                 }
             };
+            debug!("UP: {}, DOWN: {}", up_ask, down_ask);
 
+            // Get position, pending, and open orders from ledger (single source of truth)
+            let (pos, pending_up, pending_down, open_orders) = {
+                let ledger = self.ledger.read();
+                let pos = ledger.confirmed_position(&market_id);
+                let (pending_up, pending_down) = ledger.pending_for_market(&market_id);
+                let open_orders = ledger.open_orders_for_market(&market_id);
+                (pos, pending_up, pending_down, open_orders)
+            };
+
+            // Check if we need to re-ladder
             let should_reladder = self.ladder_state.should_reladder(
                 &market_id,
                 up_ask,
@@ -317,19 +296,17 @@ impl SimpleBot {
                 continue;
             }
 
-            // Get position and open orders
-            let (pos, open_orders) = {
-                let ledger = self.ledger.read();
-                (
-                    ledger.effective_position(&market_id),
-                    ledger.open_orders_for_market(&market_id),
-                )
-            };
+            // Compute ladder plan
+            let plan = self.ladder_engine.compute_ladder(
+                up_ask,
+                down_ask,
+                &pos,
+                pending_up,
+                pending_down,
+                &open_orders,
+            );
 
-            let plan = self
-                .ladder_engine
-                .compute_ladder(up_ask, down_ask, &pos, &open_orders);
-
+            // Nothing to do
             if plan.cancellations.is_empty() && plan.orders.is_empty() {
                 continue;
             }
@@ -338,7 +315,7 @@ impl SimpleBot {
             if !plan.cancellations.is_empty() {
                 match self.cancel_orders(&plan.cancellations).await {
                     Ok(cancelled) => {
-                        info!(market_id, count = cancelled.len(), "Cancelled stale orders");
+                        info!(market_id, count = cancelled.len(), "Cancelled orders");
                         self.ledger.write().mark_orders_cancelled(&cancelled);
                     }
                     Err(e) => {
@@ -347,6 +324,7 @@ impl SimpleBot {
                 }
             }
 
+            // Place new ladder orders
             if !plan.orders.is_empty() {
                 let signed_orders = self
                     .build_signed_orders(&plan.orders, &up_token_id, &down_token_id)
@@ -409,6 +387,7 @@ impl SimpleBot {
                 .insert(market_id.clone(), Instant::now());
         }
     }
+
     async fn build_signed_orders(
         &self,
         orders: &[LadderOrder],
