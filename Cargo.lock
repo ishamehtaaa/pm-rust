@@ -2908,6 +2908,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures",
+ "futures-util",
  "once_cell",
  "parking_lot",
  "polymarket-client-sdk",

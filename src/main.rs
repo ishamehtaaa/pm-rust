@@ -1,7 +1,10 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
 use polymarket::config::Config;
-use tracing_subscriber::{EnvFilter, fmt::{self, time::ChronoLocal}};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{self, time::ChronoLocal},
+};
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
@@ -32,12 +35,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::from_env()?;
     config.dry_run = args.dry_run;
-    
+
     /* Initialize the logger with a custom timestamp and quieting noisy logs. */
     tracing_subscriber::fmt()
-    .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
-    .with_env_filter(filter)
-    .init();
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
+        .with_env_filter(filter)
+        .init();
 
     tracing::info!(
         "Starting Polymarket bot (dry_run={}, targets={:?})",
@@ -53,13 +56,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for (market_id, state) in bot.markets() {
-        let pair = state.pair.read();
-        tracing::info!(
-            "Market: {} | {} | {}",
-            state.info.asset,
-            state.info.duration,
-            market_id,
-        );
+        tracing::info!("Market: {} | {}", state.asset, market_id);
     }
 
     bot.run().await;

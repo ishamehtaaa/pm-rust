@@ -2,7 +2,7 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::{
     constants::round_size,
@@ -25,7 +25,7 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 3,
+            levels: 1,
             spacing: dec!(0.01),
             size_per_level: dec!(5),
             top_offset: dec!(0.01),
@@ -114,7 +114,7 @@ impl LadderEngine {
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
 
-        debug!(
+        trace!(
             up_shares = %position.up_shares,
             down_shares = %position.down_shares,
             pending_up = %pending_up,
@@ -184,7 +184,7 @@ impl LadderEngine {
                 .max(Decimal::ZERO)
         };
 
-        debug!(
+        trace!(
             effective_pending_up = %effective_pending_up,
             effective_pending_down = %effective_pending_down,
             up_room = %up_room,

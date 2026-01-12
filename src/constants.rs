@@ -6,7 +6,7 @@ pub const SIZE_DP: u32 = 2;
 
 /* Convert raw sizes to human readable shares. */
 pub fn to_shares(raw: Decimal) -> Decimal {
-    (raw / SHARE_DECIMALS)
+    raw / SHARE_DECIMALS
 }
 
 /* Convert human readable share amounts to raw sizes. */

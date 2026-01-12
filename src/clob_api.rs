@@ -1,4 +1,3 @@
-use alloy::primitives::Address;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::Client;
