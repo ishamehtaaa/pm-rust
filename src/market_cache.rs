@@ -1,9 +1,9 @@
 use crate::config::ASSETS_BY_PREFIX;
-use crate::models::{duration_label, MarketInfo};
+use crate::models::{MarketInfo, duration_label};
 use chrono::{DateTime, Utc};
+use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market as GammaMarket;
-use polymarket_client_sdk::gamma::Client as GammaClient;
 use std::collections::HashSet;
 use tracing::info;
 
@@ -29,7 +29,10 @@ impl MarketCache {
         }
     }
 
-    pub async fn get_markets(&self, _now: DateTime<Utc>) -> Result<Vec<MarketInfo>, MarketCacheError> {
+    pub async fn get_markets(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<MarketInfo>, MarketCacheError> {
         let raw_markets = self.fetch_raw_markets().await?;
         info!("Fetched {} raw markets from Gamma API", raw_markets.len());
 
@@ -58,13 +61,15 @@ impl MarketCache {
 
     fn convert_market(&self, m: GammaMarket) -> Option<MarketInfo> {
         let slug = m.slug.as_deref()?;
-         
+
         if !is_15m_market(slug) {
             return None;
         }
 
         let prefix = slug.split('-').next()?.to_ascii_lowercase();
+        info!("Prefix: {}", prefix);
         let asset_info = ASSETS_BY_PREFIX.get(&prefix)?;
+        info!("Asset info: {:?}", ASSETS_BY_PREFIX);
 
         // Must be a target asset
         if !self.target_assets.contains(&asset_info.asset) {
@@ -83,7 +88,9 @@ impl MarketCache {
         }
 
         let up_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("up"))?;
-        let down_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))?;
+        let down_idx = outcomes
+            .iter()
+            .position(|o| o.eq_ignore_ascii_case("down"))?;
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;
@@ -102,7 +109,6 @@ impl MarketCache {
         })
     }
 }
-
 
 fn is_15m_market(slug: &str) -> bool {
     // Match pattern: {asset}-updown-15m-{number}

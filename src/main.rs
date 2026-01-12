@@ -1,6 +1,6 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::Config;
+use polymarket::config::{ASSETS_BY_PREFIX, Config};
 use std::collections::HashSet;
 use tracing_subscriber::{
     EnvFilter,
@@ -78,7 +78,12 @@ async fn main() -> anyhow::Result<()> {
 
 fn parse_assets(raw: &str) -> HashSet<String> {
     raw.split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let key = s.trim().to_lowercase();
+            if key.is_empty() {
+                return None;
+            }
+            ASSETS_BY_PREFIX.get(&key).map(|info| info.asset.clone())
+        })
         .collect()
 }

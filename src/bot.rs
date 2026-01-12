@@ -22,6 +22,7 @@ use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
 use polymarket_client_sdk::ws::config::Config as WsConfig;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -214,14 +215,11 @@ impl SimpleBot {
             list.sort_by_key(|m| m.start_time);
 
             let existing = current_by_asset.get(&asset);
-            let current = existing
-                .filter(|m| m.end_time > now)
-                .cloned()
-                .or_else(|| {
-                    list.iter()
-                        .find(|m| m.start_time <= now && m.end_time > now)
-                        .cloned()
-                });
+            let current = existing.filter(|m| m.end_time > now).cloned().or_else(|| {
+                list.iter()
+                    .find(|m| m.start_time <= now && m.end_time > now)
+                    .cloned()
+            });
 
             if let Some(current) = current {
                 if existing
@@ -434,7 +432,7 @@ impl SimpleBot {
     }
 
     /// Evaluate a single market, returning an action if needed
-    async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
+    async fn evaluate_market(&mut self, market: &ActiveMarket) -> Option<MarketAction> {
         // Get prices
         let (up_ask, down_ask) = {
             let cache = self.price_cache.read();
@@ -466,7 +464,7 @@ impl SimpleBot {
         let snapshot = self.ledger.get_state(&market.market_id).await;
 
         // Compute ladder
-        let plan = self.ladder_engine.compute_ladder(
+        let mut plan = self.ladder_engine.compute_ladder(
             up_ask,
             down_ask,
             &snapshot.position,
@@ -474,6 +472,18 @@ impl SimpleBot {
             snapshot.pending_down,
             &snapshot.open_orders,
         );
+
+        let stale_distance = self.ladder_engine.config().stale_order_distance;
+        for order_id in self.ladder_state.stale_cancellations(
+            &snapshot.open_orders,
+            up_ask,
+            down_ask,
+            stale_distance,
+        ) {
+            if !plan.cancellations.contains(&order_id) {
+                plan.cancellations.push(order_id);
+            }
+        }
 
         if plan.cancellations.is_empty() && plan.orders.is_empty() {
             return None;
@@ -490,13 +500,18 @@ impl SimpleBot {
     /// Execute cancellations and place new orders
     async fn execute_action(&mut self, market: &ActiveMarket, action: MarketAction) {
         let market_id = &market.market_id;
-        let cancelled_count = 0;
+        let mut cancelled_count = 0;
         if !action.cancellations.is_empty() {
-            debug!(
-                market_id,
-                count = action.cancellations.len(),
-                "Cancellations disabled"
-            );
+            match self.cancel_orders(&action.cancellations).await {
+                Ok(cancelled) => {
+                    cancelled_count = cancelled.len();
+                    info!(market_id, count = cancelled.len(), "Cancelled orders");
+                    self.ledger.mark_orders_cancelled(cancelled).await;
+                }
+                Err(e) => {
+                    error!(market_id, error = %e, "Failed to cancel orders");
+                }
+            }
         }
 
         // Place new orders
@@ -523,6 +538,14 @@ impl SimpleBot {
     }
 
     async fn place_orders(&self, market: &ActiveMarket, orders: &[LadderOrder]) -> usize {
+        if should_reject_pair(orders) {
+            warn!(
+                market_id = %market.market_id,
+                "Order pair rejected: notional below $1"
+            );
+            return 0;
+        }
+
         let build_start = Instant::now();
         let signed = self.build_signed_orders(orders, market).await;
         let build_ms = build_start.elapsed().as_millis();
@@ -689,11 +712,35 @@ impl SimpleBot {
                     not_cancelled = response.not_canceled.len(),
                     "Batch cancel complete"
                 );
+                if !response.not_canceled.is_empty() {
+                    let not_cancelled_ids: Vec<String> =
+                        response.not_canceled.keys().cloned().collect();
+                    self.reconcile_not_cancelled(&not_cancelled_ids).await;
+                }
                 Ok(response.canceled)
             }
             Err(e) => {
                 error!(error = %e, "Batch cancel failed");
                 Err(e.into())
+            }
+        }
+    }
+
+    async fn reconcile_not_cancelled(&self, order_ids: &[String]) {
+        for order_id in order_ids {
+            match self.client.order(order_id).await {
+                Ok(order) => {
+                    self.ledger
+                        .apply_cancel_status(order_id.clone(), order.size_matched, order.status)
+                        .await;
+                }
+                Err(e) => {
+                    warn!(
+                        order_id = %order_id,
+                        error = %e,
+                        "Failed to fetch order after cancel"
+                    );
+                }
             }
         }
     }
@@ -733,6 +780,28 @@ struct MarketAction {
     down_ask: Decimal,
     cancellations: Vec<String>,
     orders: Vec<LadderOrder>,
+}
+
+fn should_reject_pair(orders: &[LadderOrder]) -> bool {
+    let mut up_min: Option<Decimal> = None;
+    let mut down_min: Option<Decimal> = None;
+
+    for order in orders {
+        let notional = order.price * order.size;
+        match order.side {
+            MarketSide::Up => {
+                up_min = Some(up_min.map_or(notional, |v| v.min(notional)));
+            }
+            MarketSide::Down => {
+                down_min = Some(down_min.map_or(notional, |v| v.min(notional)));
+            }
+        }
+    }
+
+    match (up_min, down_min) {
+        (Some(up), Some(down)) => up < dec!(1.00) || down < dec!(1.00),
+        _ => false,
+    }
 }
 
 fn convert_order_params(price: Decimal, size: Decimal) -> Option<(PolyDecimal, PolyDecimal)> {

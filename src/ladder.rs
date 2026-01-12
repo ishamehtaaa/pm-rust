@@ -1,14 +1,15 @@
 // ladder.rs
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashMap;
-use tracing::{debug, info, trace};
+use std::collections::{HashMap, HashSet};
+use tracing::{info, trace};
 
 use crate::{
-    constants::{round_size, short_id},
+    constants::round_size,
     poller::{MarketPosition, MarketSide},
 };
 const MIN_ORDER_SIZE: Decimal = dec!(5);
+const STALE_HYSTERESIS: u32 = 2;
 
 pub struct LadderConfig {
     pub levels: usize,
@@ -23,11 +24,11 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 2,
+            levels: 1,
             spacing: dec!(0.01),
             size_per_level: dec!(5),
             top_offset: dec!(0.02),
-            target_per_side: dec!(15),
+            target_per_side: dec!(25),
             reladder_threshold: dec!(0.02),
             stale_order_distance: dec!(0.05),
         }
@@ -52,6 +53,7 @@ pub struct LadderPlan {
 pub struct LadderState {
     /// market_id -> (last_up_ask, last_down_ask)
     last_ladder_prices: HashMap<String, (Decimal, Decimal)>,
+    stale_counts: HashMap<String, u32>,
 }
 
 impl LadderState {
@@ -79,6 +81,40 @@ impl LadderState {
 
     pub fn clear_market(&mut self, market_id: &str) {
         self.last_ladder_prices.remove(market_id);
+    }
+
+    pub fn stale_cancellations(
+        &mut self,
+        open_orders: &[OpenOrderInfo],
+        up_ask: Decimal,
+        down_ask: Decimal,
+        stale_distance: Decimal,
+    ) -> Vec<String> {
+        let mut to_cancel = Vec::new();
+        let mut still_open: HashSet<String> = HashSet::new();
+
+        for order in open_orders {
+            still_open.insert(order.order_id.clone());
+            let current_ask = match order.side {
+                MarketSide::Up => up_ask,
+                MarketSide::Down => down_ask,
+            };
+
+            let distance = current_ask - order.price;
+            if distance > stale_distance {
+                let count = self.stale_counts.entry(order.order_id.clone()).or_insert(0);
+                *count += 1;
+                if *count >= STALE_HYSTERESIS {
+                    to_cancel.push(order.order_id.clone());
+                }
+            } else {
+                self.stale_counts.remove(&order.order_id);
+            }
+        }
+
+        self.stale_counts
+            .retain(|order_id, _| still_open.contains(order_id));
+        to_cancel
     }
 }
 
@@ -150,13 +186,6 @@ impl LadderEngine {
             }
         }
 
-        // Cancel stale orders (too far from market)
-        for order_id in self.find_stale_orders(up_ask, down_ask, open_orders) {
-            if !plan.cancellations.contains(&order_id) {
-                plan.cancellations.push(order_id);
-            }
-        }
-
         // Calculate pending after cancellations
         let cancelled_up: Decimal = open_orders
             .iter()
@@ -210,38 +239,6 @@ impl LadderEngine {
         }
 
         plan
-    }
-
-    fn find_stale_orders(
-        &self,
-        up_ask: Decimal,
-        down_ask: Decimal,
-        open_orders: &[OpenOrderInfo],
-    ) -> Vec<String> {
-        let mut to_cancel = Vec::new();
-
-        for order in open_orders {
-            let current_ask = match order.side {
-                MarketSide::Up => up_ask,
-                MarketSide::Down => down_ask,
-            };
-
-            /* If a pending order is too far below the current ask, it's stale. */
-            let distance = current_ask - order.price;
-            if distance > self.config.stale_order_distance {
-                let short_id = short_id(&order.order_id, 8);
-                info!(
-                    order_id = short_id,
-                    price = %order.price,
-                    current_ask = %current_ask,
-                    distance = %distance,
-                    "Order too far from market, marking for cancellation"
-                );
-                to_cancel.push(order.order_id.clone());
-            }
-        }
-
-        to_cancel
     }
 
     fn generate_side_ladder(

@@ -4,6 +4,12 @@ use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+pub const SHARES_TARGET_PER_SIDE: Decimal = dec!(25);
+pub const ORDER_SIZE: Decimal = dec!(5);
+pub const TARGET_TOTAL_COST: Decimal = dec!(0.98);
+pub const MAKER_PRICE_OFFSET: Decimal = dec!(0.01);
+pub const MAX_PRICE_AGE_MS: i64 = 2_500;
+pub const COOLDOWN_SECS: u64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
@@ -83,12 +89,12 @@ impl Config {
             Err(_) => TARGET_ASSETS.clone(),
         };
 
-        let shares_target_per_side = parse_decimal_env("SHARES_TARGET_PER_SIDE", dec!(25))?;
-        let order_size = parse_decimal_env("ORDER_SIZE", dec!(5))?;
-        let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
-        let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
-        let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
-        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 2)?;
+        let shares_target_per_side = SHARES_TARGET_PER_SIDE;
+        let order_size = ORDER_SIZE;
+        let target_total_cost = TARGET_TOTAL_COST;
+        let maker_price_offset = MAKER_PRICE_OFFSET;
+        let max_price_age_ms = MAX_PRICE_AGE_MS;
+        let cooldown_secs = COOLDOWN_SECS;
 
         if shares_target_per_side <= Decimal::ZERO {
             return Err(anyhow::anyhow!(
@@ -97,7 +103,10 @@ impl Config {
             ));
         }
         if order_size <= Decimal::ZERO {
-            return Err(anyhow::anyhow!("ORDER_SIZE must be > 0, got {}", order_size));
+            return Err(anyhow::anyhow!(
+                "ORDER_SIZE must be > 0, got {}",
+                order_size
+            ));
         }
         if target_total_cost <= Decimal::ZERO || target_total_cost >= dec!(1.00) {
             return Err(anyhow::anyhow!(
@@ -130,31 +139,5 @@ impl Config {
             max_price_age_ms,
             cooldown_secs,
         })
-    }
-}
-
-fn parse_decimal_env(key: &str, default: Decimal) -> anyhow::Result<Decimal> {
-    match std::env::var(key) {
-        Ok(v) => Decimal::from_str_exact(&v)
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_i64_env(key: &str, default: i64) -> anyhow::Result<i64> {
-    match std::env::var(key) {
-        Ok(v) => v
-            .parse::<i64>()
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_u64_env(key: &str, default: u64) -> anyhow::Result<u64> {
-    match std::env::var(key) {
-        Ok(v) => v
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
     }
 }

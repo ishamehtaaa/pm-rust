@@ -63,6 +63,12 @@ pub enum LedgerCommand {
         filled_size: Option<Decimal>,
         still_open: Option<bool>,
     },
+    /// Reconcile order status after a failed cancel attempt
+    CancelStatusCheck {
+        order_id: String,
+        filled_size: Decimal,
+        status: OrderStatusType,
+    },
 }
 
 /// Snapshot of ledger state for a market
@@ -103,7 +109,7 @@ struct TrackedOrder {
     original_size: Decimal,
     filled_size: Decimal,
     is_open: bool,
-    assumed_complete: bool,
+    needs_lookup: bool,
     placed_at: Instant,
     first_update_logged: bool,
 }
@@ -170,7 +176,7 @@ impl LedgerActor {
                         filled_size: Decimal::ZERO,
                         price,
                         is_open: true,
-                        assumed_complete: false,
+                        needs_lookup: false,
                         placed_at,
                         first_update_logged: false,
                     },
@@ -225,7 +231,7 @@ impl LedgerActor {
                 let candidates = self
                     .tracked_orders
                     .values()
-                    .filter(|o| o.assumed_complete)
+                    .filter(|o| o.needs_lookup)
                     .map(|o| o.order_id.clone())
                     .collect();
                 let _ = reply.send(candidates);
@@ -258,7 +264,34 @@ impl LedgerActor {
                     if let Some(is_open) = still_open {
                         tracked.is_open = is_open;
                     }
-                    tracked.assumed_complete = false;
+                    tracked.needs_lookup = false;
+                }
+            }
+            LedgerCommand::CancelStatusCheck {
+                order_id,
+                filled_size,
+                status,
+            } => {
+                if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
+                    let fill_delta = filled_size - tracked.filled_size;
+                    if fill_delta != Decimal::ZERO {
+                        warn!(
+                            order_id = %short_id(&order_id, 8),
+                            fill_delta = %fill_delta,
+                            "Reconciling fill via cancel lookup"
+                        );
+
+                        let pos = self.positions.entry(tracked.market_id.clone()).or_default();
+                        match tracked.side {
+                            MarketSide::Up => pos.up_shares += fill_delta,
+                            MarketSide::Down => pos.down_shares += fill_delta,
+                        }
+                        tracked.filled_size = filled_size;
+                    }
+
+                    let is_open = matches!(status, OrderStatusType::Live);
+                    tracked.is_open = is_open;
+                    tracked.needs_lookup = false;
                 }
             }
         }
@@ -365,27 +398,10 @@ impl LedgerActor {
                     }
                 }
             } else {
-                // Order not in remote - optimistically assume complete, then verify by ID
+                // Order not in remote - verify by ID
                 if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
-                    if tracked.is_open && !tracked.assumed_complete {
-                        let remaining = tracked.original_size - tracked.filled_size;
-                        if remaining > Decimal::ZERO {
-                            warn!(
-                                order_id = %short_id(&order_id, 8),
-                                remaining = %remaining,
-                                "Order not in remote, assuming filled"
-                            );
-
-                            let pos = self.positions.entry(tracked.market_id.clone()).or_default();
-                            match tracked.side {
-                                MarketSide::Up => pos.up_shares += remaining,
-                                MarketSide::Down => pos.down_shares += remaining,
-                            }
-                            tracked.filled_size = tracked.original_size;
-                        }
-                        tracked.is_open = false;
-                        tracked.assumed_complete = true;
-                    } else if tracked.is_open {
+                    if tracked.is_open {
+                        tracked.needs_lookup = true;
                         debug!(
                             order_id = %short_id(&order_id, 8),
                             "Order not in remote"
@@ -526,6 +542,23 @@ impl LedgerHandle {
                 order_id,
                 filled_size,
                 still_open,
+            })
+            .await;
+    }
+
+    /// Apply order status fetched after a cancel attempt
+    pub async fn apply_cancel_status(
+        &self,
+        order_id: String,
+        filled_size: Decimal,
+        status: OrderStatusType,
+    ) {
+        let _ = self
+            .tx
+            .send(LedgerCommand::CancelStatusCheck {
+                order_id,
+                filled_size,
+                status,
             })
             .await;
     }
