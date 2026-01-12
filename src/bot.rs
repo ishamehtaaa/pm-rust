@@ -43,6 +43,7 @@ pub struct ActiveMarket {
     pub asset: String,
     pub up_token_id: String,
     pub down_token_id: String,
+    pub start_time: chrono::DateTime<Utc>,
     pub end_time: chrono::DateTime<Utc>,
 }
 
@@ -53,6 +54,7 @@ impl ActiveMarket {
             asset: info.asset.clone(),
             up_token_id: info.up_token_id.clone(),
             down_token_id: info.down_token_id.clone(),
+            start_time: info.start_time,
             end_time: info.end_time,
         }
     }
@@ -71,6 +73,8 @@ pub struct SimpleBot {
 
     /// Active markets keyed by market_id
     markets: HashMap<String, ActiveMarket>,
+    /// Next markets keyed by market_id
+    next_markets: HashMap<String, ActiveMarket>,
 
     /// Timing state
     last_market_refresh: Instant,
@@ -139,6 +143,7 @@ impl SimpleBot {
             signer,
             market_cache: MarketCache::new(target_assets),
             markets: HashMap::new(),
+            next_markets: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
             ledger,
@@ -156,6 +161,16 @@ impl SimpleBot {
         info!("Entering main loop...");
 
         loop {
+            let newly_active = self.roll_over_markets();
+            if !newly_active.is_empty() {
+                let current = self.markets.values().cloned().collect::<Vec<_>>();
+                let queued = self.next_markets.values().cloned().collect::<Vec<_>>();
+                self.prefetch_token_metadata(&[current.clone(), queued].concat())
+                    .await;
+                self.init_positions(&newly_active).await;
+                self.start_feeds(&current);
+            }
+
             if self.should_refresh_markets() {
                 self.discover_markets().await;
                 self.last_market_refresh = Instant::now();
@@ -176,14 +191,69 @@ impl SimpleBot {
             None => return,
         };
 
-        // Update internal state
-        self.markets = markets
-            .iter()
-            .map(|m| (m.market_id.clone(), m.clone()))
+        let now = Utc::now();
+        let mut by_asset: HashMap<String, Vec<ActiveMarket>> = HashMap::new();
+        for market in markets {
+            by_asset
+                .entry(market.asset.clone())
+                .or_default()
+                .push(market);
+        }
+
+        let current_by_asset: HashMap<String, ActiveMarket> = self
+            .markets
+            .values()
+            .map(|m| (m.asset.clone(), m.clone()))
             .collect();
 
+        let mut new_current = HashMap::new();
+        let mut new_next = HashMap::new();
+        let mut newly_active = Vec::new();
+
+        for (asset, mut list) in by_asset {
+            list.sort_by_key(|m| m.start_time);
+
+            let existing = current_by_asset.get(&asset);
+            let current = existing
+                .filter(|m| m.end_time > now)
+                .cloned()
+                .or_else(|| {
+                    list.iter()
+                        .find(|m| m.start_time <= now && m.end_time > now)
+                        .cloned()
+                });
+
+            if let Some(current) = current {
+                if existing
+                    .map(|e| e.market_id != current.market_id)
+                    .unwrap_or(true)
+                {
+                    newly_active.push(current.clone());
+                }
+                new_current.insert(current.market_id.clone(), current);
+            }
+
+            if let Some(next) = list
+                .iter()
+                .filter(|m| m.start_time > now)
+                .min_by_key(|m| m.start_time)
+                .cloned()
+            {
+                new_next.insert(next.market_id.clone(), next);
+            }
+        }
+
+        for existing in current_by_asset.values() {
+            if existing.end_time > now && !new_current.contains_key(&existing.market_id) {
+                new_current.insert(existing.market_id.clone(), existing.clone());
+            }
+        }
+
+        self.markets = new_current;
+        self.next_markets = new_next;
+
         // Log what we found
-        for market in &markets {
+        for market in self.markets.values() {
             info!(
                 market_id = %market.market_id,
                 asset = %market.asset,
@@ -191,11 +261,25 @@ impl SimpleBot {
                 "Market registered"
             );
         }
+        for market in self.next_markets.values() {
+            info!(
+                market_id = %market.market_id,
+                asset = %market.asset,
+                start_time = %market.start_time,
+                end_time = %market.end_time,
+                "Market queued"
+            );
+        }
 
         // Warm token metadata caches, then initialize positions and start feeds
-        self.prefetch_token_metadata(&markets).await;
-        self.init_positions(&markets).await;
-        self.start_feeds(&markets);
+        if !newly_active.is_empty() {
+            let current = self.markets.values().cloned().collect::<Vec<_>>();
+            let queued = self.next_markets.values().cloned().collect::<Vec<_>>();
+            self.prefetch_token_metadata(&[current.clone(), queued].concat())
+                .await;
+            self.init_positions(&newly_active).await;
+            self.start_feeds(&current);
+        }
     }
 
     async fn fetch_active_markets(&self) -> Option<Vec<ActiveMarket>> {
@@ -208,18 +292,13 @@ impl SimpleBot {
         };
 
         let now = Utc::now();
+        let markets = all_markets
+            .into_iter()
+            .filter(|info| info.end_time > now)
+            .map(|info| ActiveMarket::from_info(&info))
+            .collect();
 
-        // Filter active, dedupe by asset (keep first per asset)
-        let mut by_asset: HashMap<String, ActiveMarket> = HashMap::new();
-        for info in all_markets {
-            if info.end_time > now {
-                by_asset
-                    .entry(info.asset.clone())
-                    .or_insert_with(|| ActiveMarket::from_info(&info));
-            }
-        }
-
-        Some(by_asset.into_values().collect())
+        Some(markets)
     }
 
     async fn init_positions(&self, markets: &[ActiveMarket]) {
@@ -307,6 +386,40 @@ impl SimpleBot {
             market_ids,
         ));
         info!("Order feed started");
+    }
+
+    fn roll_over_markets(&mut self) -> Vec<ActiveMarket> {
+        let now = Utc::now();
+        let mut newly_active = Vec::new();
+        let mut to_remove = Vec::new();
+        let mut promoted = Vec::new();
+
+        for market in self.markets.values() {
+            if market.end_time <= now {
+                if let Some(next) = self
+                    .next_markets
+                    .values()
+                    .filter(|m| m.asset == market.asset && m.start_time <= now)
+                    .min_by_key(|m| m.start_time)
+                    .cloned()
+                {
+                    promoted.push(next);
+                }
+                to_remove.push(market.market_id.clone());
+            }
+        }
+
+        for market_id in to_remove {
+            self.markets.remove(&market_id);
+        }
+
+        for next in promoted {
+            self.next_markets.remove(&next.market_id);
+            self.markets.insert(next.market_id.clone(), next.clone());
+            newly_active.push(next);
+        }
+
+        newly_active
     }
 
     async fn scan(&mut self) {

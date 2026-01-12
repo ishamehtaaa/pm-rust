@@ -1,6 +1,7 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
 use polymarket::config::Config;
+use std::collections::HashSet;
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, time::ChronoLocal},
@@ -15,6 +16,9 @@ struct Args {
 
     #[arg(long, help = "Run in dry-run mode (no real orders)")]
     dry_run: bool,
+
+    #[arg(long, value_name = "ASSETS", help = "Comma-separated asset list (e.g. btc,sol,eth)")]
+    assets: Option<String>,
 }
 
 #[tokio::main]
@@ -35,6 +39,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::from_env()?;
     config.dry_run = args.dry_run;
+    if let Some(assets) = args.assets {
+        let parsed = parse_assets(&assets);
+        if parsed.is_empty() {
+            tracing::warn!("--assets provided but no valid assets parsed");
+        } else {
+            config.target_assets = parsed;
+        }
+    }
 
     /* Initialize the logger with a custom timestamp and quieting noisy logs. */
     tracing_subscriber::fmt()
@@ -62,4 +74,11 @@ async fn main() -> anyhow::Result<()> {
     bot.run().await;
 
     Ok(())
+}
+
+fn parse_assets(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
