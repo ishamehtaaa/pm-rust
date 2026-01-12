@@ -45,6 +45,8 @@ pub enum LedgerCommand {
         market_id: String,
         up_shares: Decimal,
         down_shares: Decimal,
+        up_cost: Decimal,
+        down_cost: Decimal,
     },
     /// Request current state (for reads)
     GetState {
@@ -78,6 +80,8 @@ pub struct LedgerSnapshot {
     pub pending_up: Decimal,
     pub pending_down: Decimal,
     pub open_orders: Vec<OpenOrderInfo>,
+    pub up_cost: Decimal,
+    pub down_cost: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,6 +101,12 @@ pub struct MarketTokens {
 pub struct MarketPosition {
     pub up_shares: Decimal,
     pub down_shares: Decimal,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MarketCost {
+    pub up_cost: Decimal,
+    pub down_cost: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +130,7 @@ struct TrackedOrder {
 /// The WebSocket stream feeds updates directly here.
 struct LedgerActor {
     positions: HashMap<String, MarketPosition>,
+    costs: HashMap<String, MarketCost>,
     tracked_orders: HashMap<String, TrackedOrder>,
     /// Maps token_id -> (market_id, side) for fast lookup from WS messages
     token_to_market: HashMap<String, (String, MarketSide)>,
@@ -129,6 +140,7 @@ impl LedgerActor {
     fn new() -> Self {
         Self {
             positions: HashMap::new(),
+            costs: HashMap::new(),
             tracked_orders: HashMap::new(),
             token_to_market: HashMap::new(),
         }
@@ -207,6 +219,8 @@ impl LedgerActor {
                 market_id,
                 up_shares,
                 down_shares,
+                up_cost,
+                down_cost,
             } => {
                 debug!(
                     market_id = %market_id,
@@ -214,9 +228,12 @@ impl LedgerActor {
                     down_shares = %down_shares,
                     "Setting initial position"
                 );
-                let pos = self.positions.entry(market_id).or_default();
+                let pos = self.positions.entry(market_id.clone()).or_default();
                 pos.up_shares = up_shares;
                 pos.down_shares = down_shares;
+                let cost = self.costs.entry(market_id.clone()).or_default();
+                cost.up_cost = up_cost;
+                cost.down_cost = down_cost;
             }
 
             LedgerCommand::GetState { market_id, reply } => {
@@ -257,6 +274,11 @@ impl LedgerActor {
                                 MarketSide::Up => pos.up_shares += fill_delta,
                                 MarketSide::Down => pos.down_shares += fill_delta,
                             }
+                            let cost = self.costs.entry(tracked.market_id.clone()).or_default();
+                            match tracked.side {
+                                MarketSide::Up => cost.up_cost += fill_delta * tracked.price,
+                                MarketSide::Down => cost.down_cost += fill_delta * tracked.price,
+                            }
                             tracked.filled_size = actual_filled;
                         }
                     }
@@ -285,6 +307,11 @@ impl LedgerActor {
                         match tracked.side {
                             MarketSide::Up => pos.up_shares += fill_delta,
                             MarketSide::Down => pos.down_shares += fill_delta,
+                        }
+                        let cost = self.costs.entry(tracked.market_id.clone()).or_default();
+                        match tracked.side {
+                            MarketSide::Up => cost.up_cost += fill_delta * tracked.price,
+                            MarketSide::Down => cost.down_cost += fill_delta * tracked.price,
                         }
                         tracked.filled_size = filled_size;
                     }
@@ -330,6 +357,11 @@ impl LedgerActor {
                     match tracked.side {
                         MarketSide::Up => pos.up_shares += fill_delta,
                         MarketSide::Down => pos.down_shares += fill_delta,
+                    }
+                    let cost = self.costs.entry(tracked.market_id.clone()).or_default();
+                    match tracked.side {
+                        MarketSide::Up => cost.up_cost += fill_delta * tracked.price,
+                        MarketSide::Down => cost.down_cost += fill_delta * tracked.price,
                     }
                     tracked.filled_size = size_matched;
                 }
@@ -389,6 +421,11 @@ impl LedgerActor {
                             MarketSide::Up => pos.up_shares += fill_delta,
                             MarketSide::Down => pos.down_shares += fill_delta,
                         }
+                        let cost = self.costs.entry(tracked.market_id.clone()).or_default();
+                        match tracked.side {
+                            MarketSide::Up => cost.up_cost += fill_delta * tracked.price,
+                            MarketSide::Down => cost.down_cost += fill_delta * tracked.price,
+                        }
                         tracked.filled_size = remote.size_matched;
                     }
 
@@ -414,6 +451,7 @@ impl LedgerActor {
 
     fn get_snapshot(&self, market_id: &str) -> LedgerSnapshot {
         let position = self.positions.get(market_id).cloned().unwrap_or_default();
+        let cost = self.costs.get(market_id).cloned().unwrap_or_default();
 
         let mut pending_up = Decimal::ZERO;
         let mut pending_down = Decimal::ZERO;
@@ -440,6 +478,8 @@ impl LedgerActor {
             pending_up,
             pending_down,
             open_orders,
+            up_cost: cost.up_cost,
+            down_cost: cost.down_cost,
         }
     }
 }
@@ -489,6 +529,8 @@ impl LedgerHandle {
         market_id: String,
         up_shares: Decimal,
         down_shares: Decimal,
+        up_cost: Decimal,
+        down_cost: Decimal,
     ) {
         let _ = self
             .tx
@@ -496,6 +538,8 @@ impl LedgerHandle {
                 market_id,
                 up_shares,
                 down_shares,
+                up_cost,
+                down_cost,
             })
             .await;
     }

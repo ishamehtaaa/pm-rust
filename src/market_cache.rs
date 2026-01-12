@@ -67,9 +67,7 @@ impl MarketCache {
         }
 
         let prefix = slug.split('-').next()?.to_ascii_lowercase();
-        info!("Prefix: {}", prefix);
         let asset_info = ASSETS_BY_PREFIX.get(&prefix)?;
-        info!("Asset info: {:?}", ASSETS_BY_PREFIX);
 
         // Must be a target asset
         if !self.target_assets.contains(&asset_info.asset) {

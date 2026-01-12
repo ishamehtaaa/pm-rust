@@ -305,8 +305,16 @@ impl SimpleBot {
                 .await
             {
                 Ok((up_bal, down_bal)) => {
+                    let up_cost = up_bal * self.config.target_total_cost;
+                    let down_cost = down_bal * self.config.target_total_cost;
                     self.ledger
-                        .set_initial_position(market.market_id.clone(), up_bal, down_bal)
+                        .set_initial_position(
+                            market.market_id.clone(),
+                            up_bal,
+                            down_bal,
+                            up_cost,
+                            down_cost,
+                        )
                         .await;
 
                     info!(
@@ -482,6 +490,32 @@ impl SimpleBot {
         ) {
             if !plan.cancellations.contains(&order_id) {
                 plan.cancellations.push(order_id);
+            }
+        }
+
+        if !plan.orders.is_empty() {
+            let order_cost: Decimal = plan
+                .orders
+                .iter()
+                .map(|o| o.price * o.size)
+                .sum();
+            let order_shares: Decimal = plan.orders.iter().map(|o| o.size).sum();
+
+            let total_cost = snapshot.up_cost + snapshot.down_cost + order_cost;
+            let total_shares =
+                snapshot.position.up_shares + snapshot.position.down_shares + order_shares;
+
+            if total_shares > Decimal::ZERO {
+                let projected_avg = total_cost / total_shares;
+                if projected_avg > self.config.target_total_cost {
+                    warn!(
+                        market_id = %market.market_id,
+                        projected_avg = %projected_avg,
+                        target = %self.config.target_total_cost,
+                        "Projected avg exceeds target; skipping orders"
+                    );
+                    plan.orders.clear();
+                }
             }
         }
 
