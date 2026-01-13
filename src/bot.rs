@@ -96,6 +96,10 @@ pub struct SimpleBot {
     
     /// Track pending arb orders for timeout/cleanup
     pending_arb_orders: Arc<RwLock<HashMap<String, PendingArbOrder>>>,
+    
+    /// Track rebalance orders per market (market_id -> order_id)
+    /// Only one rebalance order per market at a time
+    rebalance_orders: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Tracks a pending arb order for timeout cleanup
@@ -170,6 +174,7 @@ impl SimpleBot {
             neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
             arb_finder,
             pending_arb_orders: Arc::new(RwLock::new(HashMap::new())),
+            rebalance_orders: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -410,6 +415,10 @@ impl SimpleBot {
         
         // Clean up timed out arb orders (orders that didn't fill within timeout)
         self.cleanup_stale_arb_orders().await;
+        
+        // Clean up completed rebalance orders and check for new imbalances
+        self.cleanup_rebalance_orders().await;
+        self.check_and_rebalance(&markets).await;
 
         // Scan for arb opportunities using cross-product of order book levels
         let predictions = self.arb_finder.scan();
@@ -455,15 +464,19 @@ impl SimpleBot {
                 
                 let combined = up_price + down_price;
                 
-                // CRITICAL: Only execute if combined < 1.0 (actual profit exists!)
-                // Don't place orders that sum to >= $1.00
-                if combined >= dec!(0.99) {
-                    debug!(
+                // Check if at least one side is "cheap" (below 50¢)
+                // If so, buy it! We'll work on the other side later.
+                let up_is_cheap = up_price < dec!(0.50);
+                let down_is_cheap = down_price < dec!(0.50);
+                
+                // Skip if neither side is cheap AND combined is too high
+                // But if one side IS cheap, grab it even if combined > 100¢
+                if !up_is_cheap && !down_is_cheap && combined >= dec!(0.99) {
+                    trace!(
                         market_id = %prediction.market_id,
                         up_price = %up_price,
                         down_price = %down_price,
-                        combined = %combined,
-                        "Skipping - combined price too high, no profit"
+                        "Skipping - neither side cheap, combined too high"
                     );
                     continue;
                 }
@@ -554,7 +567,169 @@ impl SimpleBot {
             let _ = self.cancel_orders(&to_cancel).await;
         }
     }
-
+    
+    /// Check for position imbalance and place rebalance orders
+    /// This allows us to continue arb trading while working to complete pairs
+    async fn check_and_rebalance(&self, markets: &[ActiveMarket]) {
+        for market in markets {
+            // Skip if we already have a rebalance order for this market
+            {
+                let rebalance = self.rebalance_orders.read();
+                if rebalance.contains_key(&market.market_id) {
+                    continue;
+                }
+            }
+            
+            let snapshot = self.ledger.get_state(&market.market_id).await;
+            let up_shares = snapshot.position.up_shares;
+            let down_shares = snapshot.position.down_shares;
+            
+            // Check for significant imbalance (> 5 shares difference)
+            let imbalance_threshold = dec!(5);
+            
+            if up_shares > down_shares + imbalance_threshold {
+                // Need Down shares - place a limit order
+                let needed = up_shares - down_shares;
+                let avg_up_price = if up_shares > Decimal::ZERO {
+                    // Estimate from recent arb prices (assume ~40-50% avg)
+                    dec!(0.45)
+                } else {
+                    dec!(0.50)
+                };
+                // Max we can pay for Down to still profit: $1 - avg_up_price - small buffer
+                let max_down_price = (dec!(1.0) - avg_up_price - dec!(0.02)).max(dec!(0.01));
+                
+                info!(
+                    market_id = %market.market_id,
+                    needed = %needed.round_dp(2),
+                    max_price = %max_down_price,
+                    "📈 Placing rebalance order for Down"
+                );
+                
+                if let Some(order_id) = self.place_rebalance_order(
+                    market,
+                    MarketSide::Down,
+                    needed.min(dec!(20)), // Cap at 20 per rebalance order
+                    max_down_price,
+                ).await {
+                    self.rebalance_orders.write().insert(market.market_id.clone(), order_id);
+                }
+                
+            } else if down_shares > up_shares + imbalance_threshold {
+                // Need Up shares - place a limit order
+                let needed = down_shares - up_shares;
+                let avg_down_price = if down_shares > Decimal::ZERO {
+                    dec!(0.45)
+                } else {
+                    dec!(0.50)
+                };
+                let max_up_price = (dec!(1.0) - avg_down_price - dec!(0.02)).max(dec!(0.01));
+                
+                info!(
+                    market_id = %market.market_id,
+                    needed = %needed.round_dp(2),
+                    max_price = %max_up_price,
+                    "📈 Placing rebalance order for Up"
+                );
+                
+                if let Some(order_id) = self.place_rebalance_order(
+                    market,
+                    MarketSide::Up,
+                    needed.min(dec!(20)),
+                    max_up_price,
+                ).await {
+                    self.rebalance_orders.write().insert(market.market_id.clone(), order_id);
+                }
+            }
+        }
+    }
+    
+    /// Place a single rebalance order
+    async fn place_rebalance_order(
+        &self,
+        market: &ActiveMarket,
+        side: MarketSide,
+        size: Decimal,
+        max_price: Decimal,
+    ) -> Option<String> {
+        let token_id = match side {
+            MarketSide::Up => &market.up_token_id,
+            MarketSide::Down => &market.down_token_id,
+        };
+        
+        let tick_size = self.get_cached_tick_size(token_id).unwrap_or(dec!(0.01));
+        let price = quantize_price(max_price, tick_size);
+        
+        let signer = self.signer.clone().with_chain_id(Some(POLYGON));
+        
+        // Build and sign the order (GTC - let it sit in the book)
+        let signed = build_single_order(&self.client, &signer, token_id, price, size, false).await?;
+        
+        match self.client.post_order(signed).await {
+            Ok(resp) => {
+                let success = resp.error_msg.as_ref().map(|s| s.is_empty()).unwrap_or(true);
+                if success {
+                    info!(
+                        market_id = %market.market_id,
+                        order_id = %resp.order_id,
+                        side = ?side,
+                        price = %price,
+                        size = %size,
+                        "Rebalance order placed"
+                    );
+                    
+                    // Track in ledger
+                    self.ledger.record_order_placed(
+                        resp.order_id.clone(),
+                        market.market_id.clone(),
+                        token_id.clone(),
+                        side,
+                        size,
+                        price,
+                    ).await;
+                    
+                    Some(resp.order_id)
+                } else {
+                    warn!(
+                        market_id = %market.market_id,
+                        error = ?resp.error_msg,
+                        "Rebalance order rejected"
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to place rebalance order");
+                None
+            }
+        }
+    }
+    
+    /// Clean up filled/cancelled rebalance orders
+    async fn cleanup_rebalance_orders(&self) {
+        let mut to_remove = Vec::new();
+        
+        {
+            let rebalance = self.rebalance_orders.read();
+            for (market_id, order_id) in rebalance.iter() {
+                // Check if order is still open by looking at ledger
+                let snapshot = self.ledger.get_state(market_id).await;
+                let still_open = snapshot.open_orders.iter().any(|o| o.order_id == *order_id);
+                
+                if !still_open {
+                    to_remove.push(market_id.clone());
+                }
+            }
+        }
+        
+        if !to_remove.is_empty() {
+            let mut rebalance = self.rebalance_orders.write();
+            for market_id in to_remove {
+                rebalance.remove(&market_id);
+                debug!(market_id = %market_id, "Rebalance order completed/cancelled");
+            }
+        }
+    }
 
     /// Execute arbitrage by submitting both Up and Down orders in parallel
     /// Uses cached tick sizes for speed
