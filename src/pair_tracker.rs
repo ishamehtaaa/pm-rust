@@ -219,3 +219,5 @@ pub struct PairSummary {
     pub total_unpaired_down: Decimal,
     pub total_cost: Decimal,
 }
+
+

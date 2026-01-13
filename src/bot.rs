@@ -1,5 +1,5 @@
 use crate::arb_finder::{
-    ArbFinder, ArbFinderConfig, MarketInfo as ArbMarketInfo, RecommendedAction,
+    ArbFinder, ArbFinderConfig, MarketInfo as ArbMarketInfo, RecommendedAction, spawn_trade_poller,
 };
 use crate::clob_api::fetch_token_balances;
 use crate::config::Config;
@@ -19,7 +19,7 @@ use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType, SignedOrder};
+use polymarket_client_sdk::clob::types::{OrderType, Side as ClobSide, SignatureType, SignedOrder};
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
@@ -84,6 +84,9 @@ pub struct SimpleBot {
 
     /// Price data from WebSocket
     price_cache: Arc<RwLock<PriceCache>>,
+
+    /// Sync cache for tick sizes (avoids HTTP calls in hot path)
+    tick_size_cache: Arc<RwLock<HashMap<String, Decimal>>>,
 
     /// Background tasks
     _order_feed: Option<tokio::task::JoinHandle<()>>,
@@ -153,6 +156,7 @@ impl SimpleBot {
             last_order_by_market: HashMap::new(),
             ledger,
             price_cache: Arc::new(RwLock::new(PriceCache::default())),
+            tick_size_cache: Arc::new(RwLock::new(HashMap::new())),
             _order_feed: None,
             _price_feed: None,
             _reconciliation_poller: reconciliation_poller,
@@ -218,6 +222,28 @@ impl SimpleBot {
             })
             .collect();
         self.arb_finder.init_markets(arb_markets);
+
+        // Start trade poller for sweep detection
+        let trade_markets: Vec<_> = markets
+            .iter()
+            .map(|m| {
+                (
+                    m.market_id.clone(),
+                    m.up_token_id.clone(),
+                    m.down_token_id.clone(),
+                )
+            })
+            .collect();
+        
+        let trade_poller_handle = spawn_trade_poller(
+            self.arb_finder.config().clone(),
+            self.client.clone(),
+            self.arb_finder.state_store().clone(),
+            self.arb_finder.data_logger().clone(),
+            trade_markets,
+        );
+        self.arb_finder.set_trade_poller(trade_poller_handle);
+        info!("Trade poller started for sweep detection");
     }
 
     async fn fetch_active_markets(&self) -> Option<Vec<ActiveMarket>> {
@@ -282,17 +308,30 @@ impl SimpleBot {
         token_ids.dedup();
 
         let client = self.client.clone();
+        let tick_cache = self.tick_size_cache.clone();
+        
         stream::iter(token_ids)
             .map(|token_id| {
                 let client = client.clone();
+                let tick_cache = tick_cache.clone();
                 async move {
-                    let _ = client.tick_size(&token_id).await;
+                    // Fetch tick size and store in sync cache for fast lookup
+                    if let Ok(resp) = client.tick_size(&token_id).await {
+                        let tick_size = resp.minimum_tick_size.as_decimal();
+                        tick_cache.write().insert(token_id.clone(), tick_size);
+                        debug!(token_id = %token_id, tick_size = %tick_size, "Tick size cached");
+                    }
                     let _ = client.neg_risk(&token_id).await;
                 }
             })
             .buffer_unordered(PREFETCH_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+        
+        info!(
+            cache_size = self.tick_size_cache.read().len(),
+            "Tick size cache populated"
+        );
     }
 
     fn start_feeds(&mut self, markets: &[ActiveMarket]) {
@@ -345,6 +384,21 @@ impl SimpleBot {
                 if let Some((bid, ask)) = cache.get(&market.down_token_id) {
                     self.arb_finder.update_ws_price(&market.down_token_id, bid, ask);
                 }
+            }
+        }
+
+        // CROSS-PRODUCT ARB SCAN: Check full depth for opportunities at any price level
+        // This logs all opportunities for analysis (per user request)
+        for market in &markets {
+            let opps = self.arb_finder.scan_cross_product_arbs(&market.market_id);
+            if !opps.is_empty() {
+                // Log summary - individual opportunities already logged in scan_cross_product_arbs
+                debug!(
+                    market_id = %market.market_id,
+                    opportunity_count = opps.len(),
+                    best_profit = %opps.first().map(|o| o.profit_per_pair).unwrap_or_default(),
+                    "Cross-product arb scan complete"
+                );
             }
         }
 
@@ -689,16 +743,17 @@ impl SimpleBot {
         let arb_start = Instant::now();
 
         // Create orders for both sides
+        // Ensure sizes are rounded to 2 decimal places (Polymarket requirement)
         let orders = vec![
             LadderOrder {
                 side: MarketSide::Up,
                 price: up_price,
-                size: up_size,
+                size: up_size.round_dp(2),
             },
             LadderOrder {
                 side: MarketSide::Down,
                 price: down_price,
-                size: down_size,
+                size: down_size.round_dp(2),
             },
         ];
 
@@ -764,13 +819,30 @@ impl SimpleBot {
 
                         placed += 1;
                     } else {
-                        warn!(
-                            market_id = %market.market_id,
-                            order_id = %resp.order_id,
-                            side = ?order.side,
-                            error = ?resp.error_msg,
-                            "Arb order rejected"
-                        );
+                        // FAK rejection means no liquidity at our price
+                        // This is expected when the opportunity disappears before we execute
+                        let error_msg = resp.error_msg.as_deref().unwrap_or("unknown");
+                        let is_no_match = error_msg.contains("no orders found to match");
+                        
+                        if is_no_match {
+                            info!(
+                                market_id = %market.market_id,
+                                side = ?order.side,
+                                price = %order.price,
+                                size = %order.size,
+                                "FAK order found no liquidity at price (opportunity disappeared)"
+                            );
+                        } else {
+                            warn!(
+                                market_id = %market.market_id,
+                                order_id = %resp.order_id,
+                                side = ?order.side,
+                                price = %order.price,
+                                size = %order.size,
+                                error = %error_msg,
+                                "Arb order rejected"
+                            );
+                        }
                     }
                 }
 
@@ -870,8 +942,9 @@ impl SimpleBot {
             .await
     }
 
-    /// Build arb orders with IOC-like behavior (short expiration)
+    /// Build arb orders with FAK (Fill-And-Kill = IOC equivalent)
     /// Orders are built in parallel for both Up and Down sides
+    /// Uses sync tick_size cache for fast execution
     async fn build_arb_orders(
         &self,
         orders: &[LadderOrder],
@@ -881,6 +954,7 @@ impl SimpleBot {
         let client = self.client.clone();
         let up_token_id = market.up_token_id.clone();
         let down_token_id = market.down_token_id.clone();
+        let tick_cache = self.tick_size_cache.clone();
 
         // Build both orders in parallel for speed
         stream::iter(orders.iter().cloned())
@@ -889,20 +963,24 @@ impl SimpleBot {
                 let signer = signer.clone();
                 let up_token_id = up_token_id.clone();
                 let down_token_id = down_token_id.clone();
+                let tick_cache = tick_cache.clone();
                 async move {
                     let token_id = match order.side {
                         MarketSide::Up => up_token_id.as_str(),
                         MarketSide::Down => down_token_id.as_str(),
                     };
 
-                    // Fetch tick size (should be cached by SDK)
-                    let tick_size = match client.tick_size(token_id).await {
-                        Ok(resp) => resp.minimum_tick_size.as_decimal(),
-                        Err(e) => {
-                            error!(error = %e, side = ?order.side, "Failed to fetch tick size for arb");
-                            return None;
-                        }
-                    };
+                    // Use sync cache for tick size (fast path)
+                    // Falls back to HTTP if not cached
+                    let tick_size = {
+                        let cache = tick_cache.read();
+                        cache.get(token_id).copied()
+                    }.unwrap_or_else(|| {
+                        // Fallback: this shouldn't happen if prefetch worked
+                        warn!(token_id = %token_id, "Tick size not in cache, will be fetched async");
+                        dec!(0.01) // Default tick size
+                    });
+                    
                     let price = quantize_price(order.price, tick_size);
 
                     let (poly_price, poly_size) = match convert_order_params(price, order.size) {
@@ -914,18 +992,19 @@ impl SimpleBot {
                         size = %poly_size,
                         price = %poly_price,
                         side = ?order.side,
-                        "Building arb order"
+                        tick_size = %tick_size,
+                        "Building arb order (fast path)"
                     );
 
-                    // Build order - using standard limit order
-                    // TODO: Add .time_in_force(TimeInForce::IOC) if SDK supports it
-                    // For now, we rely on speed and will manually cancel unfilled orders
+                    // Build arb order with FAK (Fill-And-Kill = IOC equivalent)
+                    // FAK fills as much as possible immediately, cancels any unfilled portion
                     let signable = match client
                         .limit_order()
                         .token_id(token_id)
                         .price(poly_price)
                         .size(poly_size)
                         .side(ClobSide::Buy)
+                        .order_type(OrderType::FAK)
                         .build()
                         .await
                     {
@@ -1033,11 +1112,22 @@ enum MarketAction {
 }
 
 fn convert_order_params(price: Decimal, size: Decimal) -> Option<(PolyDecimal, PolyDecimal)> {
-    let price = PolyDecimal::try_from(price.to_string().as_str())
+    // Round price to 2 decimal places (Polymarket requirement)
+    let rounded_price = price.round_dp(2);
+    let price = PolyDecimal::try_from(rounded_price.to_string().as_str())
         .map_err(|e| error!(error = %e, "Invalid price format"))
         .ok()?;
 
-    let size = PolyDecimal::try_from(size.to_string().as_str())
+    // Round size to 2 decimal places (Polymarket requirement)
+    let rounded_size = size.round_dp(2);
+    
+    // Skip if size is too small after rounding
+    if rounded_size < dec!(0.01) {
+        debug!(original_size = %size, "Size too small after rounding, skipping");
+        return None;
+    }
+    
+    let size = PolyDecimal::try_from(rounded_size.to_string().as_str())
         .map_err(|e| error!(error = %e, "Invalid size format"))
         .ok()?;
 

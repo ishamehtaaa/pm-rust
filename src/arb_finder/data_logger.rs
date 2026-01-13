@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::config::ArbFinderConfig;
+use super::market_state::ArbOpportunity;
 use super::predictor::ArbPrediction;
 use super::signals::{Signal, SignalDetails};
 
@@ -79,6 +80,20 @@ pub enum LogEvent {
         down_rest_ask: Option<String>,
         combined_ws: Option<String>,
         combined_rest: Option<String>,
+    },
+
+    /// Arbitrage opportunity detected (with full liquidity data)
+    ArbOpportunityDetected {
+        timestamp_ms: u64,
+        market_id: String,
+        up_price: String,
+        up_size: String,
+        down_price: String,
+        down_size: String,
+        combined: String,
+        profit_per_pair: String,
+        max_executable_size: String,
+        total_profit_potential: String,
     },
 }
 
@@ -206,6 +221,22 @@ impl LogEvent {
             down_rest_ask: down_rest_ask.map(|d| d.to_string()),
             combined_ws,
             combined_rest,
+        }
+    }
+
+    /// Log an arbitrage opportunity with full liquidity data
+    pub fn arb_opportunity(market_id: &str, opp: &ArbOpportunity) -> Self {
+        LogEvent::ArbOpportunityDetected {
+            timestamp_ms: Self::timestamp_ms(),
+            market_id: market_id.to_string(),
+            up_price: opp.up_price.to_string(),
+            up_size: opp.up_size.to_string(),
+            down_price: opp.down_price.to_string(),
+            down_size: opp.down_size.to_string(),
+            combined: opp.combined.to_string(),
+            profit_per_pair: opp.profit_per_pair.to_string(),
+            max_executable_size: opp.max_executable_size.to_string(),
+            total_profit_potential: (opp.profit_per_pair * opp.max_executable_size).to_string(),
         }
     }
 }

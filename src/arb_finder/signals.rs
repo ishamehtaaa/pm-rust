@@ -18,7 +18,7 @@ pub struct Signal {
     pub details: SignalDetails,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignalType {
     /// Large trade detected (potential sweep)
     Sweep,

@@ -1,13 +1,15 @@
 // arb_finder/rest_poller.rs
 //
 // Polls REST API for price snapshots to capture opportunities that WS might miss.
+// Now captures FULL DEPTH for cross-product arb detection.
 
 use rust_decimal::Decimal;
+use std::time::Instant;
 use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
 use super::config::ArbFinderConfig;
-use super::market_state::MarketStateStore;
+use super::market_state::{DepthSnapshot, MarketStateStore, PriceLevel};
 
 /// Token info for REST polling
 #[derive(Clone)]
@@ -57,22 +59,24 @@ impl RestPoller {
 
     async fn poll_all_tokens(&self) {
         for token in &self.tokens {
-            if let Some(price) = self.fetch_price(&token.token_id).await {
-                self.state_store.update_rest_price(&token.token_id, price);
+            if let Some((best_ask, depth)) = self.fetch_book(&token.token_id).await {
+                // Update best ask price (backward compatible)
+                self.state_store.update_rest_price(&token.token_id, best_ask);
+                
+                // Update full depth snapshot
+                self.state_store.update_depth(&token.token_id, depth);
+                
                 trace!(
                     token_id = %token.token_id,
-                    price = %price,
-                    "REST price update"
+                    best_ask = %best_ask,
+                    "REST depth update"
                 );
             }
         }
     }
 
-    async fn fetch_price(&self, token_id: &str) -> Option<Decimal> {
-        let url = format!(
-            "https://clob.polymarket.com/book?token_id={}",
-            token_id
-        );
+    async fn fetch_book(&self, token_id: &str) -> Option<(Decimal, DepthSnapshot)> {
+        let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
 
         match self.client.get(&url).send().await {
             Ok(response) => {
@@ -80,17 +84,42 @@ impl RestPoller {
                     debug!(
                         token_id = %token_id,
                         status = %response.status(),
-                        "REST price fetch failed"
+                        "REST book fetch failed"
                     );
                     return None;
                 }
 
                 match response.json::<BookResponse>().await {
                     Ok(book) => {
-                        // Get best ask from response
-                        book.asks
-                            .first()
-                            .and_then(|level| level.price.parse::<Decimal>().ok())
+                        // Parse ALL ask levels (sorted by price ascending - best ask first)
+                        let mut asks: Vec<PriceLevel> = book.asks.iter()
+                            .filter_map(|l| {
+                                let price = l.price.parse::<Decimal>().ok()?;
+                                let size = l.size.parse::<Decimal>().ok()?;
+                                Some(PriceLevel { price, size })
+                            })
+                            .collect();
+                        asks.sort_by(|a, b| a.price.cmp(&b.price));
+
+                        // Parse ALL bid levels (sorted by price descending - best bid first)
+                        let mut bids: Vec<PriceLevel> = book.bids.iter()
+                            .filter_map(|l| {
+                                let price = l.price.parse::<Decimal>().ok()?;
+                                let size = l.size.parse::<Decimal>().ok()?;
+                                Some(PriceLevel { price, size })
+                            })
+                            .collect();
+                        bids.sort_by(|a, b| b.price.cmp(&a.price)); // Descending for bids
+
+                        let best_ask = asks.first().map(|l| l.price)?;
+                        
+                        let depth = DepthSnapshot {
+                            asks,
+                            bids,
+                            timestamp: Some(Instant::now()),
+                        };
+
+                        Some((best_ask, depth))
                     }
                     Err(e) => {
                         debug!(error = %e, "Failed to parse book response");
@@ -99,7 +128,7 @@ impl RestPoller {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "REST price request failed");
+                warn!(error = %e, "REST book request failed");
                 None
             }
         }
@@ -142,4 +171,3 @@ pub fn spawn_rest_poller(
     let poller = RestPoller::new(config, state_store, tokens);
     poller.spawn()
 }
-

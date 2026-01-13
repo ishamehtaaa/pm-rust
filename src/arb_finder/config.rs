@@ -100,8 +100,8 @@ impl Default for ArbFinderConfig {
             velocity_window: Duration::from_secs(5),
 
             // REST polling
-            rest_poll_interval: Duration::from_millis(230),
-            rest_ws_discrepancy_threshold: dec!(0.01),
+            rest_poll_interval: Duration::from_millis(100),
+            rest_ws_discrepancy_threshold: dec!(0.02),
 
             // Confidence
             pre_position_confidence: dec!(0.5),
@@ -112,12 +112,12 @@ impl Default for ArbFinderConfig {
             discrepancy_weight: dec!(0.1),
 
             // Timeouts
-            prediction_timeout: Duration::from_secs(5),
+            prediction_timeout: Duration::from_secs(1),
             max_data_age: Duration::from_secs(1),
 
             // Position sizing
-            arb_order_size: dec!(5),
-            max_exposure_per_market: dec!(20),
+            arb_order_size: dec!(10),
+            max_exposure_per_market: dec!(30),
 
             // Logging
             enable_data_logging: true,

@@ -6,9 +6,12 @@
 pub mod config;
 pub mod data_logger;
 pub mod market_state;
+pub mod outcome_tracker;
 pub mod predictor;
 pub mod rest_poller;
 pub mod signals;
+pub mod trade_poller;
+pub mod weight_learner;
 
 use rust_decimal::Decimal;
 use std::time::{Duration, Instant};
@@ -17,9 +20,12 @@ use tracing::info;
 pub use config::ArbFinderConfig;
 pub use data_logger::{DataLogger, DataLoggerHandle, LogEvent};
 pub use market_state::{MarketState, MarketStateStore, TradeEvent, TradeSide};
+pub use outcome_tracker::{OutcomeTracker, PredictionOutcome, LearningStats};
 pub use predictor::{ArbPrediction, ArbPredictor, RecommendedAction};
 pub use rest_poller::spawn_rest_poller;
 pub use signals::{Signal, SignalDetector, SignalType};
+pub use trade_poller::spawn_trade_poller;
+pub use weight_learner::{WeightLearner, LearnedWeights};
 
 /// Market info for initializing the arb finder
 #[derive(Clone)]
@@ -37,8 +43,13 @@ pub struct ArbFinder {
     data_logger: DataLoggerHandle,
     markets: Vec<MarketInfo>,
 
+    // Active learning components
+    outcome_tracker: OutcomeTracker,
+    weight_learner: WeightLearner,
+
     // Background tasks
     _rest_poller: Option<tokio::task::JoinHandle<()>>,
+    _trade_poller: Option<tokio::task::JoinHandle<()>>,
     _data_logger_task: Option<tokio::task::JoinHandle<()>>,
     _spread_logger_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -53,13 +64,29 @@ impl ArbFinder {
         let (logger, logger_handle) = DataLogger::new(config.clone());
         let logger_task = logger.spawn();
 
+        // Create outcome tracker for learning
+        let outcome_tracker = OutcomeTracker::new(
+            config.clone(),
+            state_store.clone(),
+            logger_handle.clone(),
+        );
+
+        // Create weight learner with saved weights
+        let weight_learner = WeightLearner::new(
+            rust_decimal_macros::dec!(0.05), // 5% learning rate
+            format!("{}/learned_weights.json", config.data_log_path),
+        );
+
         Self {
             config,
             state_store,
             predictor,
             data_logger: logger_handle,
             markets: Vec::new(),
+            outcome_tracker,
+            weight_learner,
             _rest_poller: None,
+            _trade_poller: None,
             _data_logger_task: Some(logger_task),
             _spread_logger_task: None,
         }
@@ -117,6 +144,19 @@ impl ArbFinder {
         &self.data_logger
     }
 
+    /// Set the trade poller handle (started externally since it needs client access)
+    pub fn set_trade_poller(&mut self, handle: tokio::task::JoinHandle<()>) {
+        if let Some(old) = self._trade_poller.take() {
+            old.abort();
+        }
+        self._trade_poller = Some(handle);
+    }
+
+    /// Get the config
+    pub fn config(&self) -> &ArbFinderConfig {
+        &self.config
+    }
+
     /// Update price from WebSocket
     pub fn update_ws_price(&self, token_id: &str, bid: Decimal, ask: Decimal) {
         self.state_store.update_ws_price(token_id, bid, ask);
@@ -124,13 +164,8 @@ impl ArbFinder {
         // Find market for this token and log
         for market in &self.markets {
             if market.up_token_id == token_id || market.down_token_id == token_id {
-                let event = LogEvent::price_update(
-                    &market.market_id,
-                    token_id,
-                    "ws",
-                    Some(bid),
-                    Some(ask),
-                );
+                let event =
+                    LogEvent::price_update(&market.market_id, token_id, "ws", Some(bid), Some(ask));
                 self.data_logger.log_nonblocking(event);
                 break;
             }
@@ -164,11 +199,23 @@ impl ArbFinder {
     }
 
     /// Scan all markets for predictions
-    pub fn scan(&self) -> Vec<ArbPrediction> {
+    /// Now also tracks outcomes and learns from them
+    pub fn scan(&mut self) -> Vec<ArbPrediction> {
+        // First, check outcomes of previous predictions and learn
+        let outcomes = self.outcome_tracker.check_outcomes();
+        for outcome in &outcomes {
+            // Get the signals that were present in this prediction
+            // For now, we approximate - in production we'd store signals with predictions
+            let signals_present: Vec<SignalType> = vec![]; // TODO: Store signals with predictions
+            self.weight_learner.learn_from_outcome(outcome, &signals_present);
+        }
+
         let mut predictions = Vec::new();
 
         for state in self.state_store.all_states() {
-            if let Some(prediction) = self.predictor.predict(&state) {
+            // Use learned weights in predictor
+            let learned_weights = self.weight_learner.weights();
+            if let Some(prediction) = self.predictor.predict_with_weights(&state, &learned_weights.read()) {
                 // Log signals
                 for signal in &prediction.signals {
                     let event = LogEvent::signal(&state.market_id, signal);
@@ -178,6 +225,9 @@ impl ArbFinder {
                 // Log prediction
                 let event = LogEvent::prediction(&prediction);
                 self.data_logger.log_nonblocking(event);
+
+                // Track this prediction for outcome evaluation
+                self.outcome_tracker.track_prediction(prediction.clone());
 
                 predictions.push(prediction);
             }
@@ -216,6 +266,52 @@ impl ArbFinder {
         }
     }
 
+    /// Scan for ALL arb opportunities across full book depth
+    /// Logs all opportunities with full liquidity data for analysis
+    /// Returns the list of opportunities found
+    pub fn scan_cross_product_arbs(&self, market_id: &str) -> Vec<market_state::ArbOpportunity> {
+        let Some(state) = self.state_store.get_state(market_id) else {
+            return Vec::new();
+        };
+
+        let opportunities = state.find_arb_opportunities(self.config.arb_threshold);
+
+        // Log ALL opportunities for analysis
+        for opp in &opportunities {
+            let event = LogEvent::arb_opportunity(market_id, opp);
+            self.data_logger.log_nonblocking(event);
+            
+            info!(
+                market_id = %market_id,
+                up_price = %opp.up_price,
+                up_size = %opp.up_size,
+                down_price = %opp.down_price,
+                down_size = %opp.down_size,
+                combined = %opp.combined,
+                profit_per_pair = %opp.profit_per_pair,
+                max_executable = %opp.max_executable_size,
+                total_profit = %(opp.profit_per_pair * opp.max_executable_size),
+                "🎯 ARB OPPORTUNITY (cross-product)"
+            );
+        }
+
+        opportunities
+    }
+
+    /// Scan all markets for cross-product arb opportunities
+    pub fn scan_all_cross_product_arbs(&self) -> Vec<(String, Vec<market_state::ArbOpportunity>)> {
+        let mut results = Vec::new();
+        
+        for market in &self.markets {
+            let opps = self.scan_cross_product_arbs(&market.market_id);
+            if !opps.is_empty() {
+                results.push((market.market_id.clone(), opps));
+            }
+        }
+        
+        results
+    }
+
     /// Calculate safe order size for arb based on current position and config limits
     ///
     /// Returns (up_size, down_size) - the safe sizes to order for each side
@@ -231,10 +327,10 @@ impl ArbFinder {
         confidence: Decimal,
     ) -> (Decimal, Decimal) {
         let base_size = self.config.arb_order_size;
-        let max_exposure = self.config.max_exposure_per_market;
+        let max_exposure = self.config.max_exposure_per_market.round_dp(2);
 
         // Calculate current total exposure (max of either side)
-        let current_exposure = current_up_shares.max(current_down_shares);
+        let current_exposure = current_up_shares.max(current_down_shares).round_dp(2);
 
         // Calculate remaining room before hitting max exposure
         let remaining_room = (max_exposure - current_exposure).max(Decimal::ZERO);
@@ -291,6 +387,48 @@ impl ArbFinder {
     pub fn max_exposure_per_market(&self) -> Decimal {
         self.config.max_exposure_per_market
     }
+
+    // ===== Active Learning Methods =====
+
+    /// Get current learning statistics
+    pub fn learning_stats(&self) -> LearningStats {
+        self.outcome_tracker.get_learning_stats()
+    }
+
+    /// Get current prediction accuracy
+    pub fn prediction_accuracy(&self) -> Option<Decimal> {
+        self.outcome_tracker.current_accuracy()
+    }
+
+    /// Get prediction hit rate (% that resulted in actual arbs)
+    pub fn prediction_hit_rate(&self) -> Option<Decimal> {
+        self.outcome_tracker.hit_rate()
+    }
+
+    /// Get current learned weights
+    pub fn learned_weights(&self) -> LearnedWeights {
+        self.weight_learner.weights().read().clone()
+    }
+
+    /// Force save learned weights
+    pub fn save_learned_weights(&self) {
+        self.weight_learner.save_weights();
+    }
+
+    /// Log learning status (for monitoring)
+    pub fn log_learning_status(&self) {
+        self.weight_learner.log_status();
+        
+        let stats = self.learning_stats();
+        info!(
+            total_predictions = stats.total_predictions,
+            successful = stats.successful_predictions,
+            hit_rate = %stats.hit_rate,
+            avg_accuracy = %stats.avg_accuracy,
+            avg_time_to_arb_ms = ?stats.avg_time_to_arb_ms,
+            "Learning stats"
+        );
+    }
 }
 
 /// Periodically logs spread snapshots
@@ -335,4 +473,3 @@ impl SpreadLogger {
         })
     }
 }
-

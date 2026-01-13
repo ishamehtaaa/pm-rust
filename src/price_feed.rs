@@ -5,14 +5,55 @@ use polymarket_client_sdk::clob::ws::Client as WsClient;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, trace, warn};
 
+/// A single price level in the order book
+#[derive(Debug, Clone)]
+pub struct PriceLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+/// Full order book depth for a single token
+#[derive(Debug, Clone, Default)]
+pub struct BookDepth {
+    /// Ask levels sorted by price ascending (best ask first)
+    pub asks: Vec<PriceLevel>,
+    /// Bid levels sorted by price descending (best bid first)
+    pub bids: Vec<PriceLevel>,
+    /// Timestamp of last update
+    pub timestamp: Option<Instant>,
+}
+
+impl BookDepth {
+    pub fn best_ask(&self) -> Option<Decimal> {
+        self.asks.first().map(|l| l.price)
+    }
+
+    pub fn best_bid(&self) -> Option<Decimal> {
+        self.bids.first().map(|l| l.price)
+    }
+
+    /// Total ask liquidity
+    pub fn total_ask_size(&self) -> Decimal {
+        self.asks.iter().map(|l| l.size).sum()
+    }
+
+    /// Total bid liquidity
+    pub fn total_bid_size(&self) -> Decimal {
+        self.bids.iter().map(|l| l.size).sum()
+    }
+}
+
 /// Shared price state updated by WebSocket feed
-/// Stores RAW prices - no smoothing, to capture momentary mispricings
+/// Stores RAW prices and full depth - no smoothing, to capture momentary mispricings
 #[derive(Debug, Default)]
 pub struct PriceCache {
-    /// token_id -> (bid, ask, timestamp_ms)
+    /// token_id -> (bid, ask, timestamp_ms) - backward compatible best prices
     prices: HashMap<String, (Decimal, Decimal, u64)>,
+    /// token_id -> full order book depth
+    depths: HashMap<String, BookDepth>,
 }
 
 impl PriceCache {
@@ -26,6 +67,11 @@ impl PriceCache {
         })
     }
 
+    /// Get full order book depth for a token
+    pub fn get_depth(&self, token_id: &str) -> Option<&BookDepth> {
+        self.depths.get(token_id)
+    }
+
     /// Store raw prices directly - no smoothing to preserve arb opportunities
     fn update(&mut self, token_id: String, bid: Decimal, ask: Decimal, timestamp_ms: u64) {
         trace!(
@@ -35,6 +81,17 @@ impl PriceCache {
             "Price update (raw)"
         );
         self.prices.insert(token_id, (bid, ask, timestamp_ms));
+    }
+
+    /// Store full order book depth
+    fn update_depth(&mut self, token_id: String, depth: BookDepth) {
+        trace!(
+            token_id = %token_id,
+            ask_levels = depth.asks.len(),
+            bid_levels = depth.bids.len(),
+            "Depth update"
+        );
+        self.depths.insert(token_id, depth);
     }
 }
 
@@ -60,22 +117,44 @@ pub fn spawn_price_feed(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(book) => {
-                    let best_bid = book.bids.iter()
-                        .map(|l| l.price)
-                        .max();
+                    // Parse ALL ask levels (sorted by price ascending - best ask first)
+                    let mut asks: Vec<PriceLevel> = book.asks.iter()
+                        .filter_map(|l| {
+                            let price: Decimal = l.price.to_string().parse().ok()?;
+                            let size: Decimal = l.size.to_string().parse().ok()?;
+                            Some(PriceLevel { price, size })
+                        })
+                        .collect();
+                    asks.sort_by(|a, b| a.price.cmp(&b.price));
 
-                    // Best ask = lowest ask (cheapest offer to sell)
-                    let best_ask = book.asks.iter()
-                        .map(|l| l.price)
-                        .min();
+                    // Parse ALL bid levels (sorted by price descending - best bid first)
+                    let mut bids: Vec<PriceLevel> = book.bids.iter()
+                        .filter_map(|l| {
+                            let price: Decimal = l.price.to_string().parse().ok()?;
+                            let size: Decimal = l.size.to_string().parse().ok()?;
+                            Some(PriceLevel { price, size })
+                        })
+                        .collect();
+                    bids.sort_by(|a, b| b.price.cmp(&a.price)); // Descending for bids
 
+                    let best_bid = bids.first().map(|l| l.price);
+                    let best_ask = asks.first().map(|l| l.price);
+
+                    let ts: u64 = book.timestamp.try_into().unwrap_or(0);
+
+                    // Create depth snapshot
+                    let depth = BookDepth {
+                        asks,
+                        bids,
+                        timestamp: Some(Instant::now()),
+                    };
+
+                    // Update cache with both best prices and full depth
+                    let mut cache_guard = cache.write();
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                        let bid_dec: Decimal = bid.to_string().parse().unwrap_or_default();
-                        let ask_dec: Decimal = ask.to_string().parse().unwrap_or_default();
-                        let ts: u64 = book.timestamp.try_into().unwrap_or(0);
-
-                        cache.write().update(book.asset_id, bid_dec, ask_dec, ts);
+                        cache_guard.update(book.asset_id.clone(), bid, ask, ts);
                     }
+                    cache_guard.update_depth(book.asset_id, depth);
                 }
                 Err(e) => {
                     warn!(error = %e, "Price feed error");

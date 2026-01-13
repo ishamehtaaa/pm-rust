@@ -220,6 +220,25 @@ impl TokenState {
     }
 }
 
+/// A detected arbitrage opportunity at specific price levels
+#[derive(Debug, Clone)]
+pub struct ArbOpportunity {
+    /// Price to buy Up token at
+    pub up_price: Decimal,
+    /// Size available at Up price
+    pub up_size: Decimal,
+    /// Price to buy Down token at
+    pub down_price: Decimal,
+    /// Size available at Down price
+    pub down_size: Decimal,
+    /// Combined price (up + down)
+    pub combined: Decimal,
+    /// Profit per pair ($1 - combined)
+    pub profit_per_pair: Decimal,
+    /// Max executable size (min of up_size, down_size)
+    pub max_executable_size: Decimal,
+}
+
 /// Complete market state (Up + Down tokens)
 #[derive(Debug, Default, Clone)]
 pub struct MarketState {
@@ -280,6 +299,65 @@ impl MarketState {
             None
         }
     }
+
+    /// Find ALL arbitrage opportunities across the full order book depth.
+    /// Iterates through up_asks x down_asks to find all profitable combinations.
+    /// Returns opportunities sorted by profit_per_pair descending (best first).
+    pub fn find_arb_opportunities(&self, threshold: Decimal) -> Vec<ArbOpportunity> {
+        let mut opps = Vec::new();
+
+        // Need depth data for both sides
+        if self.up.depth.asks.is_empty() || self.down.depth.asks.is_empty() {
+            return opps;
+        }
+
+        // Cross-product: check every up ask against every down ask
+        for up_level in &self.up.depth.asks {
+            for down_level in &self.down.depth.asks {
+                let combined = up_level.price + down_level.price;
+                
+                if combined < threshold {
+                    let profit_per_pair = Decimal::ONE - combined;
+                    // Round max executable size to 2 decimal places (Polymarket requirement)
+                    let max_executable = up_level.size.min(down_level.size).round_dp(2);
+                    
+                    // Skip if executable size is too small after rounding
+                    if max_executable < rust_decimal_macros::dec!(0.01) {
+                        continue;
+                    }
+                    
+                    opps.push(ArbOpportunity {
+                        up_price: up_level.price,
+                        up_size: up_level.size.round_dp(2),
+                        down_price: down_level.price,
+                        down_size: down_level.size.round_dp(2),
+                        combined,
+                        profit_per_pair,
+                        max_executable_size: max_executable,
+                    });
+                }
+            }
+        }
+
+        // Sort by profit descending (best opportunities first)
+        opps.sort_by(|a, b| b.profit_per_pair.cmp(&a.profit_per_pair));
+        
+        opps
+    }
+
+    /// Get the best arbitrage opportunity (highest profit per pair)
+    pub fn best_arb_opportunity(&self, threshold: Decimal) -> Option<ArbOpportunity> {
+        self.find_arb_opportunities(threshold).into_iter().next()
+    }
+
+    /// Total potential profit from all arb opportunities
+    /// (assuming infinite capital and no slippage)
+    pub fn total_arb_potential(&self, threshold: Decimal) -> Decimal {
+        self.find_arb_opportunities(threshold)
+            .iter()
+            .map(|opp| opp.profit_per_pair * opp.max_executable_size)
+            .sum()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -330,6 +408,18 @@ impl MarketStateStore {
                 state.up.update_rest(ask);
             } else if state.down_token_id == token_id {
                 state.down.update_rest(ask);
+            }
+        }
+    }
+
+    /// Update full depth snapshot for a token
+    pub fn update_depth(&self, token_id: &str, depth: DepthSnapshot) {
+        let mut store = self.inner.write();
+        for state in store.values_mut() {
+            if state.up_token_id == token_id {
+                state.up.depth = depth.clone();
+            } else if state.down_token_id == token_id {
+                state.down.depth = depth.clone();
             }
         }
     }
