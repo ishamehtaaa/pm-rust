@@ -1,9 +1,9 @@
 use crate::arb_finder::{
-    ArbFinder, ArbFinderConfig, MarketInfo as ArbMarketInfo, RecommendedAction, spawn_trade_poller,
+    ArbFinder, ArbFinderConfig, MarketInfo as ArbMarketInfo, spawn_trade_poller,
 };
 use crate::clob_api::fetch_token_balances;
 use crate::config::Config;
-use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
+use crate::ladder::LadderOrder;
 use crate::market_cache::MarketCache;
 use crate::models::MarketInfo;
 use crate::poller::{
@@ -29,15 +29,17 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(10);  // Fast loop for arb detection
+const LOOP_DELAY: Duration = Duration::from_millis(10);
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const PREFETCH_CONCURRENCY: usize = 6;
-const SIGN_CONCURRENCY: usize = 4;
+const POSITION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const LEARNING_INTERVAL: Duration = Duration::from_secs(5);
+const EXECUTION_COOLDOWN: Duration = Duration::from_millis(500); // Cooldown after any execution attempt
 
 /// Consolidated view of a market we're trading
 #[derive(Clone)]
@@ -59,10 +61,6 @@ impl ActiveMarket {
             end_time: info.end_time,
         }
     }
-
-    fn token_ids(&self) -> [&str; 2] {
-        [&self.up_token_id, &self.down_token_id]
-    }
 }
 
 pub struct SimpleBot {
@@ -77,7 +75,11 @@ pub struct SimpleBot {
 
     /// Timing state
     last_market_refresh: Instant,
-    last_order_by_market: HashMap<String, Instant>,
+    last_position_refresh: Instant,
+    last_learning_run: Instant,
+    last_heartbeat: Instant,
+    last_execution_attempt: HashMap<String, Instant>, // Per-market cooldown
+    scan_count: u64,
 
     /// Single source of truth for inventory
     ledger: LedgerHandle,
@@ -92,10 +94,6 @@ pub struct SimpleBot {
     _order_feed: Option<tokio::task::JoinHandle<()>>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
     _reconciliation_poller: tokio::task::JoinHandle<()>,
-
-    /// Ladder strategy
-    ladder_engine: LadderEngine,
-    ladder_state: LadderState,
 
     /// Predictive arb finder
     arb_finder: ArbFinder,
@@ -153,32 +151,99 @@ impl SimpleBot {
             market_cache: MarketCache::new(target_assets),
             markets: HashMap::new(),
             last_market_refresh: Instant::now(),
-            last_order_by_market: HashMap::new(),
+            last_position_refresh: Instant::now(),
+            last_learning_run: Instant::now(),
+            last_heartbeat: Instant::now(),
+            last_execution_attempt: HashMap::new(),
+            scan_count: 0,
             ledger,
             price_cache: Arc::new(RwLock::new(PriceCache::default())),
             tick_size_cache: Arc::new(RwLock::new(HashMap::new())),
             _order_feed: None,
             _price_feed: None,
             _reconciliation_poller: reconciliation_poller,
-            ladder_engine: LadderEngine::new(LadderConfig::default()),
-            ladder_state: LadderState::default(),
             arb_finder,
         })
     }
 
     pub async fn run(&mut self) {
         self.discover_markets().await;
-        info!("Entering main loop...");
+        info!("Entering main loop - FAST PATH ONLY");
 
         loop {
-            if self.should_refresh_markets() {
-                self.discover_markets().await;
-                self.last_market_refresh = Instant::now();
-            }
-
+            // FAST PATH: Just scan for arbs
             self.scan().await;
+
+            // SLOW PATH: Run maintenance tasks periodically (non-blocking)
+            self.run_maintenance().await;
+
             tokio::time::sleep(LOOP_DELAY).await;
         }
+    }
+
+    /// Run maintenance tasks (positions, markets, learning) - NOT in hot path
+    async fn run_maintenance(&mut self) {
+        // Market refresh (every 30s typically)
+        if self.should_refresh_markets() {
+            self.discover_markets().await;
+            self.last_market_refresh = Instant::now();
+        }
+
+        // Position refresh (every 10s)
+        if self.last_position_refresh.elapsed() > POSITION_REFRESH_INTERVAL {
+            self.refresh_positions_fast().await;
+            self.last_position_refresh = Instant::now();
+        }
+
+        // Learning system (every 5s) - update arb finder state
+        if self.last_learning_run.elapsed() > LEARNING_INTERVAL {
+            self.run_learning_cycle();
+            self.last_learning_run = Instant::now();
+        }
+    }
+
+    /// Fast position refresh - just sync, minimal logging
+    async fn refresh_positions_fast(&self) {
+        for market in self.markets.values() {
+            if let Ok((up_bal, down_bal)) = 
+                fetch_token_balances(&self.client, &market.up_token_id, &market.down_token_id).await 
+            {
+                let snapshot = self.ledger.get_state(&market.market_id).await;
+                let up_diff = (up_bal - snapshot.position.up_shares).abs();
+                let down_diff = (down_bal - snapshot.position.down_shares).abs();
+                
+                // Only update if significant discrepancy
+                if up_diff > dec!(0.1) || down_diff > dec!(0.1) {
+                    warn!(
+                        market_id = %market.market_id,
+                        api_up = %up_bal,
+                        api_down = %down_bal,
+                        "Position sync"
+                    );
+                    self.ledger
+                        .set_initial_position(market.market_id.clone(), up_bal, down_bal)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Run learning cycle - update arb finder with latest prices, run ML
+    fn run_learning_cycle(&mut self) {
+        // Update arb finder with cached prices
+        let cache = self.price_cache.read();
+        for market in self.markets.values() {
+            if let Some((bid, ask)) = cache.get(&market.up_token_id) {
+                self.arb_finder.update_ws_price(&market.up_token_id, bid, ask);
+            }
+            if let Some((bid, ask)) = cache.get(&market.down_token_id) {
+                self.arb_finder.update_ws_price(&market.down_token_id, bid, ask);
+            }
+        }
+        drop(cache);
+
+        // Run learning system (non-blocking)
+        let _ = self.arb_finder.scan(); // Updates outcome tracking & weights
     }
 
     #[instrument(skip(self), fields(markets = self.markets.len()))]
@@ -370,11 +435,12 @@ impl SimpleBot {
         info!("Order feed started");
     }
 
+    /// Scan for arb opportunities - both direct and PREDICTED
     async fn scan(&mut self) {
-        // Snapshot markets to avoid borrow issues
+        self.scan_count += 1;
         let markets: Vec<ActiveMarket> = self.markets.values().cloned().collect();
 
-        // Update arb finder with latest prices from cache
+        // Update arb finder with latest prices
         {
             let cache = self.price_cache.read();
             for market in &markets {
@@ -387,350 +453,98 @@ impl SimpleBot {
             }
         }
 
-        // CROSS-PRODUCT ARB SCAN: Check full depth for opportunities at any price level
-        // This logs all opportunities for analysis (per user request)
-        for market in &markets {
-            let opps = self.arb_finder.scan_cross_product_arbs(&market.market_id);
-            if !opps.is_empty() {
-                // Log summary - individual opportunities already logged in scan_cross_product_arbs
-                debug!(
-                    market_id = %market.market_id,
-                    opportunity_count = opps.len(),
-                    best_profit = %opps.first().map(|o| o.profit_per_pair).unwrap_or_default(),
-                    "Cross-product arb scan complete"
-                );
-            }
-        }
-
-        // Check arb finder for predictions first
-        let predictions = self.arb_finder.scan();
-        for prediction in predictions {
-            if prediction.recommended_action == RecommendedAction::ExecuteNow
-                || prediction.recommended_action == RecommendedAction::PrePosition
+        // Heartbeat every 10 seconds
+        if self.last_heartbeat.elapsed() > Duration::from_secs(10) {
+            let mut best_spread: Option<(String, Decimal)> = None;
             {
-                // Get current position to calculate safe size
-                if let Some(market) = self.markets.get(&prediction.market_id) {
-                    let snapshot = self.ledger.get_state(&prediction.market_id).await;
-                    let current_up = snapshot.position.up_shares;
-                    let current_down = snapshot.position.down_shares;
-
-                    // Calculate safe order size based on position and confidence
-                    let (up_size, down_size) = self.arb_finder.calculate_safe_arb_size(
-                        current_up,
-                        current_down,
-                        prediction.confidence,
-                    );
-
-                    // Only execute if we have room for orders
-                    if up_size > Decimal::ZERO && down_size > Decimal::ZERO {
-                        if let (Some(up_price), Some(down_price)) =
-                            (prediction.up_target_price, prediction.down_target_price)
-                        {
-                            info!(
-                                market_id = %prediction.market_id,
-                                confidence = %prediction.confidence,
-                                action = ?prediction.recommended_action,
-                                up_size = %up_size,
-                                down_size = %down_size,
-                                current_up = %current_up,
-                                current_down = %current_down,
-                                "Executing arb with safe sizing"
-                            );
-
-                            let placed = self
-                                .execute_arb_orders(market, up_price, down_price, up_size, down_size)
-                                .await;
-
-                            info!(
-                                market_id = %prediction.market_id,
-                                placed,
-                                "Arb execution complete"
-                            );
+                let cache = self.price_cache.read();
+                for m in &markets {
+                    if let (Some((_, up)), Some((_, down))) = (cache.get(&m.up_token_id), cache.get(&m.down_token_id)) {
+                        let combined = up + down;
+                        if best_spread.is_none() || combined < best_spread.as_ref().unwrap().1 {
+                            best_spread = Some((m.asset.clone(), combined));
                         }
-                    } else {
-                        debug!(
-                            market_id = %prediction.market_id,
-                            current_up = %current_up,
-                            current_down = %current_down,
-                            max_exposure = %self.arb_finder.max_exposure_per_market(),
-                            "Skipping arb - max exposure reached"
-                        );
                     }
                 }
             }
-        }
-
-        // Normal evaluation for each market
-        for market in markets {
-            if let Some(action) = self.evaluate_market(&market).await {
-                self.execute_action(&market, action).await;
-            }
-        }
-    }
-
-    /// Evaluate a single market, returning an action if needed
-    async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
-        // Get prices
-        let (up_ask, down_ask) = {
-            let cache = self.price_cache.read();
-            let up = cache.get(&market.up_token_id)?.1;
-            let down = cache.get(&market.down_token_id)?.1;
-            (up, down)
-        };
-
-        let combined = up_ask + down_ask;
-        let spread_from_arb = combined - self.config.arb_threshold;
-
-        // Log when spread is getting close to profitable (within 5%)
-        if spread_from_arb < dec!(0.05) {
-            debug!(
-                market_id = %market.market_id,
-                up_ask = %up_ask,
-                down_ask = %down_ask,
-                combined = %combined,
-                arb_threshold = %self.config.arb_threshold,
-                spread_from_arb = %spread_from_arb,
-                "Spread check - getting close!"
-            );
-        } else {
-            trace!(
-                market_id = %market.market_id,
-                up_ask = %up_ask,
-                down_ask = %down_ask,
-                combined = %combined,
-                "Price check"
-            );
-        }
-
-        // PRIORITY 1: Check for arbitrage opportunity
-        if combined < self.config.arb_threshold {
-            let profit_per_pair = Decimal::ONE - combined;
             info!(
-                market_id = %market.market_id,
-                up_ask = %up_ask,
-                down_ask = %down_ask,
-                combined = %combined,
-                profit_per_pair = %profit_per_pair,
-                "🎯 ARB OPPORTUNITY DETECTED"
+                scans = self.scan_count,
+                markets = markets.len(),
+                best = ?best_spread.map(|(a, c)| format!("{}={:.3}", a, c)),
+                "💓"
+            );
+            self.last_heartbeat = Instant::now();
+        }
+
+        // === PREDICTION-BASED EXECUTION ===
+        // Run the arb finder's prediction system (signals, confidence, etc.)
+        let predictions = self.arb_finder.scan();
+        
+        for prediction in predictions {
+            // Only act on predictions (min confidence is already checked in predictor)
+            if prediction.confidence < dec!(0.25) {
+                continue;
+            }
+
+            let Some(market) = self.markets.get(&prediction.market_id) else {
+                continue;
+            };
+
+            // Check cooldown - prevent spam
+            if let Some(last_attempt) = self.last_execution_attempt.get(&prediction.market_id) {
+                if last_attempt.elapsed() < EXECUTION_COOLDOWN {
+                    continue;
+                }
+            }
+
+            // Get target prices from prediction (already calculated to be profitable)
+            let (up_price, down_price) = match (prediction.up_target_price, prediction.down_target_price) {
+                (Some(up), Some(down)) => (up.round_dp(2), down.round_dp(2)),
+                _ => continue,
+            };
+            let combined = up_price + down_price;
+
+            // Skip if prices are clearly unprofitable (sanity check)
+            if combined >= dec!(1.0) {
+                continue;
+            }
+
+            // Get position for exposure check
+            let snapshot = self.ledger.get_state(&prediction.market_id).await;
+            let current_up = snapshot.position.up_shares;
+            let current_down = snapshot.position.down_shares;
+
+            // Calculate safe order size
+            let (up_size, down_size) = self.arb_finder.calculate_safe_arb_size(
+                current_up,
+                current_down,
+                prediction.confidence,
             );
 
-            // Calculate size - use order_size from config
-            let arb_size = self.config.order_size;
-
-            return Some(MarketAction::Arb {
-                up_ask,
-                down_ask,
-                combined,
-                up_size: arb_size,
-                down_size: arb_size,
-            });
-        }
-
-        // PRIORITY 2: Normal ladder maintenance (only if cooldown elapsed)
-        let should_reladder = self.ladder_state.should_reladder(
-            &market.market_id,
-            up_ask,
-            down_ask,
-            self.ladder_engine.config().reladder_threshold,
-        );
-
-        if !should_reladder && !self.cooldown_elapsed(&market.market_id) {
-            return None;
-        }
-
-        // Get ledger state
-        let snapshot = self.ledger.get_state(&market.market_id).await;
-
-        // Compute ladder
-        let plan = self.ladder_engine.compute_ladder(
-            up_ask,
-            down_ask,
-            &snapshot.position,
-            snapshot.pending_up,
-            snapshot.pending_down,
-            &snapshot.open_orders,
-        );
-
-        if plan.cancellations.is_empty() && plan.orders.is_empty() {
-            return None;
-        }
-
-        Some(MarketAction::Ladder {
-            up_ask,
-            down_ask,
-            cancellations: plan.cancellations,
-            orders: plan.orders,
-        })
-    }
-
-    /// Execute cancellations and place new orders
-    async fn execute_action(&mut self, market: &ActiveMarket, action: MarketAction) {
-        let market_id = &market.market_id;
-
-        match action {
-            MarketAction::Arb {
-                up_ask,
-                down_ask,
-                combined,
-                up_size: _,
-                down_size: _,
-            } => {
-                // Get current position to check exposure limits
-                let snapshot = self.ledger.get_state(market_id).await;
-                let current_up = snapshot.position.up_shares;
-                let current_down = snapshot.position.down_shares;
-
-                // Calculate safe order size (use high confidence since this is a direct arb)
-                let (safe_up_size, safe_down_size) = self.arb_finder.calculate_safe_arb_size(
-                    current_up,
-                    current_down,
-                    dec!(0.9), // High confidence for direct arb
-                );
-
-                if safe_up_size <= Decimal::ZERO || safe_down_size <= Decimal::ZERO {
-                    info!(
-                        market_id,
-                        current_up = %current_up,
-                        current_down = %current_down,
-                        max_exposure = %self.arb_finder.max_exposure_per_market(),
-                        "Skipping arb - max exposure reached"
-                    );
-                    return;
-                }
-
-                info!(
-                    market_id,
-                    up_ask = %up_ask,
-                    down_ask = %down_ask,
-                    combined = %combined,
-                    up_size = %safe_up_size,
-                    down_size = %safe_down_size,
-                    current_up = %current_up,
-                    current_down = %current_down,
-                    "Executing arb orders with safe sizing"
-                );
-
-                let placed = self
-                    .execute_arb_orders(market, up_ask, down_ask, safe_up_size, safe_down_size)
-                    .await;
-
-                info!(
-                    market_id,
-                    placed,
-                    up_price = %up_ask,
-                    down_price = %down_ask,
-                    "Arb execution complete"
-                );
+            if up_size < dec!(1.0) || down_size < dec!(1.0) {
+                continue;
             }
-            MarketAction::Ladder {
-                up_ask,
-                down_ask,
-                cancellations,
-                orders,
-            } => {
-                let cancelled_count = 0;
-                if !cancellations.is_empty() {
-                    debug!(
-                        market_id,
-                        count = cancellations.len(),
-                        "Cancellations disabled"
-                    );
-                }
 
-                // Place new orders
-                if !orders.is_empty() {
-                    let placed = self.place_orders(market, &orders).await;
+            let profit = Decimal::ONE - combined;
+            info!(
+                market_id = %prediction.market_id,
+                confidence = %prediction.confidence,
+                up = %up_price,
+                down = %down_price,
+                combined = %combined,
+                profit = %profit,
+                size = %up_size,
+                signals = prediction.signals.len(),
+                "🔮 ARB - executing"
+            );
 
-                    if placed > 0 {
-                        info!(
-                            market_id,
-                            up_ask = %up_ask,
-                            down_ask = %down_ask,
-                            cancelled = cancelled_count,
-                            placed,
-                            "Ladder updated"
-                        );
+            // Record execution attempt for cooldown
+            self.last_execution_attempt.insert(prediction.market_id.clone(), Instant::now());
 
-                        self.ladder_state
-                            .record_ladder(market_id.clone(), up_ask, down_ask);
-                    }
-                }
-            }
-        }
-
-        self.last_order_by_market
-            .insert(market_id.clone(), Instant::now());
-    }
-
-    async fn place_orders(&self, market: &ActiveMarket, orders: &[LadderOrder]) -> usize {
-        let build_start = Instant::now();
-        let signed = self.build_signed_orders(orders, market).await;
-        let build_ms = build_start.elapsed().as_millis();
-
-        if signed.is_empty() {
-            return 0;
-        }
-
-        let post_start = Instant::now();
-        match self.client.post_orders(signed).await {
-            Ok(responses) => {
-                let post_ms = post_start.elapsed().as_millis();
-                debug!(
-                    market_id = %market.market_id,
-                    build_ms,
-                    post_ms,
-                    "Order batch timing"
-                );
-                let mut placed = 0;
-
-                for (resp, order) in responses.iter().zip(orders.iter()) {
-                    let success = resp
-                        .error_msg
-                        .as_ref()
-                        .map(|s| s.is_empty())
-                        .unwrap_or(true);
-
-                    if success {
-                        let token_id = match order.side {
-                            MarketSide::Up => &market.up_token_id,
-                            MarketSide::Down => &market.down_token_id,
-                        };
-
-                        self.ledger
-                            .record_order_placed(
-                                resp.order_id.clone(),
-                                market.market_id.clone(),
-                                token_id.clone(),
-                                order.side,
-                                order.size,
-                                order.price,
-                            )
-                            .await;
-
-                        placed += 1;
-                    } else {
-                        warn!(
-                            market_id = %market.market_id,
-                            order_id = %resp.order_id,
-                            error = ?resp.error_msg,
-                            "Order rejected"
-                        );
-                    }
-                }
-
-                placed
-            }
-            Err(e) => {
-                error!(
-                    market_id = %market.market_id,
-                    error = %e,
-                    "Batch order submission failed"
-                );
-                0
-            }
+            self.execute_arb_orders(market, up_price, down_price, up_size, down_size)
+                .await;
         }
     }
-
     /// Execute arbitrage by submitting both Up and Down orders in parallel
     async fn execute_arb_orders(
         &self,
@@ -740,6 +554,18 @@ impl SimpleBot {
         up_size: Decimal,
         down_size: Decimal,
     ) -> usize {
+        // Dry run check
+        if self.config.dry_run {
+            info!(
+                market_id = %market.market_id,
+                up = %up_price,
+                down = %down_price,
+                size = %up_size,
+                "[DRY RUN] Would execute arb"
+            );
+            return 0;
+        }
+
         let arb_start = Instant::now();
 
         // Create orders for both sides
@@ -868,80 +694,6 @@ impl SimpleBot {
         }
     }
 
-    async fn build_signed_orders(
-        &self,
-        orders: &[LadderOrder],
-        market: &ActiveMarket,
-    ) -> Vec<SignedOrder> {
-        let signer = self.signer.clone().with_chain_id(Some(POLYGON));
-        let client = self.client.clone();
-        let up_token_id = market.up_token_id.clone();
-        let down_token_id = market.down_token_id.clone();
-
-        stream::iter(orders.iter().cloned())
-            .map(|order| {
-                let client = client.clone();
-                let signer = signer.clone();
-                let up_token_id = up_token_id.clone();
-                let down_token_id = down_token_id.clone();
-                async move {
-                    let token_id = match order.side {
-                        MarketSide::Up => up_token_id.as_str(),
-                        MarketSide::Down => down_token_id.as_str(),
-                    };
-
-                    let tick_size = match client.tick_size(token_id).await {
-                        Ok(resp) => resp.minimum_tick_size.as_decimal(),
-                        Err(e) => {
-                            error!(error = %e, "Failed to fetch tick size");
-                            return None;
-                        }
-                    };
-                    let price = quantize_price(order.price, tick_size);
-
-                    let (poly_price, poly_size) = match convert_order_params(price, order.size) {
-                        Some(p) => p,
-                        None => return None,
-                    };
-
-                    info!(
-                        size = %poly_size,
-                        price = %poly_price,
-                        side = ?order.side,
-                        "Building order"
-                    );
-
-                    let signable = match client
-                        .limit_order()
-                        .token_id(token_id)
-                        .price(poly_price)
-                        .size(poly_size)
-                        .side(ClobSide::Buy)
-                        .build()
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(error = %e, "Failed to build order");
-                            return None;
-                        }
-                    };
-
-                    match client.sign(&signer, signable).await {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            error!(error = %e, "Failed to sign order");
-                            None
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(SIGN_CONCURRENCY)
-            .filter_map(|signed| async move { signed })
-            .collect::<Vec<_>>()
-            .await
-    }
-
     /// Build arb orders with FAK (Fill-And-Kill = IOC equivalent)
     /// Orders are built in parallel for both Up and Down sides
     /// Uses sync tick_size cache for fast execution
@@ -1030,39 +782,6 @@ impl SimpleBot {
             .await
     }
 
-    fn convert_order_params(&self, order: &LadderOrder) -> Option<(PolyDecimal, PolyDecimal)> {
-        convert_order_params(order.price, order.size)
-    }
-
-    async fn cancel_orders(&self, order_ids: &[String]) -> anyhow::Result<Vec<String>> {
-        if order_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if self.config.dry_run {
-            info!(count = order_ids.len(), "Dry run: would cancel orders");
-            return Ok(order_ids.to_vec());
-        }
-
-        let order_id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
-
-        match self.client.cancel_orders(&order_id_refs).await {
-            Ok(response) => {
-                info!(
-                    requested = order_ids.len(),
-                    cancelled = response.canceled.len(),
-                    not_cancelled = response.not_canceled.len(),
-                    "Batch cancel complete"
-                );
-                Ok(response.canceled)
-            }
-            Err(e) => {
-                error!(error = %e, "Batch cancel failed");
-                Err(e.into())
-            }
-        }
-    }
-
     fn should_refresh_markets(&self) -> bool {
         if self.last_market_refresh.elapsed() < Duration::from_secs(30) {
             return false;
@@ -1076,13 +795,6 @@ impl SimpleBot {
         (840..870).contains(&position_in_window)
     }
 
-    fn cooldown_elapsed(&self, market_id: &str) -> bool {
-        self.last_order_by_market
-            .get(market_id)
-            .map(|t| t.elapsed() >= Duration::from_secs(self.config.cooldown_secs))
-            .unwrap_or(true)
-    }
-
     pub fn market_count(&self) -> usize {
         self.markets.len()
     }
@@ -1092,40 +804,24 @@ impl SimpleBot {
     }
 }
 
-/// Encapsulates what needs to happen for a market
-enum MarketAction {
-    /// Normal ladder maintenance
-    Ladder {
-        up_ask: Decimal,
-        down_ask: Decimal,
-        cancellations: Vec<String>,
-        orders: Vec<LadderOrder>,
-    },
-    /// Arbitrage opportunity detected - buy both sides immediately
-    Arb {
-        up_ask: Decimal,
-        down_ask: Decimal,
-        combined: Decimal,
-        up_size: Decimal,
-        down_size: Decimal,
-    },
-}
-
 fn convert_order_params(price: Decimal, size: Decimal) -> Option<(PolyDecimal, PolyDecimal)> {
     // Round price to 2 decimal places (Polymarket requirement)
     let rounded_price = price.round_dp(2);
+    
+    // CRITICAL: Polymarket requires maker_amount (price * size) to have max 2 decimals
+    // Rounding size to INTEGER guarantees cost has at most 2 decimals
+    // e.g., 0.41 * 6 = 2.46 (2 decimals) ✓
+    let rounded_size = size.round_dp(0); // Round to integer
+    
+    // Skip if size is too small
+    if rounded_size < dec!(1.0) {
+        debug!(original_size = %size, "Size < 1, skipping");
+        return None;
+    }
+    
     let price = PolyDecimal::try_from(rounded_price.to_string().as_str())
         .map_err(|e| error!(error = %e, "Invalid price format"))
         .ok()?;
-
-    // Round size to 2 decimal places (Polymarket requirement)
-    let rounded_size = size.round_dp(2);
-    
-    // Skip if size is too small after rounding
-    if rounded_size < dec!(0.01) {
-        debug!(original_size = %size, "Size too small after rounding, skipping");
-        return None;
-    }
     
     let size = PolyDecimal::try_from(rounded_size.to_string().as_str())
         .map_err(|e| error!(error = %e, "Invalid size format"))

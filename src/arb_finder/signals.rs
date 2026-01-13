@@ -156,6 +156,11 @@ impl SignalDetector {
         let ratio = state.depth_imbalance_ratio()?;
         let thin_side = state.thin_side()?;
 
+        // Guard against division by zero
+        if ratio == Decimal::ZERO || self.config.imbalance_ratio_threshold == Decimal::ZERO {
+            return None;
+        }
+
         // Check if imbalance exceeds threshold
         let effective_ratio = if thin_side == ThinSide::Down {
             ratio

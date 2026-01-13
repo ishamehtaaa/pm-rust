@@ -15,7 +15,7 @@ pub mod weight_learner;
 
 use rust_decimal::Decimal;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 pub use config::ArbFinderConfig;
 pub use data_logger::{DataLogger, DataLoggerHandle, LogEvent};
@@ -266,9 +266,35 @@ impl ArbFinder {
         }
     }
 
+    /// Get predicted prices for a market, accounting for execution delay
+    /// Returns (up_price, down_price) adjusted for expected latency
+    pub fn predict_prices(&self, market_id: &str, delay_ms: u64) -> Option<(Decimal, Decimal)> {
+        let state = self.state_store.get_state(market_id)?;
+        state.predict_prices_in_ms(delay_ms)
+    }
+
+    /// Check if arb will still be profitable after execution delay
+    /// Returns Some((up_price, down_price, combined)) if still profitable
+    pub fn check_arb_with_prediction(&self, market_id: &str, delay_ms: u64) -> Option<(Decimal, Decimal, Decimal)> {
+        let state = self.state_store.get_state(market_id)?;
+        
+        // Get predicted prices
+        let predicted_combined = state.predict_combined_ask_in_ms(delay_ms)?;
+        let (up_predicted, down_predicted) = state.predict_prices_in_ms(delay_ms)?;
+        
+        // Check if still profitable after delay
+        if predicted_combined < self.config.arb_threshold {
+            Some((up_predicted, down_predicted, predicted_combined))
+        } else {
+            // Use aggressive pricing as fallback
+            let up_aggressive = (state.up.best_ask()? + rust_decimal_macros::dec!(0.01)).round_dp(2);
+            let down_aggressive = (state.down.best_ask()? + rust_decimal_macros::dec!(0.01)).round_dp(2);
+            Some((up_aggressive, down_aggressive, up_aggressive + down_aggressive))
+        }
+    }
+
     /// Scan for ALL arb opportunities across full book depth
-    /// Logs all opportunities with full liquidity data for analysis
-    /// Returns the list of opportunities found
+    /// Returns the list of opportunities found (logging is minimal for speed)
     pub fn scan_cross_product_arbs(&self, market_id: &str) -> Vec<market_state::ArbOpportunity> {
         let Some(state) = self.state_store.get_state(market_id) else {
             return Vec::new();
@@ -276,22 +302,19 @@ impl ArbFinder {
 
         let opportunities = state.find_arb_opportunities(self.config.arb_threshold);
 
-        // Log ALL opportunities for analysis
+        // Log to file only (non-blocking), no console spam
         for opp in &opportunities {
             let event = LogEvent::arb_opportunity(market_id, opp);
             self.data_logger.log_nonblocking(event);
-            
-            info!(
+        }
+
+        // Only log summary if opportunities found (DEBUG level)
+        if !opportunities.is_empty() {
+            debug!(
                 market_id = %market_id,
-                up_price = %opp.up_price,
-                up_size = %opp.up_size,
-                down_price = %opp.down_price,
-                down_size = %opp.down_size,
-                combined = %opp.combined,
-                profit_per_pair = %opp.profit_per_pair,
-                max_executable = %opp.max_executable_size,
-                total_profit = %(opp.profit_per_pair * opp.max_executable_size),
-                "🎯 ARB OPPORTUNITY (cross-product)"
+                count = opportunities.len(),
+                best_profit = %opportunities.first().map(|o| o.profit_per_pair).unwrap_or_default(),
+                "Cross-product scan"
             );
         }
 
@@ -386,6 +409,11 @@ impl ArbFinder {
     /// Get the max exposure per market
     pub fn max_exposure_per_market(&self) -> Decimal {
         self.config.max_exposure_per_market
+    }
+
+    /// Get the arb threshold
+    pub fn arb_threshold(&self) -> Decimal {
+        self.config.arb_threshold
     }
 
     // ===== Active Learning Methods =====

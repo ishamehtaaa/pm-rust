@@ -120,9 +120,9 @@ impl ArbPredictor {
     }
 
     /// Calculate confidence score from signals using default config weights
+    /// Normalizes by ALL signal weights, not just detected ones
     fn calculate_confidence(&self, signals: &[Signal]) -> Decimal {
         let mut weighted_sum = Decimal::ZERO;
-        let mut weight_total = Decimal::ZERO;
 
         for signal in signals {
             let weight = match signal.signal_type {
@@ -131,36 +131,47 @@ impl ArbPredictor {
                 SignalType::Velocity => self.config.velocity_weight,
                 SignalType::Discrepancy => self.config.discrepancy_weight,
             };
-
             weighted_sum += signal.strength * weight;
-            weight_total += weight;
         }
 
-        if weight_total == Decimal::ZERO {
+        // Normalize by TOTAL possible weights (all 4 signal types)
+        let total_weight = self.config.sweep_weight
+            + self.config.imbalance_weight
+            + self.config.velocity_weight
+            + self.config.discrepancy_weight;
+
+        if total_weight == Decimal::ZERO {
             return Decimal::ZERO;
         }
 
         // Normalize and cap at 1.0
-        (weighted_sum / weight_total).min(dec!(1.0))
+        (weighted_sum / total_weight).min(dec!(1.0))
     }
 
     /// Calculate confidence using LEARNED weights
+    /// Normalizes by ALL signal weights, not just detected ones
+    /// This prevents a single signal from giving 100% confidence
     fn calculate_confidence_with_weights(&self, signals: &[Signal], weights: &LearnedWeights) -> Decimal {
         let mut weighted_sum = Decimal::ZERO;
-        let mut weight_total = Decimal::ZERO;
 
         for signal in signals {
             let weight = weights.get(signal.signal_type);
             weighted_sum += signal.strength * weight;
-            weight_total += weight;
         }
 
-        if weight_total == Decimal::ZERO {
+        // Normalize by TOTAL possible weights (all 4 signal types)
+        // This way, a single signal can give at most 25-40% confidence
+        let total_weight = weights.get(SignalType::Sweep)
+            + weights.get(SignalType::Imbalance)
+            + weights.get(SignalType::Velocity)
+            + weights.get(SignalType::Discrepancy);
+
+        if total_weight == Decimal::ZERO {
             return Decimal::ZERO;
         }
 
         // Normalize and cap at 1.0
-        (weighted_sum / weight_total).min(dec!(1.0))
+        (weighted_sum / total_weight).min(dec!(1.0))
     }
 
     /// Predict using learned weights (for active learning)

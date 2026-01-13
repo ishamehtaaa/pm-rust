@@ -189,7 +189,33 @@ impl TokenState {
             return None;
         }
 
-        Some(price_change / Decimal::try_from(time_secs).ok()?)
+        // Guard against division by zero
+        let time_decimal = Decimal::try_from(time_secs).ok()?;
+        if time_decimal == Decimal::ZERO {
+            return None;
+        }
+
+        Some(price_change / time_decimal)
+    }
+
+    /// Predict ask price in `ms` milliseconds based on recent velocity
+    /// Returns current price if velocity cannot be calculated
+    pub fn predict_ask_in_ms(&self, ms: u64) -> Option<Decimal> {
+        let current = self.best_ask()?;
+        
+        // Use 2-second window for velocity calculation
+        let velocity = self.price_velocity(Duration::from_secs(2));
+        
+        match velocity {
+            Some(vel) if vel.abs() > Decimal::ZERO => {
+                // velocity is change per second, convert ms to seconds
+                let seconds = Decimal::from(ms) / Decimal::from(1000);
+                let predicted = current + (vel * seconds);
+                // Clamp to valid price range [0.01, 0.99]
+                Some(predicted.max(rust_decimal_macros::dec!(0.01)).min(rust_decimal_macros::dec!(0.99)))
+            }
+            _ => Some(current), // No velocity data, use current price
+        }
     }
 
     /// Get recent trade volume in a window
@@ -273,6 +299,22 @@ impl MarketState {
     /// Combined ask from REST only
     pub fn combined_rest_ask(&self) -> Option<Decimal> {
         Some(self.up.rest_ask? + self.down.rest_ask?)
+    }
+
+    /// Predict combined ask price in `ms` milliseconds
+    /// Useful for anticipating where prices will be when order actually executes
+    pub fn predict_combined_ask_in_ms(&self, ms: u64) -> Option<Decimal> {
+        let up_predicted = self.up.predict_ask_in_ms(ms)?;
+        let down_predicted = self.down.predict_ask_in_ms(ms)?;
+        Some(up_predicted + down_predicted)
+    }
+
+    /// Get predicted prices for both sides
+    /// Returns (up_price, down_price) adjusted for expected execution delay
+    pub fn predict_prices_in_ms(&self, ms: u64) -> Option<(Decimal, Decimal)> {
+        let up = self.up.predict_ask_in_ms(ms)?;
+        let down = self.down.predict_ask_in_ms(ms)?;
+        Some((up, down))
     }
 
     /// Depth imbalance ratio (up liquidity / down liquidity)

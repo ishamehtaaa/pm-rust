@@ -19,7 +19,6 @@ use super::predictor::ArbPrediction;
 struct PendingPrediction {
     prediction: ArbPrediction,
     created_at: Instant,
-    initial_combined: Option<Decimal>,
 }
 
 /// Outcome of a prediction
@@ -66,23 +65,16 @@ impl OutcomeTracker {
     /// Register a new prediction to track
     pub fn track_prediction(&mut self, prediction: ArbPrediction) {
         let market_id = prediction.market_id.clone();
-        
-        // Get current combined price
-        let initial_combined = self.state_store
-            .get_state(&market_id)
-            .and_then(|s| s.combined_ask());
 
         debug!(
             market_id = %market_id,
             confidence = %prediction.confidence,
-            initial_combined = ?initial_combined,
             "Tracking prediction"
         );
 
         self.pending.insert(market_id, PendingPrediction {
             prediction,
             created_at: Instant::now(),
-            initial_combined,
         });
     }
 

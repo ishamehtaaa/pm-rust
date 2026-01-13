@@ -97,7 +97,6 @@ pub struct MarketPosition {
 #[derive(Debug, Clone)]
 struct TrackedOrder {
     order_id: String,
-    token_id: String,
     market_id: String,
     side: MarketSide,
     price: Decimal,
@@ -116,9 +115,6 @@ struct TrackedOrder {
 struct LedgerActor {
     positions: HashMap<String, MarketPosition>,
     tracked_orders: HashMap<String, TrackedOrder>,
-    /// Maps token_id -> (market_id, side) for fast lookup from WS messages
-    token_to_market: HashMap<String, (String, MarketSide)>,
-    /// Tracks paired positions and P&L
     pair_tracker: PairTracker,
 }
 
@@ -127,20 +123,8 @@ impl LedgerActor {
         Self {
             positions: HashMap::new(),
             tracked_orders: HashMap::new(),
-            token_to_market: HashMap::new(),
             pair_tracker: PairTracker::new(),
         }
-    }
-
-    fn register_market(&mut self, market: &MarketTokens) {
-        self.token_to_market.insert(
-            market.up_token_id.clone(),
-            (market.market_id.clone(), MarketSide::Up),
-        );
-        self.token_to_market.insert(
-            market.down_token_id.clone(),
-            (market.market_id.clone(), MarketSide::Down),
-        );
     }
 
     fn handle_command(&mut self, cmd: LedgerCommand) {
@@ -148,7 +132,7 @@ impl LedgerActor {
             LedgerCommand::OrderPlaced {
                 order_id,
                 market_id,
-                token_id,
+                token_id: _, // Not stored, just used for API compatibility
                 side,
                 size,
                 price,
@@ -167,7 +151,6 @@ impl LedgerActor {
                     order_id.clone(),
                     TrackedOrder {
                         order_id,
-                        token_id,
                         market_id,
                         side,
                         original_size: rounded_size,
