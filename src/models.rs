@@ -73,6 +73,12 @@ pub struct MarketState {
     pub end_time: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub enum MarketEvent {
+    Price(String),
+    Order(String),
+}
+
 pub fn duration_label(delta: TimeDelta) -> String {
     let minutes = delta.num_minutes();
     match minutes {

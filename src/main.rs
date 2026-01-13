@@ -2,10 +2,7 @@ use clap::Parser;
 use polymarket::bot::SimpleBot;
 use polymarket::config::{ASSETS_BY_PREFIX, Config};
 use std::collections::HashSet;
-use tracing_subscriber::{
-    EnvFilter,
-    fmt::{self, time::ChronoLocal},
-};
+use tracing_subscriber::{EnvFilter, fmt::time::ChronoLocal};
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]

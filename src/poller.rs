@@ -16,12 +16,14 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::constants::{round_size, short_id};
-use crate::ladder::OpenOrderInfo;
+use crate::ladder::{CostTracker, OpenOrderInfo};
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
 const ORDER_STATUS_CHECK_CONCURRENCY: usize = 4;
+const PENDING_UPDATE_TTL: Duration = Duration::from_secs(5);
+const MAX_PENDING_UPDATES: usize = 512;
 
 /// Messages sent to the ledger actor
 #[derive(Debug)]
@@ -30,7 +32,6 @@ pub enum LedgerCommand {
     OrderPlaced {
         order_id: String,
         market_id: String,
-        token_id: String,
         side: MarketSide,
         size: Decimal,
         price: Decimal,
@@ -82,19 +83,13 @@ pub struct LedgerSnapshot {
     pub open_orders: Vec<OpenOrderInfo>,
     pub up_cost: Decimal,
     pub down_cost: Decimal,
+    pub cost_tracker: CostTracker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MarketSide {
     Up,
     Down,
-}
-
-#[derive(Debug, Clone)]
-pub struct MarketTokens {
-    pub market_id: String,
-    pub up_token_id: String,
-    pub down_token_id: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -112,7 +107,6 @@ pub struct MarketCost {
 #[derive(Debug, Clone)]
 struct TrackedOrder {
     order_id: String,
-    token_id: String,
     market_id: String,
     side: MarketSide,
     price: Decimal,
@@ -124,6 +118,12 @@ struct TrackedOrder {
     first_update_logged: bool,
 }
 
+#[derive(Debug)]
+struct PendingUpdate {
+    msg: OrderMessage,
+    received_at: Instant,
+}
+
 /// The single source of truth for inventory.
 ///
 /// All mutations go through the command channel, ensuring serialized access.
@@ -132,8 +132,8 @@ struct LedgerActor {
     positions: HashMap<String, MarketPosition>,
     costs: HashMap<String, MarketCost>,
     tracked_orders: HashMap<String, TrackedOrder>,
-    /// Maps token_id -> (market_id, side) for fast lookup from WS messages
-    token_to_market: HashMap<String, (String, MarketSide)>,
+    pending_updates: HashMap<String, PendingUpdate>,
+    cost_trackers: HashMap<String, CostTracker>,
 }
 
 impl LedgerActor {
@@ -142,19 +142,9 @@ impl LedgerActor {
             positions: HashMap::new(),
             costs: HashMap::new(),
             tracked_orders: HashMap::new(),
-            token_to_market: HashMap::new(),
+            pending_updates: HashMap::new(),
+            cost_trackers: HashMap::new(),
         }
-    }
-
-    fn register_market(&mut self, market: &MarketTokens) {
-        self.token_to_market.insert(
-            market.up_token_id.clone(),
-            (market.market_id.clone(), MarketSide::Up),
-        );
-        self.token_to_market.insert(
-            market.down_token_id.clone(),
-            (market.market_id.clone(), MarketSide::Down),
-        );
     }
 
     fn handle_command(&mut self, cmd: LedgerCommand) {
@@ -162,13 +152,13 @@ impl LedgerActor {
             LedgerCommand::OrderPlaced {
                 order_id,
                 market_id,
-                token_id,
                 side,
                 size,
                 price,
                 placed_at,
             } => {
                 let rounded_size = round_size(size);
+                let order_id_for_pending = order_id.clone();
                 debug!(
                     order_id = %short_id(&order_id, 8),
                     market_id = %market_id,
@@ -181,7 +171,6 @@ impl LedgerActor {
                     order_id.clone(),
                     TrackedOrder {
                         order_id,
-                        token_id,
                         market_id,
                         side,
                         original_size: rounded_size,
@@ -193,6 +182,10 @@ impl LedgerActor {
                         first_update_logged: false,
                     },
                 );
+
+                if let Some(pending) = self.pending_updates.remove(&order_id_for_pending) {
+                    self.handle_order_message(pending.msg);
+                }
             }
 
             LedgerCommand::OrderUpdate(msg) => {
@@ -351,6 +344,20 @@ impl LedgerActor {
                         side = ?tracked.side,
                         "Fill detected via WebSocket"
                     );
+                    let cost_tracker = self
+                        .cost_trackers
+                        .entry(tracked.market_id.clone())
+                        .or_insert_with(CostTracker::new);
+                    cost_tracker.record_fill(tracked.side, tracked.price, fill_delta);
+
+                    info!(
+                        order_id = %short_id(order_id, 8),
+                        fill_delta = %fill_delta,
+                        side = ?tracked.side,
+                        price = %tracked.price,
+                        avg_pair_cost = ?cost_tracker.avg_pair_cost(),
+                        "Fill detected"
+                    );
 
                     // Credit the position immediately
                     let pos = self.positions.entry(tracked.market_id.clone()).or_default();
@@ -385,12 +392,38 @@ impl LedgerActor {
             }
         } else {
             // Order not in our tracked set - might be from a previous session
-            // or placed outside this bot. We can optionally track it.
+            // or placed outside this bot. Buffer the update in case we are racing post_orders.
             debug!(
                 order_id = %short_id(order_id, 8),
                 msg_type = ?msg.msg_type,
                 "Received update for untracked order"
             );
+            self.pending_updates.insert(
+                msg.id.clone(),
+                PendingUpdate {
+                    msg,
+                    received_at: Instant::now(),
+                },
+            );
+            self.prune_pending_updates();
+        }
+    }
+
+    fn prune_pending_updates(&mut self) {
+        let now = Instant::now();
+        self.pending_updates
+            .retain(|_, update| now.duration_since(update.received_at) <= PENDING_UPDATE_TTL);
+        if self.pending_updates.len() > MAX_PENDING_UPDATES {
+            let mut entries: Vec<(String, Instant)> = self
+                .pending_updates
+                .iter()
+                .map(|(id, update)| (id.clone(), update.received_at))
+                .collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = entries.len() - MAX_PENDING_UPDATES;
+            for (id, _) in entries.into_iter().take(to_remove) {
+                self.pending_updates.remove(&id);
+            }
         }
     }
 
@@ -480,6 +513,11 @@ impl LedgerActor {
             open_orders,
             up_cost: cost.up_cost,
             down_cost: cost.down_cost,
+            cost_tracker: self
+                .cost_trackers
+                .get(market_id)
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 }
@@ -496,7 +534,6 @@ impl LedgerHandle {
         &self,
         order_id: String,
         market_id: String,
-        token_id: String,
         side: MarketSide,
         size: Decimal,
         price: Decimal,
@@ -506,7 +543,6 @@ impl LedgerHandle {
             .send(LedgerCommand::OrderPlaced {
                 order_id,
                 market_id,
-                token_id,
                 side,
                 size,
                 price,
@@ -628,6 +664,7 @@ pub fn spawn_order_feed(
     client: Arc<AuthenticatedWsClient>,
     ledger: LedgerHandle,
     market_ids: Vec<String>,
+    event_tx: mpsc::Sender<crate::models::MarketEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if market_ids.is_empty() {
@@ -658,6 +695,9 @@ pub fn spawn_order_feed(
                                     msg_type = ?order_msg.msg_type,
                                     "Order update received"
                                 );
+                                let _ = event_tx.try_send(crate::models::MarketEvent::Order(
+                                    order_msg.market.clone(),
+                                ));
                                 let _ = ledger.tx.send(LedgerCommand::OrderUpdate(order_msg)).await;
                             }
                             Err(e) => {

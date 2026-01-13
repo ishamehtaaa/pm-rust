@@ -6,10 +6,10 @@ use std::collections::{HashMap, HashSet};
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
 pub const SHARES_TARGET_PER_SIDE: Decimal = dec!(25);
 pub const ORDER_SIZE: Decimal = dec!(5);
-pub const TARGET_TOTAL_COST: Decimal = dec!(0.98);
+pub const TARGET_TOTAL_COST: Decimal = dec!(0.99);
 pub const MAKER_PRICE_OFFSET: Decimal = dec!(0.01);
-pub const MAX_PRICE_AGE_MS: i64 = 2_500;
-pub const COOLDOWN_SECS: u64 = 2;
+pub const MAX_PRICE_AGE_MS: i64 = 1_000;
+pub const COOLDOWN_SECS: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
