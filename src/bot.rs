@@ -126,9 +126,9 @@ impl SimpleBot {
         // Spawn ledger actor - single source of truth
         let ledger = spawn_ledger_actor();
 
-        // HTTP reconciliation as backup (every 10s)
+        // HTTP reconciliation as backup (every 3s for faster fill detection)
         let reconciliation_poller =
-            spawn_reconciliation_poller(client.clone(), ledger.clone(), Duration::from_secs(10));
+            spawn_reconciliation_poller(client.clone(), ledger.clone(), Duration::from_secs(3));
 
         let target_assets = config.target_assets.clone();
 
@@ -322,6 +322,21 @@ impl SimpleBot {
 
     /// Evaluate a single market, returning an action if needed
     async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
+        // Safety check: don't place new orders too close to market end
+        let now = Utc::now();
+        let seconds_until_end = (market.end_time - now).num_seconds();
+        let min_seconds = self.ladder_engine.config().min_seconds_before_end;
+        
+        if seconds_until_end < min_seconds {
+            trace!(
+                market_id = %market.market_id,
+                seconds_until_end,
+                min_seconds,
+                "Too close to market end, skipping"
+            );
+            return None;
+        }
+
         // Get prices
         let (up_ask, down_ask) = {
             let cache = self.price_cache.read();
@@ -351,6 +366,8 @@ impl SimpleBot {
 
         // Get ledger state
         let snapshot = self.ledger.get_state(&market.market_id).await;
+        let locked_pairs = self.ledger.get_locked_pairs(&market.market_id).await;
+        let (max_up_price, max_down_price) = self.ledger.get_max_hedge_prices(&market.market_id).await;
 
         // Compute ladder
         let plan = self.ladder_engine.compute_ladder(
@@ -360,6 +377,9 @@ impl SimpleBot {
             snapshot.pending_up,
             snapshot.pending_down,
             &snapshot.open_orders,
+            locked_pairs,
+            max_up_price,
+            max_down_price,
         );
 
         if plan.cancellations.is_empty() && plan.orders.is_empty() {

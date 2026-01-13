@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use tracing::{debug, info, trace};
+use tracing::info;
 
 use crate::{
     constants::{round_size, short_id},
@@ -16,21 +16,31 @@ pub struct LadderConfig {
     pub spacing: Decimal,
     pub size_per_level: Decimal,
     pub top_offset: Decimal,
-    pub target_per_side: Decimal,
+    pub shares_per_round: Decimal,
     pub reladder_threshold: Decimal,
     pub stale_order_distance: Decimal,
+    
+    // Round-based safety settings
+    pub max_rounds_per_market: usize,
+    pub max_unpaired_exposure: Decimal,
+    pub min_seconds_before_end: i64,
 }
 
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 2,                        // Only 2 levels - minimal
-            spacing: dec!(0.01),              // 1¢ between levels
-            size_per_level: dec!(10),         // Larger size per level
-            top_offset: dec!(0.005),          // Half-cent below ask - very close!
-            target_per_side: dec!(20),        // 20 shares per side (2 orders × 10)
-            reladder_threshold: dec!(0.05),   // Only reladder if price moves 5¢ - STICKY
-            stale_order_distance: dec!(0.15), // Only cancel if 15¢ away - very tolerant
+            levels: 2,                          // Only 2 levels - minimal
+            spacing: dec!(0.01),                // 1¢ between levels
+            size_per_level: dec!(10),           // Larger size per level
+            top_offset: dec!(0.005),            // Half-cent below ask - very close!
+            shares_per_round: dec!(20),         // 20 shares per side per round
+            reladder_threshold: dec!(0.05),     // Only reladder if price moves 5¢ - STICKY
+            stale_order_distance: dec!(0.15),   // Only cancel if 15¢ away - very tolerant
+            
+            // Round-based safety
+            max_rounds_per_market: 5,           // Max 5 complete rounds per market
+            max_unpaired_exposure: dec!(25),    // Never have more than 25 unpaired shares
+            min_seconds_before_end: 180,        // Stop 3 minutes before market ends
         }
     }
 }
@@ -105,25 +115,32 @@ impl LadderEngine {
         pending_up: Decimal,
         pending_down: Decimal,
         open_orders: &[OpenOrderInfo],
+        locked_pairs: Decimal,  // Pairs already completed in previous rounds
+        max_up_price: Option<Decimal>,   // Max price for Up to stay profitable (from pair tracker)
+        max_down_price: Option<Decimal>, // Max price for Down to stay profitable
     ) -> LadderPlan {
         let mut plan = LadderPlan::default();
 
-        let target = self.config.target_per_side;
-        let min_side = position.up_shares.min(position.down_shares);
+        // Subtract locked pairs from position - those are "done"
+        let working_up = (position.up_shares - locked_pairs).max(Decimal::ZERO);
+        let working_down = (position.down_shares - locked_pairs).max(Decimal::ZERO);
+
+        let target = self.config.shares_per_round;
+        let min_side = working_up.min(working_down);
         let desired_per_side = if min_side >= target {
-            position.up_shares.max(position.down_shares)
+            working_up.max(working_down)
         } else {
             target
         };
 
         /* for both sides, if we are over, then cancel all pending orders. */
-        if position.up_shares >= desired_per_side {
+        if working_up >= desired_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 plan.cancellations.push(order.order_id.clone());
             }
         }
 
-        if position.down_shares >= desired_per_side {
+        if working_down >= desired_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Down) {
                 plan.cancellations.push(order.order_id.clone());
             }
@@ -165,22 +182,23 @@ impl LadderEngine {
         let effective_pending_up = (pending_up - cancelled_up).max(Decimal::ZERO);
         let effective_pending_down = (pending_down - cancelled_down).max(Decimal::ZERO);
 
-        // 5. Calculate room for new orders
-        let up_room = if position.up_shares >= desired_per_side {
+        // 5. Calculate room for new orders (based on working position, not total)
+        let up_room = if working_up >= desired_per_side {
             Decimal::ZERO
         } else {
-            (desired_per_side - position.up_shares - effective_pending_up).max(Decimal::ZERO)
+            (desired_per_side - working_up - effective_pending_up).max(Decimal::ZERO)
         };
 
-        let down_room = if position.down_shares >= desired_per_side {
+        let down_room = if working_down >= desired_per_side {
             Decimal::ZERO
         } else {
-            (desired_per_side - position.down_shares - effective_pending_down).max(Decimal::ZERO)
+            (desired_per_side - working_down - effective_pending_down).max(Decimal::ZERO)
         };
 
         // 6. Generate ladders, skipping already-covered price levels
+        // Also respect max hedge prices to avoid chasing unprofitable fills
         if up_room >= MIN_ORDER_SIZE {
-            for order in self.generate_side_ladder(MarketSide::Up, up_ask, up_room) {
+            for order in self.generate_side_ladder(MarketSide::Up, up_ask, up_room, max_up_price) {
                 if !covered_up.contains(&order.price) {
                     plan.orders.push(order);
                 }
@@ -188,7 +206,7 @@ impl LadderEngine {
         }
 
         if down_room >= MIN_ORDER_SIZE {
-            for order in self.generate_side_ladder(MarketSide::Down, down_ask, down_room) {
+            for order in self.generate_side_ladder(MarketSide::Down, down_ask, down_room, max_down_price) {
                 if !covered_down.contains(&order.price) {
                     plan.orders.push(order);
                 }
@@ -234,6 +252,7 @@ impl LadderEngine {
         side: MarketSide,
         ask: Decimal,
         room: Decimal,
+        max_price: Option<Decimal>,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
 
@@ -241,14 +260,35 @@ impl LadderEngine {
             return orders;
         }
 
-        let mut remaining_room = room;
+        // If we have unpaired shares on the opposite side, we can only buy at max_price
+        // to stay profitable. If market has moved past this, skip placing orders.
+        let effective_max = max_price.unwrap_or(dec!(0.99));
         let top_price = (ask - self.config.top_offset).max(dec!(0.01));
+        
+        // If our desired price is above the max profitable price, don't place orders
+        if top_price > effective_max {
+            info!(
+                side = ?side,
+                ask = %ask,
+                top_price = %top_price,
+                max_price = %effective_max,
+                "Price too high to be profitable, skipping orders"
+            );
+            return orders;
+        }
+
+        let mut remaining_room = room;
 
         for level in 0..self.config.levels {
             let price =
                 (top_price - self.config.spacing * Decimal::from(level as u32)).max(dec!(0.01));
 
             if price >= ask {
+                continue;
+            }
+            
+            // Don't place orders above our max profitable price
+            if price > effective_max {
                 continue;
             }
 
