@@ -95,6 +95,8 @@ pub struct Config {
     pub cooldown_secs: u64,
     /// Arb threshold: trigger when combined ask (up + down) is below this
     pub arb_threshold: Decimal,
+    /// If IOC isn't available, cancel arb orders after this long
+    pub arb_order_timeout_ms: u64,
 }
 
 impl Config {
@@ -121,6 +123,7 @@ impl Config {
         let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
         let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 1)?;  // 1s cooldown - fast for arb
         let arb_threshold = parse_decimal_env("ARB_THRESHOLD", dec!(0.98))?;  // Trigger when combined < 0.98
+        let arb_order_timeout_ms = parse_u64_env("ARB_ORDER_TIMEOUT_MS", 350)?;
 
         if shares_target_per_side <= Decimal::ZERO {
             return Err(anyhow::anyhow!(
@@ -158,6 +161,12 @@ impl Config {
                 arb_threshold
             ));
         }
+        if arb_order_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "ARB_ORDER_TIMEOUT_MS must be > 0, got {}",
+                arb_order_timeout_ms
+            ));
+        }
 
         Ok(Self {
             dry_run,
@@ -171,6 +180,7 @@ impl Config {
             max_price_age_ms,
             cooldown_secs,
             arb_threshold,
+            arb_order_timeout_ms,
         })
     }
 }

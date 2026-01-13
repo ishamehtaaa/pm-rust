@@ -50,6 +50,17 @@ impl ArbPredictor {
 
     /// Analyze market state and generate prediction
     pub fn predict(&self, state: &MarketState) -> Option<ArbPrediction> {
+        // Guardrail: refuse to act on stale data
+        let now = Instant::now();
+        let max_age = self.config.max_data_age;
+
+        let (_, up_ts) = state.up.best_ask_with_timestamp()?;
+        let (_, down_ts) = state.down.best_ask_with_timestamp()?;
+
+        if now.duration_since(up_ts) > max_age || now.duration_since(down_ts) > max_age {
+            return None;
+        }
+
         // First, check if there's already an arb opportunity
         if let Some(combined) = state.combined_ask() {
             if combined < self.config.arb_threshold {

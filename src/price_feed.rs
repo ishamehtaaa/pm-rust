@@ -70,8 +70,20 @@ pub fn spawn_price_feed(
                         .min();
 
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                        let bid_dec: Decimal = bid.to_string().parse().unwrap_or_default();
-                        let ask_dec: Decimal = ask.to_string().parse().unwrap_or_default();
+                        let bid_dec: Decimal = match bid.to_string().parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, asset_id = %book.asset_id, "Failed to parse WS bid");
+                                continue;
+                            }
+                        };
+                        let ask_dec: Decimal = match ask.to_string().parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, asset_id = %book.asset_id, "Failed to parse WS ask");
+                                continue;
+                            }
+                        };
                         let ts: u64 = book.timestamp.try_into().unwrap_or(0);
 
                         cache.write().update(book.asset_id, bid_dec, ask_dec, ts);

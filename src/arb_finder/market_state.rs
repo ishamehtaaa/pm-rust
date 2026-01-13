@@ -89,6 +89,8 @@ pub struct TokenState {
     pub ws_bid: Option<Decimal>,
     /// WebSocket best ask
     pub ws_ask: Option<Decimal>,
+    /// REST API best bid
+    pub rest_bid: Option<Decimal>,
     /// REST API best ask (may differ from WS)
     pub rest_ask: Option<Decimal>,
     /// Last WS update time
@@ -108,6 +110,7 @@ impl Default for TokenState {
         Self {
             ws_bid: None,
             ws_ask: None,
+            rest_bid: None,
             rest_ask: None,
             ws_updated: None,
             rest_updated: None,
@@ -136,6 +139,22 @@ impl TokenState {
         }
     }
 
+    /// Like `best_ask`, but also returns the timestamp of the chosen source.
+    pub fn best_ask_with_timestamp(&self) -> Option<(Decimal, Instant)> {
+        match (self.rest_ask, self.rest_updated, self.ws_ask, self.ws_updated) {
+            (Some(rest), Some(rest_t), Some(ws), Some(ws_t)) => {
+                if rest_t > ws_t {
+                    Some((rest, rest_t))
+                } else {
+                    Some((ws, ws_t))
+                }
+            }
+            (Some(rest), Some(rest_t), None, _) => Some((rest, rest_t)),
+            (None, _, Some(ws), Some(ws_t)) => Some((ws, ws_t)),
+            _ => None,
+        }
+    }
+
     /// Update from WebSocket orderbook
     pub fn update_ws(&mut self, bid: Decimal, ask: Decimal) {
         let now = Instant::now();
@@ -151,7 +170,8 @@ impl TokenState {
     }
 
     /// Update from REST snapshot
-    pub fn update_rest(&mut self, ask: Decimal) {
+    pub fn update_rest(&mut self, bid: Decimal, ask: Decimal) {
+        self.rest_bid = Some(bid);
         self.rest_ask = Some(ask);
         self.rest_updated = Some(Instant::now());
     }
@@ -292,57 +312,91 @@ pub enum ThinSide {
 #[derive(Clone, Default)]
 pub struct MarketStateStore {
     inner: Arc<RwLock<HashMap<String, MarketState>>>,
+    /// token_id -> (market_id, is_up)
+    token_index: Arc<RwLock<HashMap<String, (String, bool)>>>,
 }
 
 impl MarketStateStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            token_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Initialize state for a market
     pub fn init_market(&self, market_id: String, up_token_id: String, down_token_id: String) {
-        let mut store = self.inner.write();
-        store.insert(
-            market_id.clone(),
-            MarketState::new(market_id, up_token_id, down_token_id),
-        );
+        {
+            let mut store = self.inner.write();
+            store.insert(
+                market_id.clone(),
+                MarketState::new(market_id.clone(), up_token_id.clone(), down_token_id.clone()),
+            );
+        }
+
+        // Maintain O(1) token_id -> market lookup for hot-path updates
+        let mut idx = self.token_index.write();
+        idx.insert(up_token_id, (market_id.clone(), true));
+        idx.insert(down_token_id, (market_id, false));
     }
 
     /// Update WS prices for a token
     pub fn update_ws_price(&self, token_id: &str, bid: Decimal, ask: Decimal) {
+        let (market_id, is_up) = match self.token_index.read().get(token_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
         let mut store = self.inner.write();
-        for state in store.values_mut() {
-            if state.up_token_id == token_id {
-                state.up.update_ws(bid, ask);
-            } else if state.down_token_id == token_id {
-                state.down.update_ws(bid, ask);
-            }
+        let state = match store.get_mut(&market_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if is_up {
+            state.up.update_ws(bid, ask);
+        } else {
+            state.down.update_ws(bid, ask);
         }
     }
 
     /// Update REST price for a token
-    pub fn update_rest_price(&self, token_id: &str, ask: Decimal) {
+    pub fn update_rest_price(&self, token_id: &str, bid: Decimal, ask: Decimal) {
+        let (market_id, is_up) = match self.token_index.read().get(token_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
         let mut store = self.inner.write();
-        for state in store.values_mut() {
-            if state.up_token_id == token_id {
-                state.up.update_rest(ask);
-            } else if state.down_token_id == token_id {
-                state.down.update_rest(ask);
-            }
+        let state = match store.get_mut(&market_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if is_up {
+            state.up.update_rest(bid, ask);
+        } else {
+            state.down.update_rest(bid, ask);
         }
     }
 
     /// Record a trade for a token
     pub fn record_trade(&self, token_id: &str, trade: TradeEvent) {
+        let (market_id, is_up) = match self.token_index.read().get(token_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
         let mut store = self.inner.write();
-        for state in store.values_mut() {
-            if state.up_token_id == token_id {
-                state.up.record_trade(trade.clone());
-            } else if state.down_token_id == token_id {
-                state.down.record_trade(trade.clone());
-            }
+        let state = match store.get_mut(&market_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if is_up {
+            state.up.record_trade(trade);
+        } else {
+            state.down.record_trade(trade);
         }
     }
 

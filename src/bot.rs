@@ -5,7 +5,7 @@ use crate::clob_api::fetch_token_balances;
 use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
-use crate::models::MarketInfo;
+use crate::models::{MarketInfo, now_ms};
 use crate::poller::{
     LedgerHandle, MarketSide, spawn_ledger_actor, spawn_order_feed, spawn_reconciliation_poller,
 };
@@ -38,6 +38,7 @@ const LOOP_DELAY: Duration = Duration::from_millis(10);  // Fast loop for arb de
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const PREFETCH_CONCURRENCY: usize = 6;
 const SIGN_CONCURRENCY: usize = 4;
+const MIN_VALID_PRICE: Decimal = dec!(0.01);
 
 /// Consolidated view of a market we're trading
 #[derive(Clone)]
@@ -416,12 +417,39 @@ impl SimpleBot {
 
     /// Evaluate a single market, returning an action if needed
     async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
-        // Get prices
+        // Get prices (and enforce freshness)
         let (up_ask, down_ask) = {
+            let now_ms_u64 = now_ms().max(0) as u64;
+            let max_age_ms = self.config.max_price_age_ms.max(0) as u64;
+
             let cache = self.price_cache.read();
-            let up = cache.get(&market.up_token_id)?.1;
-            let down = cache.get(&market.down_token_id)?.1;
-            (up, down)
+
+            let (_, up_ask, up_age) = cache.get_with_age(&market.up_token_id, now_ms_u64)?;
+            let (_, down_ask, down_age) = cache.get_with_age(&market.down_token_id, now_ms_u64)?;
+
+            if up_age > max_age_ms || down_age > max_age_ms {
+                trace!(
+                    market_id = %market.market_id,
+                    up_age_ms = up_age,
+                    down_age_ms = down_age,
+                    max_age_ms,
+                    "Skipping market - stale prices"
+                );
+                return None;
+            }
+
+            // Sanity-check price bounds
+            if up_ask < MIN_VALID_PRICE || down_ask < MIN_VALID_PRICE || up_ask >= Decimal::ONE || down_ask >= Decimal::ONE {
+                warn!(
+                    market_id = %market.market_id,
+                    up_ask = %up_ask,
+                    down_ask = %down_ask,
+                    "Skipping market - invalid ask price"
+                );
+                return None;
+            }
+
+            (up_ask, down_ask)
         };
 
         let combined = up_ask + down_ask;
@@ -574,13 +602,19 @@ impl SimpleBot {
                 cancellations,
                 orders,
             } => {
-                let cancelled_count = 0;
+                let mut cancelled_count = 0;
                 if !cancellations.is_empty() {
-                    debug!(
-                        market_id,
-                        count = cancellations.len(),
-                        "Cancellations disabled"
-                    );
+                    match self.cancel_orders(&cancellations).await {
+                        Ok(cancelled) => {
+                            cancelled_count = cancelled.len();
+                            if cancelled_count > 0 {
+                                self.ledger.mark_orders_cancelled(cancelled).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(market_id, error = %e, "Failed to cancel orders");
+                        }
+                    }
                 }
 
                 // Place new orders
@@ -729,6 +763,7 @@ impl SimpleBot {
                 let total_ms = arb_start.elapsed().as_millis();
 
                 let mut placed = 0;
+                let mut placed_order_ids: Vec<String> = Vec::new();
                 for (resp, order) in responses.iter().zip(orders.iter()) {
                     let success = resp
                         .error_msg
@@ -762,6 +797,7 @@ impl SimpleBot {
                             "Arb order placed"
                         );
 
+                        placed_order_ids.push(resp.order_id.clone());
                         placed += 1;
                     } else {
                         warn!(
@@ -782,6 +818,41 @@ impl SimpleBot {
                     total_ms,
                     "Arb execution timing"
                 );
+
+                // If IOC isn't available, auto-cancel anything that lingers.
+                if !self.config.dry_run && !placed_order_ids.is_empty() {
+                    let client = self.client.clone();
+                    let ledger = self.ledger.clone();
+                    let market_id = market.market_id.clone();
+                    let timeout_ms = self.config.arb_order_timeout_ms;
+
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+
+                        let order_id_refs: Vec<&str> =
+                            placed_order_ids.iter().map(|s| s.as_str()).collect();
+
+                        match client.cancel_orders(&order_id_refs).await {
+                            Ok(response) => {
+                                let cancelled_count = response.canceled.len();
+                                let not_cancelled_count = response.not_canceled.len();
+
+                                if cancelled_count > 0 {
+                                    ledger.mark_orders_cancelled(response.canceled).await;
+                                }
+                                debug!(
+                                    market_id = %market_id,
+                                    cancelled = cancelled_count,
+                                    not_cancelled = not_cancelled_count,
+                                    "Auto-cancelled lingering arb orders"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(market_id = %market_id, error = %e, "Auto-cancel failed");
+                            }
+                        }
+                    });
+                }
 
                 placed
             }
