@@ -139,6 +139,22 @@ impl TokenState {
         }
     }
 
+    /// Like `best_ask`, but also returns the timestamp of the chosen source.
+    pub fn best_ask_with_timestamp(&self) -> Option<(Decimal, Instant)> {
+        match (self.rest_ask, self.rest_updated, self.ws_ask, self.ws_updated) {
+            (Some(rest), Some(rest_t), Some(ws), Some(ws_t)) => {
+                if rest_t > ws_t {
+                    Some((rest, rest_t))
+                } else {
+                    Some((ws, ws_t))
+                }
+            }
+            (Some(rest), Some(rest_t), None, _) => Some((rest, rest_t)),
+            (None, _, Some(ws), Some(ws_t)) => Some((ws, ws_t)),
+            _ => None,
+        }
+    }
+
     /// Update from WebSocket orderbook
     pub fn update_ws(&mut self, bid: Decimal, ask: Decimal) {
         let now = Instant::now();
