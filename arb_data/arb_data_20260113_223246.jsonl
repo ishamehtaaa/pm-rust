@@ -1,0 +1,7 @@
+{"type":"SpreadSnapshot","timestamp_ms":1768343569536,"market_id":"1170820","up_ws_ask":null,"down_ws_ask":null,"up_rest_ask":null,"down_rest_ask":null,"combined_ws":null,"combined_rest":null}
+{"type":"SpreadSnapshot","timestamp_ms":1768343570636,"market_id":"1170820","up_ws_ask":null,"down_ws_ask":null,"up_rest_ask":null,"down_rest_ask":null,"combined_ws":null,"combined_rest":null}
+{"type":"PriceUpdate","timestamp_ms":1768343570644,"market_id":"1170820","token_id":"20098991116206797440255867141200312699148463803951473521868627875827653613584","source":"ws","bid":"0.7","ask":"0.71"}
+{"type":"PriceUpdate","timestamp_ms":1768343570644,"market_id":"1170820","token_id":"41553629226306167326740151058180134924196790436418332413034747744692550994306","source":"ws","bid":"0.29","ask":"0.3"}
+{"type":"SpreadSnapshot","timestamp_ms":1768343570646,"market_id":"1170820","up_ws_ask":"0.71","down_ws_ask":"0.3","up_rest_ask":null,"down_rest_ask":null,"combined_ws":"1.01","combined_rest":null}
+{"type":"PriceUpdate","timestamp_ms":1768343570664,"market_id":"1170820","token_id":"20098991116206797440255867141200312699148463803951473521868627875827653613584","source":"ws","bid":"0.7","ask":"0.71"}
+{"type":"PriceUpdate","timestamp_ms":1768343570664,"market_id":"1170820","token_id":"41553629226306167326740151058180134924196790436418332413034747744692550994306","source":"ws","bid":"0.29","ask":"0.3"}

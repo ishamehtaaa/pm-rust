@@ -1,4 +1,5 @@
 // price_feed.rs
+use crate::arb_finder::{MarketStateStore, PriceLevel};
 use futures::StreamExt;
 use parking_lot::RwLock;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
@@ -38,10 +39,13 @@ impl PriceCache {
     }
 }
 
+/// Spawn price feed that captures FULL order book depth from WebSocket
+/// This is critical for finding arb opportunities at any price level, not just top-of-book
 pub fn spawn_price_feed(
     ws_endpoint: &str,
     asset_ids: Vec<String>,
     cache: Arc<RwLock<PriceCache>>,
+    state_store: Option<MarketStateStore>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let client = WsClient::new(ws_endpoint, Default::default())?;
 
@@ -60,21 +64,35 @@ pub fn spawn_price_feed(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(book) => {
-                    let best_bid = book.bids.iter()
-                        .map(|l| l.price)
-                        .max();
+                    // Convert FULL depth to our PriceLevel format
+                    let bids: Vec<PriceLevel> = book.bids.iter()
+                        .filter_map(|l| {
+                            let price: Decimal = l.price.to_string().parse().ok()?;
+                            let size: Decimal = l.size.to_string().parse().ok()?;
+                            Some(PriceLevel { price, size })
+                        })
+                        .collect();
+                    
+                    let asks: Vec<PriceLevel> = book.asks.iter()
+                        .filter_map(|l| {
+                            let price: Decimal = l.price.to_string().parse().ok()?;
+                            let size: Decimal = l.size.to_string().parse().ok()?;
+                            Some(PriceLevel { price, size })
+                        })
+                        .collect();
 
-                    // Best ask = lowest ask (cheapest offer to sell)
-                    let best_ask = book.asks.iter()
-                        .map(|l| l.price)
-                        .min();
+                    let best_bid = bids.iter().map(|l| l.price).max();
+                    let best_ask = asks.iter().map(|l| l.price).min();
 
+                    // Update basic price cache (best bid/ask only)
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                        let bid_dec: Decimal = bid.to_string().parse().unwrap_or_default();
-                        let ask_dec: Decimal = ask.to_string().parse().unwrap_or_default();
                         let ts: u64 = book.timestamp.try_into().unwrap_or(0);
+                        cache.write().update(book.asset_id.clone(), bid, ask, ts);
+                    }
 
-                        cache.write().update(book.asset_id, bid_dec, ask_dec, ts);
+                    // Update FULL depth in state store for cross-product arb scanning
+                    if let Some(ref store) = state_store {
+                        store.update_ws_depth(&book.asset_id, bids, asks);
                     }
                 }
                 Err(e) => {

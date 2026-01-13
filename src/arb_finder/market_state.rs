@@ -397,7 +397,8 @@ impl MarketState {
         let up_liq = self.up.rest_depth.total_ask_liquidity();
         let down_liq = self.down.rest_depth.total_ask_liquidity();
 
-        if down_liq == Decimal::ZERO {
+        // Need both sides to have liquidity for a meaningful ratio
+        if up_liq == Decimal::ZERO || down_liq == Decimal::ZERO {
             return None;
         }
 

@@ -18,7 +18,7 @@ use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType, SignedOrder};
+use polymarket_client_sdk::clob::types::{OrderType, Side as ClobSide, SignatureType, SignedOrder};
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
@@ -86,6 +86,10 @@ pub struct SimpleBot {
 
     /// Cached tick sizes for fast order building (token_id -> tick_size)
     tick_size_cache: Arc<RwLock<HashMap<String, Decimal>>>,
+    
+    /// Cached neg_risk values for fast order building (token_id -> neg_risk)
+    /// Pre-loaded at startup to avoid network calls during arb execution
+    neg_risk_cache: Arc<RwLock<HashMap<String, bool>>>,
 
     /// Predictive arb finder with cross-product scanning
     arb_finder: ArbFinder,
@@ -163,6 +167,7 @@ impl SimpleBot {
             _price_feed: None,
             _reconciliation_poller: reconciliation_poller,
             tick_size_cache: Arc::new(RwLock::new(HashMap::new())),
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
             arb_finder,
             pending_arb_orders: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -278,7 +283,8 @@ impl SimpleBot {
         }
     }
 
-    /// Prefetch and cache tick sizes for all tokens - critical for fast arb execution
+    /// Prefetch and cache tick sizes + neg_risk for all tokens - critical for fast arb execution
+    /// This eliminates network calls during order building, saving ~20-50ms per order
     async fn prefetch_token_metadata(&self, markets: &[ActiveMarket]) {
         let mut token_ids = Vec::new();
         for market in markets {
@@ -290,31 +296,57 @@ impl SimpleBot {
 
         let client = self.client.clone();
         let tick_cache = self.tick_size_cache.clone();
+        let neg_risk_cache = self.neg_risk_cache.clone();
         
         let results: Vec<_> = stream::iter(token_ids)
             .map(|token_id| {
                 let client = client.clone();
                 async move {
-                    let tick_size = client.tick_size(&token_id).await.ok()
+                    // Fetch tick size and neg_risk in parallel for this token
+                    let tick_future = client.tick_size(&token_id);
+                    let neg_risk_future = client.neg_risk(&token_id);
+                    
+                    let (tick_result, neg_risk_result) = tokio::join!(tick_future, neg_risk_future);
+                    
+                    let tick_size = tick_result.ok()
                         .map(|resp| resp.minimum_tick_size.as_decimal());
-                    let _ = client.neg_risk(&token_id).await;
-                    (token_id, tick_size)
+                    let neg_risk = neg_risk_result.ok()
+                        .map(|resp| resp.neg_risk);
+                    
+                    (token_id, tick_size, neg_risk)
                 }
             })
             .buffer_unordered(PREFETCH_CONCURRENCY)
             .collect()
             .await;
         
-        // Cache tick sizes synchronously for fast lookup during order building
+        // Cache values synchronously for fast lookup during order building
+        let tick_count;
+        let neg_risk_count;
         {
-            let mut cache = tick_cache.write();
-            for (token_id, tick_size) in results {
+            let mut tick_guard = tick_cache.write();
+            let mut neg_guard = neg_risk_cache.write();
+            
+            for (token_id, tick_size, neg_risk) in results {
                 if let Some(ts) = tick_size {
-                    info!(token_id = %token_id, tick_size = %ts, "Cached tick size");
-                    cache.insert(token_id, ts);
+                    debug!(token_id = %token_id, tick_size = %ts, "Cached tick size");
+                    tick_guard.insert(token_id.clone(), ts);
+                }
+                if let Some(nr) = neg_risk {
+                    debug!(token_id = %token_id, neg_risk = %nr, "Cached neg_risk");
+                    neg_guard.insert(token_id, nr);
                 }
             }
+            
+            tick_count = tick_guard.len();
+            neg_risk_count = neg_guard.len();
         }
+        
+        info!(
+            tick_sizes_cached = tick_count,
+            neg_risk_cached = neg_risk_count,
+            "Token metadata prefetched and cached"
+        );
     }
     
     /// Get cached tick size (synchronous, no network call)
@@ -338,11 +370,12 @@ impl SimpleBot {
             .flat_map(|m| [m.up_token_id.clone(), m.down_token_id.clone()])
             .collect();
 
-        // Start price feed
-        match spawn_price_feed(WS_SUB_URL, token_ids, self.price_cache.clone()) {
+        // Start price feed with FULL DEPTH - passes state_store for arb scanning
+        let state_store = self.arb_finder.state_store().clone();
+        match spawn_price_feed(WS_SUB_URL, token_ids, self.price_cache.clone(), Some(state_store)) {
             Ok(handle) => {
                 self._price_feed = Some(handle);
-                info!("Price feed started");
+                info!("Price feed started (full depth mode)");
             }
             Err(e) => {
                 error!(error = %e, "Failed to start price feed");
@@ -394,15 +427,30 @@ impl SimpleBot {
             }
             
             if let Some(market) = self.markets.get(&prediction.market_id).cloned() {
-                // Get position state
+                // Get position state INCLUDING pending orders
                 let snapshot = self.ledger.get_state(&prediction.market_id).await;
-                let current_up = snapshot.position.up_shares;
-                let current_down = snapshot.position.down_shares;
+                
+                // Skip if we have pending orders - wait for them to settle first
+                let total_pending = snapshot.pending_up + snapshot.pending_down;
+                if total_pending > Decimal::ZERO {
+                    debug!(
+                        market_id = %prediction.market_id,
+                        pending_up = %snapshot.pending_up,
+                        pending_down = %snapshot.pending_down,
+                        "Skipping arb - orders still pending"
+                    );
+                    continue;
+                }
+                
+                // CRITICAL: Include pending orders in exposure calculation!
+                // Otherwise we keep placing orders while previous ones are in flight
+                let effective_up = snapshot.position.up_shares + snapshot.pending_up;
+                let effective_down = snapshot.position.down_shares + snapshot.pending_down;
 
-                // Calculate safe order size based on position and confidence
+                // Calculate safe order size based on EFFECTIVE position and confidence
                 let (up_size, down_size) = self.arb_finder.calculate_safe_arb_size(
-                    current_up,
-                    current_down,
+                    effective_up,
+                    effective_down,
                     prediction.confidence,
                 );
 
@@ -423,9 +471,9 @@ impl SimpleBot {
                 if exec_size <= Decimal::ZERO {
                     debug!(
                         market_id = %prediction.market_id,
-                        current_up = %current_up,
-                        current_down = %current_down,
-                        "Skipping arb - no room for orders"
+                        effective_up = %effective_up,
+                        effective_down = %effective_down,
+                        "Skipping arb - max exposure reached"
                     );
                     continue;
                 }
@@ -433,18 +481,25 @@ impl SimpleBot {
                 let combined = up_price + down_price;
                 let profit_per_share = Decimal::ONE - combined;
                 
+                // Use FOK (Fill-or-Kill) for high-confidence arbs (>= 0.85)
+                // This ensures orders fill completely or are cancelled - prevents one-sided fills
+                // One-sided fills leave us with unbalanced exposure which is risky
+                let use_fok = prediction.confidence >= dec!(0.85);
+                
                 info!(
                     market_id = %prediction.market_id,
+                    confidence = %prediction.confidence.round_dp(4),
                     up_price = %up_price,
                     down_price = %down_price,
                     combined = %combined,
                     profit_per_share = %profit_per_share,
                     size = %exec_size,
+                    order_type = if use_fok { "FOK" } else { "GTC" },
                     "🚀 EXECUTING ARB"
                 );
 
                 let placed = self
-                    .execute_arb_orders(&market, up_price, down_price, exec_size, exec_size)
+                    .execute_arb_orders(&market, up_price, down_price, exec_size, exec_size, use_fok)
                     .await;
 
                 // Record attempt time for cooldown
@@ -463,7 +518,7 @@ impl SimpleBot {
     fn arb_cooldown_elapsed(&self, market_id: &str) -> bool {
         self.last_arb_attempt
             .get(market_id)
-            .map(|t| t.elapsed() >= Duration::from_millis(500)) // 500ms cooldown
+            .map(|t| t.elapsed() >= Duration::from_secs(2)) // 2s cooldown - give orders time to settle
             .unwrap_or(true)
     }
     
@@ -500,6 +555,8 @@ impl SimpleBot {
 
     /// Execute arbitrage by submitting both Up and Down orders in parallel
     /// Uses cached tick sizes for speed
+    /// `use_fok`: If true, use Fill-or-Kill orders - order fills completely or is cancelled
+    ///            This is ideal for confirmed arbs where we know liquidity exists
     async fn execute_arb_orders(
         &self,
         market: &ActiveMarket,
@@ -507,11 +564,12 @@ impl SimpleBot {
         down_price: Decimal,
         up_size: Decimal,
         down_size: Decimal,
+        use_fok: bool,
     ) -> usize {
         let arb_start = Instant::now();
 
         // Build orders using CACHED tick sizes (no network calls!)
-        let signed = self.build_arb_orders_fast(market, up_price, down_price, up_size, down_size).await;
+        let signed = self.build_arb_orders_fast(market, up_price, down_price, up_size, down_size, use_fok).await;
         let build_ms = arb_start.elapsed().as_millis();
 
         if signed.is_empty() {
@@ -624,6 +682,7 @@ impl SimpleBot {
     }
     
     /// Build arb orders using cached tick sizes for maximum speed
+    /// `use_fok`: If true, use Fill-or-Kill orders for immediate execution (confirmed arbs)
     async fn build_arb_orders_fast(
         &self,
         market: &ActiveMarket,
@@ -631,6 +690,7 @@ impl SimpleBot {
         down_price: Decimal,
         up_size: Decimal,
         down_size: Decimal,
+        use_fok: bool,
     ) -> Vec<SignedOrder> {
         let signer = self.signer.clone().with_chain_id(Some(POLYGON));
         let client = self.client.clone();
@@ -651,7 +711,7 @@ impl SimpleBot {
             let signer = signer.clone();
             let token_id = market.up_token_id.clone();
             async move {
-                build_single_order(&client, &signer, &token_id, up_price_q, up_size).await
+                build_single_order(&client, &signer, &token_id, up_price_q, up_size, use_fok).await
             }
         };
         
@@ -660,7 +720,7 @@ impl SimpleBot {
             let signer = signer.clone();
             let token_id = market.down_token_id.clone();
             async move {
-                build_single_order(&client, &signer, &token_id, down_price_q, down_size).await
+                build_single_order(&client, &signer, &token_id, down_price_q, down_size, use_fok).await
             }
         };
         
@@ -750,19 +810,25 @@ fn quantize_price(price: Decimal, tick_size: Decimal) -> Decimal {
 }
 
 /// Build a single signed order - used by build_arb_orders_fast
+/// `use_fok`: If true, use Fill-or-Kill for immediate execution (confirmed arbs)
+///            If false, use GTC (good-till-cancelled) for limit orders
 async fn build_single_order(
     client: &AuthenticatedClient,
     signer: &alloy::signers::local::PrivateKeySigner,
     token_id: &str,
     price: Decimal,
     size: Decimal,
+    use_fok: bool,
 ) -> Option<SignedOrder> {
     let (poly_price, poly_size) = convert_order_params(price, size)?;
     
-    debug!(
+    let order_type = if use_fok { OrderType::FOK } else { OrderType::GTC };
+    
+    trace!(
         token_id = %token_id,
         price = %poly_price,
         size = %poly_size,
+        order_type = ?order_type,
         "Building order"
     );
 
@@ -772,6 +838,7 @@ async fn build_single_order(
         .price(poly_price)
         .size(poly_size)
         .side(ClobSide::Buy)
+        .order_type(order_type)
         .build()
         .await
     {

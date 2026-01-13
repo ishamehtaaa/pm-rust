@@ -128,23 +128,15 @@ impl ArbPredictor {
             return None;
         }
 
-        // Only log ExecuteNow at info level - PrePosition is too frequent
-        if recommended_action == RecommendedAction::ExecuteNow {
-            info!(
-                market_id = %state.market_id,
-                confidence = %confidence,
-                signal_count = signals.len(),
-                "Signal-based arb prediction: ExecuteNow"
-            );
-        } else {
-            debug!(
-                market_id = %state.market_id,
-                confidence = %confidence,
-                action = ?recommended_action,
-                signal_count = signals.len(),
-                "Arb prediction generated"
-            );
-        }
+        // Log at debug level - caller will log at info when actually executing
+        // This reduces spam from predictions that hit cooldown
+        debug!(
+            market_id = %state.market_id,
+            confidence = %confidence.round_dp(4),
+            action = ?recommended_action,
+            signal_count = signals.len(),
+            "Signal-based prediction"
+        );
 
         Some(ArbPrediction {
             market_id: state.market_id.clone(),

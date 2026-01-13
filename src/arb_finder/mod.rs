@@ -271,12 +271,12 @@ impl ArbFinder {
 
         debug!(
             base_size = %base_size,
-            confidence = %confidence,
-            confidence_multiplier = %confidence_multiplier,
-            current_exposure = %current_exposure,
-            remaining_room = %remaining_room,
-            final_size = %final_size,
-            "Calculated safe arb size"
+            confidence = %confidence.round_dp(4),
+            multiplier = %confidence_multiplier.round_dp(2),
+            exposure = %current_exposure,
+            room = %remaining_room,
+            size = %final_size,
+            "Safe arb size calculated"
         );
 
         (final_size, final_size)
