@@ -427,27 +427,14 @@ impl SimpleBot {
             }
             
             if let Some(market) = self.markets.get(&prediction.market_id).cloned() {
-                // Get position state INCLUDING pending orders
+                // Get position state - include pending in exposure calc but DON'T block on them
                 let snapshot = self.ledger.get_state(&prediction.market_id).await;
                 
-                // Skip if we have pending orders - wait for them to settle first
-                let total_pending = snapshot.pending_up + snapshot.pending_down;
-                if total_pending > Decimal::ZERO {
-                    debug!(
-                        market_id = %prediction.market_id,
-                        pending_up = %snapshot.pending_up,
-                        pending_down = %snapshot.pending_down,
-                        "Skipping arb - orders still pending"
-                    );
-                    continue;
-                }
-                
-                // CRITICAL: Include pending orders in exposure calculation!
-                // Otherwise we keep placing orders while previous ones are in flight
+                // Include pending orders in exposure to avoid over-leveraging
                 let effective_up = snapshot.position.up_shares + snapshot.pending_up;
                 let effective_down = snapshot.position.down_shares + snapshot.pending_down;
 
-                // Calculate safe order size based on EFFECTIVE position and confidence
+                // Calculate safe order size based on effective position
                 let (up_size, down_size) = self.arb_finder.calculate_safe_arb_size(
                     effective_up,
                     effective_down,
@@ -481,10 +468,9 @@ impl SimpleBot {
                 let combined = up_price + down_price;
                 let profit_per_share = Decimal::ONE - combined;
                 
-                // Use FOK (Fill-or-Kill) for high-confidence arbs (>= 0.85)
-                // This ensures orders fill completely or are cancelled - prevents one-sided fills
-                // One-sided fills leave us with unbalanced exposure which is risky
-                let use_fok = prediction.confidence >= dec!(0.85);
+                // Use FOK only for confirmed arbs (confidence = 1.0) where we KNOW liquidity exists
+                // Otherwise use GTC to let orders rest and catch fleeting opportunities
+                let use_fok = prediction.confidence >= dec!(1.0);
                 
                 info!(
                     market_id = %prediction.market_id,
@@ -518,7 +504,7 @@ impl SimpleBot {
     fn arb_cooldown_elapsed(&self, market_id: &str) -> bool {
         self.last_arb_attempt
             .get(market_id)
-            .map(|t| t.elapsed() >= Duration::from_secs(2)) // 2s cooldown - give orders time to settle
+            .map(|t| t.elapsed() >= Duration::from_millis(200)) // 200ms cooldown - be aggressive
             .unwrap_or(true)
     }
     

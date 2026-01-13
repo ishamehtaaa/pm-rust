@@ -103,9 +103,9 @@ impl Default for ArbFinderConfig {
             rest_poll_interval: Duration::from_millis(100),
             rest_ws_discrepancy_threshold: dec!(0.01),
 
-            // Confidence
-            pre_position_confidence: dec!(0.3),
-            aggressive_confidence: dec!(0.6),
+            // Confidence - lower thresholds to act faster on signals
+            pre_position_confidence: dec!(0.2),  // Act early
+            aggressive_confidence: dec!(0.5),    // Be aggressive
             sweep_weight: dec!(0.4),
             imbalance_weight: dec!(0.3),
             velocity_weight: dec!(0.2),

@@ -176,26 +176,17 @@ impl ArbPredictor {
         (weighted_sum / weight_total).min(dec!(1.0))
     }
 
-    /// Calculate target prices for pre-positioning
+    /// Calculate target prices - USE ACTUAL BOOK PRICES
+    /// Don't calculate theoretical prices - hit what's actually there!
     fn calculate_target_prices(
         &self,
         state: &MarketState,
         _signals: &[Signal],
     ) -> (Option<Decimal>, Option<Decimal>) {
-        // For pre-positioning, we want to place orders slightly below current ask
-        // These should be prices that would result in profitable arb if filled
-
-        let combined = state.combined_ask().unwrap_or(dec!(1.05));
-        let _profit_needed = dec!(1.0) - self.config.arb_threshold;
-
-        // Current overage from arb threshold
-        let overage = combined - self.config.arb_threshold;
-
-        // We need to shave off the overage + some buffer
-        let adjustment_per_side = overage / dec!(2.0) + dec!(0.005);
-
-        let up_target = state.up.best_ask().map(|p| (p - adjustment_per_side).max(dec!(0.01)));
-        let down_target = state.down.best_ask().map(|p| (p - adjustment_per_side).max(dec!(0.01)));
+        // AGGRESSIVE: Use actual best asks from the book
+        // If there's cheap liquidity, we want to HIT IT, not calculate some adjusted price
+        let up_target = state.up.best_ask();
+        let down_target = state.down.best_ask();
 
         (up_target, down_target)
     }
