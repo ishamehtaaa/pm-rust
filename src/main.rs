@@ -1,6 +1,6 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::Config;
+use polymarket::config::{Config, resolve_target_assets};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, time::ChronoLocal},
@@ -15,6 +15,13 @@ struct Args {
 
     #[arg(long, help = "Run in dry-run mode (no real orders)")]
     dry_run: bool,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated asset names or prefixes to target"
+    )]
+    assets: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -35,6 +42,16 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::from_env()?;
     config.dry_run = args.dry_run;
+
+    if let Some(assets) = args.assets {
+        let resolved = resolve_target_assets(assets)?;
+        if resolved.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No valid assets provided via --assets"
+            ));
+        }
+        config.target_assets = resolved;
+    }
 
     /* Initialize the logger with a custom timestamp and quieting noisy logs. */
     tracing_subscriber::fmt()

@@ -48,6 +48,39 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
 pub static TARGET_ASSETS: Lazy<HashSet<String>> =
     Lazy::new(|| HashSet::from(["solana".to_string()]));
 
+pub fn resolve_target_assets<I>(assets: I) -> anyhow::Result<HashSet<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut resolved = HashSet::new();
+    let mut unknown = Vec::new();
+
+    for asset in assets {
+        let trimmed = asset.trim().to_lowercase();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(info) = ASSETS_BY_PREFIX
+            .get(&trimmed)
+            .or_else(|| ASSETS_BY_NAME.get(&trimmed))
+        {
+            resolved.insert(info.asset.clone());
+        } else {
+            unknown.push(asset);
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Unknown asset(s): {}",
+            unknown.join(", ")
+        ));
+    }
+
+    Ok(resolved)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub dry_run: bool,
@@ -75,11 +108,7 @@ impl Config {
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
         let target_assets = match std::env::var("TARGET_ASSETS") {
-            Ok(v) => v
-                .split(',')
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            Ok(v) => resolve_target_assets(v.split(',').map(|s| s.to_string()))?,
             Err(_) => TARGET_ASSETS.clone(),
         };
 

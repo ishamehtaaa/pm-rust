@@ -365,25 +365,13 @@ impl LedgerActor {
                     }
                 }
             } else {
-                // Order not in remote - optimistically assume complete, then verify by ID
+                // Order not in remote - verify by ID before changing state
                 if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
                     if tracked.is_open && !tracked.assumed_complete {
-                        let remaining = tracked.original_size - tracked.filled_size;
-                        if remaining > Decimal::ZERO {
-                            warn!(
-                                order_id = %short_id(&order_id, 8),
-                                remaining = %remaining,
-                                "Order not in remote, assuming filled"
-                            );
-
-                            let pos = self.positions.entry(tracked.market_id.clone()).or_default();
-                            match tracked.side {
-                                MarketSide::Up => pos.up_shares += remaining,
-                                MarketSide::Down => pos.down_shares += remaining,
-                            }
-                            tracked.filled_size = tracked.original_size;
-                        }
-                        tracked.is_open = false;
+                        warn!(
+                            order_id = %short_id(&order_id, 8),
+                            "Order not in remote, scheduling order lookup"
+                        );
                         tracked.assumed_complete = true;
                     } else if tracked.is_open {
                         debug!(

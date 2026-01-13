@@ -116,7 +116,7 @@ impl LadderEngine {
             target
         };
 
-        // 1. Cancel orders on sides that are at/over target
+        /* for both sides, if we are over, then cancel all pending orders. */
         if position.up_shares >= desired_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 plan.cancellations.push(order.order_id.clone());
@@ -129,14 +129,14 @@ impl LadderEngine {
             }
         }
 
-        // 2. Cancel only truly stale orders
+        /* only cancel actually stale orders */
         for order_id in self.find_stale_orders(up_ask, down_ask, open_orders) {
             if !plan.cancellations.contains(&order_id) {
                 plan.cancellations.push(order_id);
             }
         }
 
-        // 3. Find price levels already covered by non-cancelled orders
+        /* find the price levels that are already covered by open orders. */
         let covered_up: HashSet<Decimal> = open_orders
             .iter()
             .filter(|o| o.side == MarketSide::Up && !plan.cancellations.contains(&o.order_id))
@@ -149,7 +149,7 @@ impl LadderEngine {
             .map(|o| o.price)
             .collect();
 
-        // 4. Calculate pending after cancellations
+        /* calculate the pending room we have after cancellations */
         let cancelled_up: Decimal = open_orders
             .iter()
             .filter(|o| o.side == MarketSide::Up && plan.cancellations.contains(&o.order_id))
