@@ -2,40 +2,33 @@ use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
-
-pub static PAUSED_ASSETS: Lazy<HashSet<&'static str>> = Lazy::new(|| HashSet::from(["ethereum"]));
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
     pub asset: String,
     pub prefixes: Vec<String>,
-    pub chainlink: String,
-    pub binance: String,
 }
 
-pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str], &str, &str)>> = Lazy::new(|| {
+pub static ASSET_CONFIG: Lazy<Vec<(&str, &[&str])>> = Lazy::new(|| {
     vec![
-        ("bitcoin", &["btc", "bitcoin"], "btc/usd", "btcusdt"),
-        ("ethereum", &["eth", "ethereum"], "eth/usd", "ethusdt"),
-        ("solana", &["sol", "solana"], "sol/usd", "solusdt"),
-        ("xrp", &["xrp"], "xrp/usd", "xrpusdt"),
+        ("bitcoin", &["btc", "bitcoin"]),
+        ("ethereum", &["eth", "ethereum"]),
+        ("solana", &["sol", "solana"]),
+        ("xrp", &["xrp", "xrp"]),
     ]
 });
 
 pub static ASSETS_BY_NAME: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     ASSET_CONFIG
         .iter()
-        .map(|(asset, prefixes, chainlink, binance)| {
+        .map(|(asset, prefixes)| {
             (
                 asset.to_string(),
                 AssetInfo {
                     asset: asset.to_string(),
                     prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
-                    chainlink: chainlink.to_string(),
-                    binance: binance.to_string(),
                 },
             )
         })
@@ -52,27 +45,40 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
     map
 });
 
-#[derive(Debug, Clone)]
-pub struct LeggingConfig {
-    pub target_combined: Decimal,
-    pub taker_buffer: Decimal,
-    pub requote_threshold: Decimal,
-    pub shares_per_trade: Decimal,
-    pub max_shares_per_market: Decimal,
-    pub max_levels: usize,
-}
+pub static TARGET_ASSETS: Lazy<HashSet<String>> =
+    Lazy::new(|| HashSet::from(["solana".to_string()]));
 
-impl Default for LeggingConfig {
-    fn default() -> Self {
-        Self {
-            target_combined: dec!(0.97),
-            taker_buffer: dec!(0.01),
-            requote_threshold: dec!(0.01),
-            shares_per_trade: dec!(8.0),
-            max_shares_per_market: dec!(100.0),
-            max_levels: 5,
+pub fn resolve_target_assets<I>(assets: I) -> anyhow::Result<HashSet<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut resolved = HashSet::new();
+    let mut unknown = Vec::new();
+
+    for asset in assets {
+        let trimmed = asset.trim().to_lowercase();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(info) = ASSETS_BY_PREFIX
+            .get(&trimmed)
+            .or_else(|| ASSETS_BY_NAME.get(&trimmed))
+        {
+            resolved.insert(info.asset.clone());
+        } else {
+            unknown.push(asset);
         }
     }
+
+    if !unknown.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Unknown asset(s): {}",
+            unknown.join(", ")
+        ));
+    }
+
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone)]
@@ -81,58 +87,115 @@ pub struct Config {
     pub polymarket_private_key: String,
     pub polymarket_proxy_address: String,
     pub target_assets: HashSet<String>,
-    pub legging_config: LeggingConfig,
+    pub shares_target_per_side: Decimal,
+    pub order_size: Decimal,
+    pub target_total_cost: Decimal,
+    pub maker_price_offset: Decimal,
+    pub max_price_age_ms: i64,
+    pub cooldown_secs: u64,
+    /// Arb threshold: trigger when combined ask (up + down) is below this
+    pub arb_threshold: Decimal,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let dry_run = std::env::var("DRY_RUN")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         let polymarket_private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
             .map_err(|_| anyhow::anyhow!("POLYMARKET_PRIVATE_KEY env var is required"))?;
 
         let polymarket_proxy_address =
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
-        // Optional env override: POLYMARKET_ASSETS=btc,eth
-        let target_assets = match std::env::var("POLYMARKET_ASSETS") {
-            Ok(v) => parse_assets(&v)?,
-            Err(_) => HashSet::from(["bitcoin".to_string()]), // sane default
+        let target_assets = match std::env::var("TARGET_ASSETS") {
+            Ok(v) => resolve_target_assets(v.split(',').map(|s| s.to_string()))?,
+            Err(_) => TARGET_ASSETS.clone(),
         };
 
-        let mut legging_config = LeggingConfig::default();
-        if let Ok(value) = std::env::var("POLYMARKET_MAX_SHARES_PER_MARKET") {
-            let parsed = Decimal::from_str(&value)
-                .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_MAX_SHARES_PER_MARKET: {}", e))?;
-            legging_config.max_shares_per_market = parsed;
+        let shares_target_per_side = parse_decimal_env("SHARES_TARGET_PER_SIDE", dec!(25))?;
+        let order_size = parse_decimal_env("ORDER_SIZE", dec!(5))?;
+        let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
+        let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
+        let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
+        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 1)?;  // 1s cooldown - fast for arb
+        let arb_threshold = parse_decimal_env("ARB_THRESHOLD", dec!(0.98))?;  // Trigger when combined < 0.98
+
+        if shares_target_per_side <= Decimal::ZERO {
+            return Err(anyhow::anyhow!(
+                "SHARES_TARGET_PER_SIDE must be > 0, got {}",
+                shares_target_per_side
+            ));
+        }
+        if order_size <= Decimal::ZERO {
+            return Err(anyhow::anyhow!(
+                "ORDER_SIZE must be > 0, got {}",
+                order_size
+            ));
+        }
+        if target_total_cost <= Decimal::ZERO || target_total_cost >= dec!(1.00) {
+            return Err(anyhow::anyhow!(
+                "TARGET_TOTAL_COST must be in (0, 1.00), got {}",
+                target_total_cost
+            ));
+        }
+        if maker_price_offset < Decimal::ZERO {
+            return Err(anyhow::anyhow!(
+                "MAKER_PRICE_OFFSET must be >= 0, got {}",
+                maker_price_offset
+            ));
+        }
+        if max_price_age_ms <= 0 {
+            return Err(anyhow::anyhow!(
+                "MAX_PRICE_AGE_MS must be > 0, got {}",
+                max_price_age_ms
+            ));
+        }
+        if arb_threshold <= Decimal::ZERO || arb_threshold >= dec!(1.00) {
+            return Err(anyhow::anyhow!(
+                "ARB_THRESHOLD must be in (0, 1.00), got {}",
+                arb_threshold
+            ));
         }
 
         Ok(Self {
-            dry_run: false,
+            dry_run,
             polymarket_private_key,
             polymarket_proxy_address,
             target_assets,
-            legging_config,
+            shares_target_per_side,
+            order_size,
+            target_total_cost,
+            maker_price_offset,
+            max_price_age_ms,
+            cooldown_secs,
+            arb_threshold,
         })
     }
 }
 
-/// Normalize + validate asset list from CLI or env
-pub fn parse_assets(input: &str) -> anyhow::Result<HashSet<String>> {
-    let mut assets = HashSet::new();
-
-    for raw in input.split(',') {
-        let key = raw.trim().to_lowercase();
-
-        let info = ASSETS_BY_PREFIX
-            .get(&key)
-            .or_else(|| ASSETS_BY_NAME.get(&key))
-            .ok_or_else(|| anyhow::anyhow!("Unsupported asset: {}", raw))?;
-
-        if PAUSED_ASSETS.contains(info.asset.as_str()) {
-            anyhow::bail!("Asset is paused: {}", info.asset);
-        }
-
-        assets.insert(info.asset.clone());
+fn parse_decimal_env(key: &str, default: Decimal) -> anyhow::Result<Decimal> {
+    match std::env::var(key) {
+        Ok(v) => Decimal::from_str_exact(&v).map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
+        Err(_) => Ok(default),
     }
+}
 
-    Ok(assets)
+fn parse_i64_env(key: &str, default: i64) -> anyhow::Result<i64> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<i64>()
+            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_u64_env(key: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
+        Err(_) => Ok(default),
+    }
 }

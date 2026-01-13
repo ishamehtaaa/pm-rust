@@ -1,13 +1,14 @@
 use clap::Parser;
-use polymarket::config::{Config, parse_assets};
-use polymarket::legging::LeggingBot;
-use rust_decimal::Decimal;
-use std::str::FromStr;
-use tracing_subscriber::{EnvFilter, fmt};
+use polymarket::bot::SimpleBot;
+use polymarket::config::{Config, resolve_target_assets};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::time::ChronoLocal,
+};
 
 #[derive(Parser)]
 #[command(name = "polymarket-arb")]
-#[command(about = "Polymarket high-frequency legging bot")]
+#[command(about = "Polymarket arbitrage bot")]
 struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -18,110 +19,63 @@ struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        num_args = 1..,
-        help = "Comma-separated list of assets to monitor (prefixes or names)"
+        help = "Comma-separated asset names or prefixes to target"
     )]
-    target_assets: Vec<String>,
-
-    #[arg(long, help = "Max ladder levels per side", value_parser = clap::value_parser!(usize))]
-    max_levels: Option<usize>,
-
-    #[arg(
-        long,
-        help = "Share size per ladder order",
-        value_parser = parse_decimal
-    )]
-    shares_per_trade: Option<Decimal>,
-
-    #[arg(
-        long,
-        help = "Max shares (per side) allowed before the trailing side triggers rebalancing",
-        value_parser = parse_decimal
-    )]
-    max_shares_per_market: Option<Decimal>,
-}
-
-fn parse_decimal(value: &str) -> Result<Decimal, String> {
-    Decimal::from_str(value).map_err(|err| format!("invalid decimal value: {}", err))
+    assets: Option<Vec<String>>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
 
-    // Initialize logging with tracing-subscriber
-    let mut filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    filter = filter
-        .add_directive("hyper_util::client::legacy::pool=warn".parse().unwrap())
-        .add_directive("tungstenite::handshake::client=warn".parse().unwrap());
-    fmt().with_env_filter(filter).init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(&args.log_level)
+            .add_directive("hyper_util=warn".parse().unwrap())
+            .add_directive("h2=warn".parse().unwrap())
+            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("reqwest=info".parse().unwrap())
+            .add_directive("tungstenite=warn".parse().unwrap())
+            .add_directive("tokio_tungstenite=warn".parse().unwrap())
+    });
 
-    // Load configuration from environment
     let mut config = Config::from_env()?;
+    config.dry_run = args.dry_run;
 
-    // Command-line flag takes precedence for dry-run mode
-    if args.dry_run {
-        config.dry_run = true;
+    if let Some(assets) = args.assets {
+        let resolved = resolve_target_assets(assets)?;
+        if resolved.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No valid assets provided via --assets"
+            ));
+        }
+        config.target_assets = resolved;
     }
 
-    let filtered_assets: Vec<&str> = args
-        .target_assets
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !filtered_assets.is_empty() {
-        let normalized = filtered_assets.join(",");
-        config.target_assets = parse_assets(&normalized)?;
-    }
-
-    if let Some(max_levels) = args.max_levels {
-        config.legging_config.max_levels = max_levels;
-    }
-
-    if let Some(shares_per_trade) = args.shares_per_trade {
-        config.legging_config.shares_per_trade = shares_per_trade;
-    }
-
-    if let Some(max_shares_per_market) = args.max_shares_per_market {
-        config.legging_config.max_shares_per_market = max_shares_per_market;
-    }
+    /* Initialize the logger with a custom timestamp and quieting noisy logs. */
+    tracing_subscriber::fmt()
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
+        .with_env_filter(filter)
+        .init();
 
     tracing::info!(
-        "Starting Powerful Polymarket Bot (dry_run={}, targets={:?})",
+        "Starting Polymarket bot (dry_run={}, targets={:?})",
         config.dry_run,
         config.target_assets
     );
 
-    // Initialize the bot
-    let mut bot = LeggingBot::new(config).await?;
-
-    // Discover initial markets
+    let mut bot = SimpleBot::new(config).await?;
     bot.discover_markets().await;
 
     if bot.market_count() == 0 {
-        tracing::warn!(
-            "No active markets discovered during startup. Will keep searching in the background."
-        );
+        tracing::warn!("No markets discovered, will retry in main loop");
     }
 
-    // Log the initial state of discovered markets
     for (market_id, state) in bot.markets() {
-        tracing::info!(
-            "Monitored Market: {} | {} | Asset: {} | End: {}",
-            market_id,
-            state.info.slug,
-            state.info.asset,
-            state.info.end_time
-        );
+        tracing::info!("Market: {} | {}", state.asset, market_id);
     }
 
-    // Start the high-frequency trading loop
-    // This calls the scan_markets method and manages the WS/REST event loop
     bot.run().await;
 
     Ok(())
