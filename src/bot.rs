@@ -834,13 +834,16 @@ impl SimpleBot {
 
                         match client.cancel_orders(&order_id_refs).await {
                             Ok(response) => {
-                                if !response.canceled.is_empty() {
+                                let cancelled_count = response.canceled.len();
+                                let not_cancelled_count = response.not_canceled.len();
+
+                                if cancelled_count > 0 {
                                     ledger.mark_orders_cancelled(response.canceled).await;
                                 }
                                 debug!(
                                     market_id = %market_id,
-                                    cancelled = response.canceled.len(),
-                                    not_cancelled = response.not_canceled.len(),
+                                    cancelled = cancelled_count,
+                                    not_cancelled = not_cancelled_count,
                                     "Auto-cancelled lingering arb orders"
                                 );
                             }
