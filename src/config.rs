@@ -46,7 +46,7 @@ pub static ASSETS_BY_PREFIX: Lazy<HashMap<String, AssetInfo>> = Lazy::new(|| {
 });
 
 pub static TARGET_ASSETS: Lazy<HashSet<String>> =
-    Lazy::new(|| HashSet::from(["bitcoin".to_string()]));
+    Lazy::new(|| HashSet::from(["solana".to_string()]));
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -97,7 +97,10 @@ impl Config {
             ));
         }
         if order_size <= Decimal::ZERO {
-            return Err(anyhow::anyhow!("ORDER_SIZE must be > 0, got {}", order_size));
+            return Err(anyhow::anyhow!(
+                "ORDER_SIZE must be > 0, got {}",
+                order_size
+            ));
         }
         if target_total_cost <= Decimal::ZERO || target_total_cost >= dec!(1.00) {
             return Err(anyhow::anyhow!(
@@ -135,8 +138,7 @@ impl Config {
 
 fn parse_decimal_env(key: &str, default: Decimal) -> anyhow::Result<Decimal> {
     match std::env::var(key) {
-        Ok(v) => Decimal::from_str_exact(&v)
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
+        Ok(v) => Decimal::from_str_exact(&v).map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
         Err(_) => Ok(default),
     }
 }
