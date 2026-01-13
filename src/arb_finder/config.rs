@@ -99,8 +99,8 @@ impl Default for ArbFinderConfig {
             velocity_threshold: dec!(0.02), // 2% per second
             velocity_window: Duration::from_secs(1),
 
-            // REST polling
-            rest_poll_interval: Duration::from_millis(100),
+            // REST polling - faster to catch fleeting opportunities
+            rest_poll_interval: Duration::from_millis(50),
             rest_ws_discrepancy_threshold: dec!(0.01),
 
             // Confidence - lower thresholds to act faster on signals

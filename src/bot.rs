@@ -441,14 +441,32 @@ impl SimpleBot {
                     prediction.confidence,
                 );
 
-                // Get prices from prediction (these come from cross-product scan)
+                // Get prices from prediction (these come from actual book prices now)
                 let (up_price, down_price) = match (
                     prediction.up_target_price,
                     prediction.down_target_price,
                 ) {
                     (Some(u), Some(d)) => (u, d),
-                    _ => continue,
+                    _ => {
+                        debug!(market_id = %prediction.market_id, "No target prices in prediction");
+                        continue;
+                    }
                 };
+                
+                let combined = up_price + down_price;
+                
+                // CRITICAL: Only execute if combined < 1.0 (actual profit exists!)
+                // Don't place orders that sum to >= $1.00
+                if combined >= dec!(0.99) {
+                    debug!(
+                        market_id = %prediction.market_id,
+                        up_price = %up_price,
+                        down_price = %down_price,
+                        combined = %combined,
+                        "Skipping - combined price too high, no profit"
+                    );
+                    continue;
+                }
                 
                 // Use the executable size from the prediction if available
                 let exec_size = prediction.executable_size
@@ -465,7 +483,6 @@ impl SimpleBot {
                     continue;
                 }
 
-                let combined = up_price + down_price;
                 let profit_per_share = Decimal::ONE - combined;
                 
                 // Use FOK only for confirmed arbs (confidence = 1.0) where we KNOW liquidity exists

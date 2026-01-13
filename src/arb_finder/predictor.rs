@@ -176,19 +176,33 @@ impl ArbPredictor {
         (weighted_sum / weight_total).min(dec!(1.0))
     }
 
-    /// Calculate target prices - USE ACTUAL BOOK PRICES
-    /// Don't calculate theoretical prices - hit what's actually there!
+    /// Calculate target prices by scanning ALL book levels for best combination
+    /// Not just top-of-book - look for profitable combinations at any depth
     fn calculate_target_prices(
         &self,
         state: &MarketState,
         _signals: &[Signal],
     ) -> (Option<Decimal>, Option<Decimal>) {
-        // AGGRESSIVE: Use actual best asks from the book
-        // If there's cheap liquidity, we want to HIT IT, not calculate some adjusted price
-        let up_target = state.up.best_ask();
-        let down_target = state.down.best_ask();
-
-        (up_target, down_target)
+        // Scan the FULL book for the best profitable combination
+        // This finds opportunities like: Up @ 45¢ (level 3) + Down @ 48¢ (level 2) = 93¢
+        let opportunities = state.find_arb_opportunities(self.config.arb_threshold);
+        
+        if let Some(best) = opportunities.first() {
+            // Found a profitable combination in the book!
+            return (Some(best.up_price), Some(best.down_price));
+        }
+        
+        // No profitable combination found - try near-threshold prices
+        // Look for the minimum combined price in the book
+        if let Some(min_combined) = state.min_combined() {
+            // If we're close to threshold, use actual best asks
+            if min_combined < dec!(1.02) {
+                return (state.up.min_ask(), state.down.min_ask());
+            }
+        }
+        
+        // Fallback to best asks (top of book)
+        (state.up.best_ask(), state.down.best_ask())
     }
 }
 
