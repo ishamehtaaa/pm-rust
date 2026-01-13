@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::constants::{round_size, short_id};
 use crate::ladder::OpenOrderInfo;
+use crate::pair_tracker::PairTracker;
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
@@ -117,6 +118,8 @@ struct LedgerActor {
     tracked_orders: HashMap<String, TrackedOrder>,
     /// Maps token_id -> (market_id, side) for fast lookup from WS messages
     token_to_market: HashMap<String, (String, MarketSide)>,
+    /// Tracks paired positions and P&L
+    pair_tracker: PairTracker,
 }
 
 impl LedgerActor {
@@ -125,6 +128,7 @@ impl LedgerActor {
             positions: HashMap::new(),
             tracked_orders: HashMap::new(),
             token_to_market: HashMap::new(),
+            pair_tracker: PairTracker::new(),
         }
     }
 
@@ -239,7 +243,7 @@ impl LedgerActor {
                     if let Some(actual_filled) = filled_size {
                         let fill_delta = actual_filled - tracked.filled_size;
 
-                        if fill_delta != Decimal::ZERO {
+                        if fill_delta > Decimal::ZERO {
                             warn!(
                                 order_id = %short_id(&order_id, 8),
                                 fill_delta = %fill_delta,
@@ -251,6 +255,15 @@ impl LedgerActor {
                                 MarketSide::Up => pos.up_shares += fill_delta,
                                 MarketSide::Down => pos.down_shares += fill_delta,
                             }
+                            
+                            // Track the fill for pair P&L
+                            self.pair_tracker.record_fill(
+                                &tracked.market_id,
+                                tracked.side,
+                                fill_delta,
+                                tracked.price,
+                            );
+                            
                             tracked.filled_size = actual_filled;
                         }
                     }
@@ -298,6 +311,15 @@ impl LedgerActor {
                         MarketSide::Up => pos.up_shares += fill_delta,
                         MarketSide::Down => pos.down_shares += fill_delta,
                     }
+                    
+                    // Track the fill for pair P&L
+                    self.pair_tracker.record_fill(
+                        &tracked.market_id,
+                        tracked.side,
+                        fill_delta,
+                        tracked.price,
+                    );
+                    
                     tracked.filled_size = size_matched;
                 }
             }
@@ -356,6 +378,15 @@ impl LedgerActor {
                             MarketSide::Up => pos.up_shares += fill_delta,
                             MarketSide::Down => pos.down_shares += fill_delta,
                         }
+                        
+                        // Track the fill for pair P&L
+                        self.pair_tracker.record_fill(
+                            &tracked.market_id,
+                            tracked.side,
+                            fill_delta,
+                            tracked.price,
+                        );
+                        
                         tracked.filled_size = remote.size_matched;
                     }
 

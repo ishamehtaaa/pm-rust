@@ -31,7 +31,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(200);
+const LOOP_DELAY: Duration = Duration::from_millis(500);  // Slower loop - less churn
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const PREFETCH_CONCURRENCY: usize = 6;
 const SIGN_CONCURRENCY: usize = 4;

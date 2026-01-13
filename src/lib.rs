@@ -7,3 +7,4 @@ pub mod poller;
 pub mod ladder;
 pub mod constants;
 pub mod clob_api;
+pub mod pair_tracker;

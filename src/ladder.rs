@@ -24,13 +24,13 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 3,
-            spacing: dec!(0.01),
-            size_per_level: dec!(5),
-            top_offset: dec!(0.01),
-            target_per_side: dec!(25),
-            reladder_threshold: dec!(0.01),
-            stale_order_distance: dec!(0.12),
+            levels: 2,                        // Only 2 levels - minimal
+            spacing: dec!(0.01),              // 1¢ between levels
+            size_per_level: dec!(10),         // Larger size per level
+            top_offset: dec!(0.005),          // Half-cent below ask - very close!
+            target_per_side: dec!(20),        // 20 shares per side (2 orders × 10)
+            reladder_threshold: dec!(0.05),   // Only reladder if price moves 5¢ - STICKY
+            stale_order_distance: dec!(0.15), // Only cancel if 15¢ away - very tolerant
         }
     }
 }

@@ -117,7 +117,7 @@ impl Config {
         let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
         let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
         let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
-        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 2)?;
+        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 10)?;  // 10s cooldown - let orders sit
 
         if shares_target_per_side <= Decimal::ZERO {
             return Err(anyhow::anyhow!(
