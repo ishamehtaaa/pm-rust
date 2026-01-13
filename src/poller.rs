@@ -8,7 +8,6 @@ use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::ws::types::response::OrderMessage;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,8 +16,16 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::constants::{round_size, short_id};
-use crate::ladder::OpenOrderInfo;
 use crate::pair_tracker::PairTracker;
+
+/// Info about an open order (used for tracking state)
+#[derive(Debug, Clone)]
+pub struct OpenOrderInfo {
+    pub order_id: String,
+    pub side: MarketSide,
+    pub price: Decimal,
+    pub remaining_size: Decimal,
+}
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
@@ -65,16 +72,6 @@ pub enum LedgerCommand {
         filled_size: Option<Decimal>,
         still_open: Option<bool>,
     },
-    /// Request locked pairs for a market
-    GetLockedPairs {
-        market_id: String,
-        reply: tokio::sync::oneshot::Sender<Decimal>,
-    },
-    /// Request max hedge prices (to avoid unprofitable chasing)
-    GetMaxHedgePrices {
-        market_id: String,
-        reply: tokio::sync::oneshot::Sender<(Option<Decimal>, Option<Decimal>)>, // (max_up, max_down)
-    },
 }
 
 /// Snapshot of ledger state for a market
@@ -106,6 +103,7 @@ pub struct MarketPosition {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TrackedOrder {
     order_id: String,
     token_id: String,
@@ -120,28 +118,11 @@ struct TrackedOrder {
     first_update_logged: bool,
 }
 
-/// Round-based trading configuration
-#[derive(Debug, Clone)]
-pub struct RoundConfig {
-    pub shares_per_round: Decimal,
-    pub max_rounds: usize,
-    pub max_unpaired: Decimal,
-}
-
-impl Default for RoundConfig {
-    fn default() -> Self {
-        Self {
-            shares_per_round: Decimal::new(20, 0),  // 20 shares per round
-            max_rounds: 5,
-            max_unpaired: Decimal::new(25, 0),  // Max 25 unpaired
-        }
-    }
-}
-
 /// The single source of truth for inventory.
 ///
 /// All mutations go through the command channel, ensuring serialized access.
 /// The WebSocket stream feeds updates directly here.
+#[allow(dead_code)]
 struct LedgerActor {
     positions: HashMap<String, MarketPosition>,
     tracked_orders: HashMap<String, TrackedOrder>,
@@ -149,8 +130,6 @@ struct LedgerActor {
     token_to_market: HashMap<String, (String, MarketSide)>,
     /// Tracks paired positions and P&L
     pair_tracker: PairTracker,
-    /// Round configuration
-    round_config: RoundConfig,
 }
 
 impl LedgerActor {
@@ -160,10 +139,10 @@ impl LedgerActor {
             tracked_orders: HashMap::new(),
             token_to_market: HashMap::new(),
             pair_tracker: PairTracker::new(),
-            round_config: RoundConfig::default(),
         }
     }
 
+    #[allow(dead_code)]
     fn register_market(&mut self, market: &MarketTokens) {
         self.token_to_market.insert(
             market.up_token_id.clone(),
@@ -294,8 +273,6 @@ impl LedgerActor {
                                 tracked.side,
                                 fill_delta,
                                 tracked.price,
-                                self.round_config.shares_per_round,
-                                self.round_config.max_rounds,
                             );
                             
                             tracked.filled_size = actual_filled;
@@ -307,36 +284,6 @@ impl LedgerActor {
                     }
                     tracked.assumed_complete = false;
                 }
-            }
-
-            LedgerCommand::GetLockedPairs { market_id, reply } => {
-                let locked = self
-                    .pair_tracker
-                    .get_state(&market_id)
-                    .map(|s| s.locked_pairs)
-                    .unwrap_or(Decimal::ZERO);
-                let _ = reply.send(locked);
-            }
-            LedgerCommand::GetMaxHedgePrices { market_id, reply } => {
-                let (max_up, max_down) = if let Some(state) = self.pair_tracker.get_state(&market_id) {
-                    let round = &state.current_round;
-                    // If we have unpaired Down shares, we need Up at a good price
-                    let max_up = if round.unpaired_down() > dec!(0.5) {
-                        Some(round.max_price_for_hedge(MarketSide::Down))
-                    } else {
-                        None
-                    };
-                    // If we have unpaired Up shares, we need Down at a good price
-                    let max_down = if round.unpaired_up() > dec!(0.5) {
-                        Some(round.max_price_for_hedge(MarketSide::Up))
-                    } else {
-                        None
-                    };
-                    (max_up, max_down)
-                } else {
-                    (None, None)
-                };
-                let _ = reply.send((max_up, max_down));
             }
         }
     }
@@ -382,8 +329,6 @@ impl LedgerActor {
                         tracked.side,
                         fill_delta,
                         tracked.price,
-                        self.round_config.shares_per_round,
-                        self.round_config.max_rounds,
                     );
                     
                     tracked.filled_size = size_matched;
@@ -451,8 +396,6 @@ impl LedgerActor {
                             tracked.side,
                             fill_delta,
                             tracked.price,
-                            self.round_config.shares_per_round,
-                            self.round_config.max_rounds,
                         );
                         
                         tracked.filled_size = remote.size_matched;
@@ -615,33 +558,6 @@ impl LedgerHandle {
                 still_open,
             })
             .await;
-    }
-
-    /// Get locked pairs for a market (from completed rounds)
-    pub async fn get_locked_pairs(&self, market_id: &str) -> Decimal {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .tx
-            .send(LedgerCommand::GetLockedPairs {
-                market_id: market_id.to_string(),
-                reply: reply_tx,
-            })
-            .await;
-        reply_rx.await.unwrap_or(Decimal::ZERO)
-    }
-
-    /// Get max hedge prices to avoid chasing unprofitable fills
-    /// Returns (max_up_price, max_down_price) - None if no constraint
-    pub async fn get_max_hedge_prices(&self, market_id: &str) -> (Option<Decimal>, Option<Decimal>) {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .tx
-            .send(LedgerCommand::GetMaxHedgePrices {
-                market_id: market_id.to_string(),
-                reply: reply_tx,
-            })
-            .await;
-        reply_rx.await.unwrap_or((None, None))
     }
 }
 

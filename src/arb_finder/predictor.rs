@@ -1,0 +1,226 @@
+// arb_finder/predictor.rs
+//
+// Combines signals into predictions about upcoming arb opportunities.
+// Now uses cross-product scanning of full order book depth.
+
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::time::Instant;
+use tracing::{debug, info};
+
+use super::config::ArbFinderConfig;
+use super::market_state::MarketState;
+use super::signals::{Signal, SignalDetector, SignalType};
+
+/// A prediction about an upcoming arb opportunity
+#[derive(Debug, Clone)]
+pub struct ArbPrediction {
+    pub market_id: String,
+    pub confidence: Decimal,
+    pub signals: Vec<Signal>,
+    pub recommended_action: RecommendedAction,
+    pub up_target_price: Option<Decimal>,
+    pub down_target_price: Option<Decimal>,
+    /// The size we can execute at these prices
+    pub executable_size: Option<Decimal>,
+    /// Profit per share if we execute
+    pub profit_per_share: Option<Decimal>,
+    pub timestamp: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecommendedAction {
+    /// Do nothing, confidence too low
+    Wait,
+    /// Place limit orders at favorable prices (pre-position)
+    PrePosition,
+    /// Execute immediately with IOC/market orders
+    ExecuteNow,
+}
+
+/// Combines signals into predictions
+pub struct ArbPredictor {
+    config: ArbFinderConfig,
+    signal_detector: SignalDetector,
+}
+
+impl ArbPredictor {
+    pub fn new(config: ArbFinderConfig) -> Self {
+        let signal_detector = SignalDetector::new(config.clone());
+        Self {
+            config,
+            signal_detector,
+        }
+    }
+
+    /// Analyze market state and generate prediction
+    /// Now uses cross-product scanning of ALL order book levels
+    pub fn predict(&self, state: &MarketState) -> Option<ArbPrediction> {
+        // CRITICAL: Scan ALL price levels for arb opportunities, not just top-of-book
+        let opportunities = state.find_arb_opportunities(self.config.arb_threshold);
+        
+        if !opportunities.is_empty() {
+            // Found direct arb opportunity in the book!
+            let best = &opportunities[0];
+            
+            info!(
+                market_id = %state.market_id,
+                up_price = %best.up_price,
+                down_price = %best.down_price,
+                combined = %best.combined,
+                max_size = %best.max_size,
+                profit_per_share = %best.profit_per_share,
+                total_opportunities = opportunities.len(),
+                "🎯 ARB OPPORTUNITY FOUND in order book!"
+            );
+            
+            return Some(ArbPrediction {
+                market_id: state.market_id.clone(),
+                confidence: dec!(1.0),
+                signals: vec![],
+                recommended_action: RecommendedAction::ExecuteNow,
+                up_target_price: Some(best.up_price),
+                down_target_price: Some(best.down_price),
+                executable_size: Some(best.max_size),
+                profit_per_share: Some(best.profit_per_share),
+                timestamp: Instant::now(),
+            });
+        }
+        
+        // Log the current best combined price for debugging
+        if let Some(min_combined) = state.min_combined() {
+            let distance_to_arb = min_combined - self.config.arb_threshold;
+            if distance_to_arb < dec!(0.05) {
+                debug!(
+                    market_id = %state.market_id,
+                    min_combined = %min_combined,
+                    threshold = %self.config.arb_threshold,
+                    distance = %distance_to_arb,
+                    "Getting close to arb threshold"
+                );
+            }
+        }
+
+        // Detect signals for predictive positioning
+        let signals = self.signal_detector.detect_signals(state);
+
+        if signals.is_empty() {
+            return None;
+        }
+
+        // Calculate confidence from signals
+        let confidence = self.calculate_confidence(&signals);
+
+        // Determine recommended action based on confidence
+        let recommended_action = if confidence >= self.config.aggressive_confidence {
+            RecommendedAction::ExecuteNow
+        } else if confidence >= self.config.pre_position_confidence {
+            RecommendedAction::PrePosition
+        } else {
+            RecommendedAction::Wait
+        };
+
+        // Calculate target prices for pre-positioning
+        let (up_target, down_target) = self.calculate_target_prices(state, &signals);
+
+        // Only return prediction if action is recommended
+        if recommended_action == RecommendedAction::Wait {
+            return None;
+        }
+
+        // Only log ExecuteNow at info level - PrePosition is too frequent
+        if recommended_action == RecommendedAction::ExecuteNow {
+            info!(
+                market_id = %state.market_id,
+                confidence = %confidence,
+                signal_count = signals.len(),
+                "Signal-based arb prediction: ExecuteNow"
+            );
+        } else {
+            debug!(
+                market_id = %state.market_id,
+                confidence = %confidence,
+                action = ?recommended_action,
+                signal_count = signals.len(),
+                "Arb prediction generated"
+            );
+        }
+
+        Some(ArbPrediction {
+            market_id: state.market_id.clone(),
+            confidence,
+            signals,
+            recommended_action,
+            up_target_price: up_target,
+            down_target_price: down_target,
+            executable_size: None,
+            profit_per_share: None,
+            timestamp: Instant::now(),
+        })
+    }
+
+    /// Calculate confidence score from signals
+    fn calculate_confidence(&self, signals: &[Signal]) -> Decimal {
+        let mut weighted_sum = Decimal::ZERO;
+        let mut weight_total = Decimal::ZERO;
+
+        for signal in signals {
+            let weight = match signal.signal_type {
+                SignalType::Sweep => self.config.sweep_weight,
+                SignalType::Imbalance => self.config.imbalance_weight,
+                SignalType::Velocity => self.config.velocity_weight,
+                SignalType::Discrepancy => self.config.discrepancy_weight,
+            };
+
+            weighted_sum += signal.strength * weight;
+            weight_total += weight;
+        }
+
+        if weight_total == Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        // Normalize and cap at 1.0
+        (weighted_sum / weight_total).min(dec!(1.0))
+    }
+
+    /// Calculate target prices for pre-positioning
+    fn calculate_target_prices(
+        &self,
+        state: &MarketState,
+        _signals: &[Signal],
+    ) -> (Option<Decimal>, Option<Decimal>) {
+        // For pre-positioning, we want to place orders slightly below current ask
+        // These should be prices that would result in profitable arb if filled
+
+        let combined = state.combined_ask().unwrap_or(dec!(1.05));
+        let _profit_needed = dec!(1.0) - self.config.arb_threshold;
+
+        // Current overage from arb threshold
+        let overage = combined - self.config.arb_threshold;
+
+        // We need to shave off the overage + some buffer
+        let adjustment_per_side = overage / dec!(2.0) + dec!(0.005);
+
+        let up_target = state.up.best_ask().map(|p| (p - adjustment_per_side).max(dec!(0.01)));
+        let down_target = state.down.best_ask().map(|p| (p - adjustment_per_side).max(dec!(0.01)));
+
+        (up_target, down_target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_confidence_calculation() {
+        let config = ArbFinderConfig::default();
+        let predictor = ArbPredictor::new(config);
+
+        // Empty signals should give 0 confidence
+        let confidence = predictor.calculate_confidence(&[]);
+        assert_eq!(confidence, Decimal::ZERO);
+    }
+}
+

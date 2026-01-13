@@ -93,6 +93,8 @@ pub struct Config {
     pub maker_price_offset: Decimal,
     pub max_price_age_ms: i64,
     pub cooldown_secs: u64,
+    /// Arb threshold: trigger when combined ask (up + down) is below this
+    pub arb_threshold: Decimal,
 }
 
 impl Config {
@@ -117,7 +119,8 @@ impl Config {
         let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
         let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
         let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
-        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 10)?;  // 10s cooldown - let orders sit
+        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 1)?;  // 1s cooldown - fast for arb
+        let arb_threshold = parse_decimal_env("ARB_THRESHOLD", dec!(0.98))?;  // Trigger when combined < 0.98
 
         if shares_target_per_side <= Decimal::ZERO {
             return Err(anyhow::anyhow!(
@@ -149,6 +152,12 @@ impl Config {
                 max_price_age_ms
             ));
         }
+        if arb_threshold <= Decimal::ZERO || arb_threshold >= dec!(1.00) {
+            return Err(anyhow::anyhow!(
+                "ARB_THRESHOLD must be in (0, 1.00), got {}",
+                arb_threshold
+            ));
+        }
 
         Ok(Self {
             dry_run,
@@ -161,6 +170,7 @@ impl Config {
             maker_price_offset,
             max_price_age_ms,
             cooldown_secs,
+            arb_threshold,
         })
     }
 }

@@ -3,7 +3,7 @@ use polymarket::bot::SimpleBot;
 use polymarket::config::{Config, resolve_target_assets};
 use tracing_subscriber::{
     EnvFilter,
-    fmt::{self, time::ChronoLocal},
+    fmt::time::ChronoLocal,
 };
 
 #[derive(Parser)]

@@ -1,6 +1,8 @@
+use crate::arb_finder::{
+    ArbFinder, ArbFinderConfig, MarketInfo as ArbMarketInfo, RecommendedAction,
+};
 use crate::clob_api::fetch_token_balances;
 use crate::config::Config;
-use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::MarketInfo;
 use crate::poller::{
@@ -20,8 +22,8 @@ use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType, Signed
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
-use polymarket_client_sdk::ws::config::Config as WsConfig;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,10 +33,9 @@ use tracing::{debug, error, info, instrument, trace, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(500);  // Slower loop - less churn
+const LOOP_DELAY: Duration = Duration::from_millis(10);  // Fast loop for arb detection
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const PREFETCH_CONCURRENCY: usize = 6;
-const SIGN_CONCURRENCY: usize = 4;
 
 /// Consolidated view of a market we're trading
 #[derive(Clone)]
@@ -56,10 +57,6 @@ impl ActiveMarket {
             end_time: info.end_time,
         }
     }
-
-    fn token_ids(&self) -> [&str; 2] {
-        [&self.up_token_id, &self.down_token_id]
-    }
 }
 
 pub struct SimpleBot {
@@ -74,7 +71,7 @@ pub struct SimpleBot {
 
     /// Timing state
     last_market_refresh: Instant,
-    last_order_by_market: HashMap<String, Instant>,
+    last_arb_attempt: HashMap<String, Instant>,
 
     /// Single source of truth for inventory
     ledger: LedgerHandle,
@@ -87,15 +84,30 @@ pub struct SimpleBot {
     _price_feed: Option<tokio::task::JoinHandle<()>>,
     _reconciliation_poller: tokio::task::JoinHandle<()>,
 
-    /// Ladder strategy
-    ladder_engine: LadderEngine,
-    ladder_state: LadderState,
+    /// Cached tick sizes for fast order building (token_id -> tick_size)
+    tick_size_cache: Arc<RwLock<HashMap<String, Decimal>>>,
+
+    /// Predictive arb finder with cross-product scanning
+    arb_finder: ArbFinder,
+    
+    /// Track pending arb orders for timeout/cleanup
+    pending_arb_orders: Arc<RwLock<HashMap<String, PendingArbOrder>>>,
+}
+
+/// Tracks a pending arb order for timeout cleanup
+#[derive(Clone)]
+#[allow(dead_code)]
+struct PendingArbOrder {
+    order_id: String,
+    market_id: String,
+    side: MarketSide,
+    placed_at: Instant,
 }
 
 impl SimpleBot {
     #[instrument(skip(config), fields(target_assets = ?config.target_assets))]
     pub async fn new(config: Config) -> anyhow::Result<Self> {
-        info!("Initializing SimpleBot");
+        info!("Initializing SimpleBot (arb-focused)");
 
         let signer = PrivateKeySigner::from_str(&config.polymarket_private_key)
             .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
@@ -120,17 +132,21 @@ impl SimpleBot {
         );
 
         let ws_client = Arc::new(
-            WsClient::new(WS_SUB_URL, WsConfig::default())?.authenticate(credentials, addr)?,
+            WsClient::new(WS_SUB_URL, Default::default())?.authenticate(credentials, addr)?,
         );
 
         // Spawn ledger actor - single source of truth
         let ledger = spawn_ledger_actor();
 
-        // HTTP reconciliation as backup (every 3s for faster fill detection)
+        // HTTP reconciliation as backup (every 10s)
         let reconciliation_poller =
-            spawn_reconciliation_poller(client.clone(), ledger.clone(), Duration::from_secs(3));
+            spawn_reconciliation_poller(client.clone(), ledger.clone(), Duration::from_secs(10));
 
         let target_assets = config.target_assets.clone();
+
+        // Initialize arb finder with its own config
+        let arb_finder_config = ArbFinderConfig::from_env();
+        let arb_finder = ArbFinder::new(arb_finder_config);
 
         Ok(Self {
             config,
@@ -140,14 +156,15 @@ impl SimpleBot {
             market_cache: MarketCache::new(target_assets),
             markets: HashMap::new(),
             last_market_refresh: Instant::now(),
-            last_order_by_market: HashMap::new(),
+            last_arb_attempt: HashMap::new(),
             ledger,
             price_cache: Arc::new(RwLock::new(PriceCache::default())),
             _order_feed: None,
             _price_feed: None,
             _reconciliation_poller: reconciliation_poller,
-            ladder_engine: LadderEngine::new(LadderConfig::default()),
-            ladder_state: LadderState::default(),
+            tick_size_cache: Arc::new(RwLock::new(HashMap::new())),
+            arb_finder,
+            pending_arb_orders: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -196,6 +213,17 @@ impl SimpleBot {
         self.prefetch_token_metadata(&markets).await;
         self.init_positions(&markets).await;
         self.start_feeds(&markets);
+
+        // Initialize arb finder with markets
+        let arb_markets: Vec<ArbMarketInfo> = markets
+            .iter()
+            .map(|m| ArbMarketInfo {
+                market_id: m.market_id.clone(),
+                up_token_id: m.up_token_id.clone(),
+                down_token_id: m.down_token_id.clone(),
+            })
+            .collect();
+        self.arb_finder.init_markets(arb_markets);
     }
 
     async fn fetch_active_markets(&self) -> Option<Vec<ActiveMarket>> {
@@ -250,6 +278,7 @@ impl SimpleBot {
         }
     }
 
+    /// Prefetch and cache tick sizes for all tokens - critical for fast arb execution
     async fn prefetch_token_metadata(&self, markets: &[ActiveMarket]) {
         let mut token_ids = Vec::new();
         for market in markets {
@@ -260,17 +289,37 @@ impl SimpleBot {
         token_ids.dedup();
 
         let client = self.client.clone();
-        stream::iter(token_ids)
+        let tick_cache = self.tick_size_cache.clone();
+        
+        let results: Vec<_> = stream::iter(token_ids)
             .map(|token_id| {
                 let client = client.clone();
                 async move {
-                    let _ = client.tick_size(&token_id).await;
+                    let tick_size = client.tick_size(&token_id).await.ok()
+                        .map(|resp| resp.minimum_tick_size.as_decimal());
                     let _ = client.neg_risk(&token_id).await;
+                    (token_id, tick_size)
                 }
             })
             .buffer_unordered(PREFETCH_CONCURRENCY)
-            .collect::<Vec<_>>()
+            .collect()
             .await;
+        
+        // Cache tick sizes synchronously for fast lookup during order building
+        {
+            let mut cache = tick_cache.write();
+            for (token_id, tick_size) in results {
+                if let Some(ts) = tick_size {
+                    info!(token_id = %token_id, tick_size = %ts, "Cached tick size");
+                    cache.insert(token_id, ts);
+                }
+            }
+        }
+    }
+    
+    /// Get cached tick size (synchronous, no network call)
+    fn get_cached_tick_size(&self, token_id: &str) -> Option<Decimal> {
+        self.tick_size_cache.read().get(token_id).copied()
     }
 
     fn start_feeds(&mut self, markets: &[ActiveMarket]) {
@@ -313,152 +362,198 @@ impl SimpleBot {
         // Snapshot markets to avoid borrow issues
         let markets: Vec<ActiveMarket> = self.markets.values().cloned().collect();
 
-        for market in markets {
-            if let Some(action) = self.evaluate_market(&market).await {
-                self.execute_action(&market, action).await;
+        // Update arb finder with latest prices from WebSocket cache
+        {
+            let cache = self.price_cache.read();
+            for market in &markets {
+                if let Some((bid, ask)) = cache.get(&market.up_token_id) {
+                    self.arb_finder.update_ws_price(&market.up_token_id, bid, ask);
+                }
+                if let Some((bid, ask)) = cache.get(&market.down_token_id) {
+                    self.arb_finder.update_ws_price(&market.down_token_id, bid, ask);
+                }
             }
         }
-    }
-
-    /// Evaluate a single market, returning an action if needed
-    async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
-        // Safety check: don't place new orders too close to market end
-        let now = Utc::now();
-        let seconds_until_end = (market.end_time - now).num_seconds();
-        let min_seconds = self.ladder_engine.config().min_seconds_before_end;
         
-        if seconds_until_end < min_seconds {
-            trace!(
-                market_id = %market.market_id,
-                seconds_until_end,
-                min_seconds,
-                "Too close to market end, skipping"
-            );
-            return None;
-        }
+        // Clean up timed out arb orders (orders that didn't fill within timeout)
+        self.cleanup_stale_arb_orders().await;
 
-        // Get prices
-        let (up_ask, down_ask) = {
-            let cache = self.price_cache.read();
-            let up = cache.get(&market.up_token_id)?.1;
-            let down = cache.get(&market.down_token_id)?.1;
-            (up, down)
-        };
+        // Scan for arb opportunities using cross-product of order book levels
+        let predictions = self.arb_finder.scan();
+        
+        for prediction in predictions {
+            // Only act on ExecuteNow for direct arb opportunities
+            if prediction.recommended_action != RecommendedAction::ExecuteNow {
+                continue;
+            }
+            
+            // Check cooldown to avoid hammering the same market
+            if !self.arb_cooldown_elapsed(&prediction.market_id) {
+                trace!(market_id = %prediction.market_id, "Arb cooldown active");
+                continue;
+            }
+            
+            if let Some(market) = self.markets.get(&prediction.market_id).cloned() {
+                // Get position state
+                let snapshot = self.ledger.get_state(&prediction.market_id).await;
+                let current_up = snapshot.position.up_shares;
+                let current_down = snapshot.position.down_shares;
 
-        trace!(
-            market_id = %market.market_id,
-            up_ask = %up_ask,
-            down_ask = %down_ask,
-            "Price check"
-        );
-
-        // Check if action needed
-        let should_reladder = self.ladder_state.should_reladder(
-            &market.market_id,
-            up_ask,
-            down_ask,
-            self.ladder_engine.config().reladder_threshold,
-        );
-
-        if !should_reladder && !self.cooldown_elapsed(&market.market_id) {
-            return None;
-        }
-
-        // Get ledger state
-        let snapshot = self.ledger.get_state(&market.market_id).await;
-        let locked_pairs = self.ledger.get_locked_pairs(&market.market_id).await;
-        let (max_up_price, max_down_price) = self.ledger.get_max_hedge_prices(&market.market_id).await;
-
-        // Compute ladder
-        let plan = self.ladder_engine.compute_ladder(
-            up_ask,
-            down_ask,
-            &snapshot.position,
-            snapshot.pending_up,
-            snapshot.pending_down,
-            &snapshot.open_orders,
-            locked_pairs,
-            max_up_price,
-            max_down_price,
-        );
-
-        if plan.cancellations.is_empty() && plan.orders.is_empty() {
-            return None;
-        }
-
-        Some(MarketAction {
-            up_ask,
-            down_ask,
-            cancellations: plan.cancellations,
-            orders: plan.orders,
-        })
-    }
-
-    /// Execute cancellations and place new orders
-    async fn execute_action(&mut self, market: &ActiveMarket, action: MarketAction) {
-        let market_id = &market.market_id;
-        let cancelled_count = 0;
-        if !action.cancellations.is_empty() {
-            debug!(
-                market_id,
-                count = action.cancellations.len(),
-                "Cancellations disabled"
-            );
-        }
-
-        // Place new orders
-        if !action.orders.is_empty() {
-            let placed = self.place_orders(market, &action.orders).await;
-
-            if placed > 0 {
-                info!(
-                    market_id,
-                    up_ask = %action.up_ask,
-                    down_ask = %action.down_ask,
-                    cancelled = cancelled_count,
-                    placed,
-                    "Ladder updated"
+                // Calculate safe order size based on position and confidence
+                let (up_size, down_size) = self.arb_finder.calculate_safe_arb_size(
+                    current_up,
+                    current_down,
+                    prediction.confidence,
                 );
 
-                self.ladder_state
-                    .record_ladder(market_id.clone(), action.up_ask, action.down_ask);
+                // Get prices from prediction (these come from cross-product scan)
+                let (up_price, down_price) = match (
+                    prediction.up_target_price,
+                    prediction.down_target_price,
+                ) {
+                    (Some(u), Some(d)) => (u, d),
+                    _ => continue,
+                };
+                
+                // Use the executable size from the prediction if available
+                let exec_size = prediction.executable_size
+                    .map(|s| s.min(up_size).min(down_size))
+                    .unwrap_or_else(|| up_size.min(down_size));
+
+                if exec_size <= Decimal::ZERO {
+                    debug!(
+                        market_id = %prediction.market_id,
+                        current_up = %current_up,
+                        current_down = %current_down,
+                        "Skipping arb - no room for orders"
+                    );
+                    continue;
+                }
+
+                let combined = up_price + down_price;
+                let profit_per_share = Decimal::ONE - combined;
+                
+                info!(
+                    market_id = %prediction.market_id,
+                    up_price = %up_price,
+                    down_price = %down_price,
+                    combined = %combined,
+                    profit_per_share = %profit_per_share,
+                    size = %exec_size,
+                    "🚀 EXECUTING ARB"
+                );
+
+                let placed = self
+                    .execute_arb_orders(&market, up_price, down_price, exec_size, exec_size)
+                    .await;
+
+                // Record attempt time for cooldown
+                self.last_arb_attempt.insert(market.market_id.clone(), Instant::now());
+
+                info!(
+                    market_id = %prediction.market_id,
+                    placed,
+                    "Arb execution complete"
+                );
             }
         }
-
-        self.last_order_by_market
-            .insert(market_id.clone(), Instant::now());
+    }
+    
+    /// Check if cooldown has elapsed for a market (prevent hammering)
+    fn arb_cooldown_elapsed(&self, market_id: &str) -> bool {
+        self.last_arb_attempt
+            .get(market_id)
+            .map(|t| t.elapsed() >= Duration::from_millis(500)) // 500ms cooldown
+            .unwrap_or(true)
+    }
+    
+    /// Clean up arb orders that didn't fill within timeout
+    async fn cleanup_stale_arb_orders(&self) {
+        let timeout = Duration::from_secs(2); // Cancel unfilled arb orders after 2 seconds
+        let mut to_cancel = Vec::new();
+        
+        {
+            let orders = self.pending_arb_orders.read();
+            for (order_id, pending) in orders.iter() {
+                if pending.placed_at.elapsed() > timeout {
+                    to_cancel.push(order_id.clone());
+                }
+            }
+        }
+        
+        if !to_cancel.is_empty() {
+            debug!(count = to_cancel.len(), "Cleaning up stale arb orders");
+            
+            // Remove from tracking FIRST - whether cancel succeeds or not, we're done tracking these
+            {
+                let mut orders = self.pending_arb_orders.write();
+                for order_id in &to_cancel {
+                    orders.remove(order_id);
+                }
+            }
+            
+            // Attempt cancel (best effort - orders may already be filled/cancelled)
+            let _ = self.cancel_orders(&to_cancel).await;
+        }
     }
 
-    async fn place_orders(&self, market: &ActiveMarket, orders: &[LadderOrder]) -> usize {
-        let build_start = Instant::now();
-        let signed = self.build_signed_orders(orders, market).await;
-        let build_ms = build_start.elapsed().as_millis();
+
+    /// Execute arbitrage by submitting both Up and Down orders in parallel
+    /// Uses cached tick sizes for speed
+    async fn execute_arb_orders(
+        &self,
+        market: &ActiveMarket,
+        up_price: Decimal,
+        down_price: Decimal,
+        up_size: Decimal,
+        down_size: Decimal,
+    ) -> usize {
+        let arb_start = Instant::now();
+
+        // Build orders using CACHED tick sizes (no network calls!)
+        let signed = self.build_arb_orders_fast(market, up_price, down_price, up_size, down_size).await;
+        let build_ms = arb_start.elapsed().as_millis();
 
         if signed.is_empty() {
+            warn!(
+                market_id = %market.market_id,
+                "Failed to build arb orders"
+            );
             return 0;
         }
 
+        info!(
+            market_id = %market.market_id,
+            order_count = signed.len(),
+            build_ms,
+            "Submitting arb orders"
+        );
+
+        // Submit all orders in one batch
         let post_start = Instant::now();
         match self.client.post_orders(signed).await {
             Ok(responses) => {
                 let post_ms = post_start.elapsed().as_millis();
-                debug!(
-                    market_id = %market.market_id,
-                    build_ms,
-                    post_ms,
-                    "Order batch timing"
-                );
-                let mut placed = 0;
+                let total_ms = arb_start.elapsed().as_millis();
 
-                for (resp, order) in responses.iter().zip(orders.iter()) {
+                let mut placed = 0;
+                let sides = [MarketSide::Up, MarketSide::Down];
+                let sizes = [up_size, down_size];
+                let prices = [up_price, down_price];
+                
+                for (i, resp) in responses.iter().enumerate() {
                     let success = resp
                         .error_msg
                         .as_ref()
                         .map(|s| s.is_empty())
                         .unwrap_or(true);
 
+                    let side = sides.get(i).copied().unwrap_or(MarketSide::Up);
+                    let size = sizes.get(i).copied().unwrap_or(Decimal::ZERO);
+                    let price = prices.get(i).copied().unwrap_or(Decimal::ZERO);
+
                     if success {
-                        let token_id = match order.side {
+                        let token_id = match side {
                             MarketSide::Up => &market.up_token_id,
                             MarketSide::Down => &market.down_token_id,
                         };
@@ -468,22 +563,52 @@ impl SimpleBot {
                                 resp.order_id.clone(),
                                 market.market_id.clone(),
                                 token_id.clone(),
-                                order.side,
-                                order.size,
-                                order.price,
+                                side,
+                                size,
+                                price,
                             )
                             .await;
+                        
+                        // Track pending arb order for timeout cleanup
+                        {
+                            let mut pending = self.pending_arb_orders.write();
+                            pending.insert(resp.order_id.clone(), PendingArbOrder {
+                                order_id: resp.order_id.clone(),
+                                market_id: market.market_id.clone(),
+                                side,
+                                placed_at: Instant::now(),
+                            });
+                        }
+
+                        info!(
+                            market_id = %market.market_id,
+                            order_id = %resp.order_id,
+                            side = ?side,
+                            price = %price,
+                            size = %size,
+                            "Arb order placed"
+                        );
 
                         placed += 1;
                     } else {
                         warn!(
                             market_id = %market.market_id,
                             order_id = %resp.order_id,
+                            side = ?side,
                             error = ?resp.error_msg,
-                            "Order rejected"
+                            "Arb order rejected"
                         );
                     }
                 }
+
+                info!(
+                    market_id = %market.market_id,
+                    placed,
+                    build_ms,
+                    post_ms,
+                    total_ms,
+                    "Arb execution timing"
+                );
 
                 placed
             }
@@ -491,89 +616,65 @@ impl SimpleBot {
                 error!(
                     market_id = %market.market_id,
                     error = %e,
-                    "Batch order submission failed"
+                    "Arb order submission failed"
                 );
                 0
             }
         }
     }
-
-    async fn build_signed_orders(
+    
+    /// Build arb orders using cached tick sizes for maximum speed
+    async fn build_arb_orders_fast(
         &self,
-        orders: &[LadderOrder],
         market: &ActiveMarket,
+        up_price: Decimal,
+        down_price: Decimal,
+        up_size: Decimal,
+        down_size: Decimal,
     ) -> Vec<SignedOrder> {
         let signer = self.signer.clone().with_chain_id(Some(POLYGON));
         let client = self.client.clone();
-        let up_token_id = market.up_token_id.clone();
-        let down_token_id = market.down_token_id.clone();
-
-        stream::iter(orders.iter().cloned())
-            .map(|order| {
-                let client = client.clone();
-                let signer = signer.clone();
-                let up_token_id = up_token_id.clone();
-                let down_token_id = down_token_id.clone();
-                async move {
-                    let token_id = match order.side {
-                        MarketSide::Up => up_token_id.as_str(),
-                        MarketSide::Down => down_token_id.as_str(),
-                    };
-
-                    let tick_size = match client.tick_size(token_id).await {
-                        Ok(resp) => resp.minimum_tick_size.as_decimal(),
-                        Err(e) => {
-                            error!(error = %e, "Failed to fetch tick size");
-                            return None;
-                        }
-                    };
-                    let price = quantize_price(order.price, tick_size);
-
-                    let (poly_price, poly_size) = match convert_order_params(price, order.size) {
-                        Some(p) => p,
-                        None => return None,
-                    };
-
-                    info!(
-                        size = %poly_size,
-                        price = %poly_price,
-                        side = ?order.side,
-                        "Building order"
-                    );
-
-                    let signable = match client
-                        .limit_order()
-                        .token_id(token_id)
-                        .price(poly_price)
-                        .size(poly_size)
-                        .side(ClobSide::Buy)
-                        .build()
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(error = %e, "Failed to build order");
-                            return None;
-                        }
-                    };
-
-                    match client.sign(&signer, signable).await {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            error!(error = %e, "Failed to sign order");
-                            None
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(SIGN_CONCURRENCY)
-            .filter_map(|signed| async move { signed })
-            .collect::<Vec<_>>()
-            .await
-    }
-
-    fn convert_order_params(&self, order: &LadderOrder) -> Option<(PolyDecimal, PolyDecimal)> {
-        convert_order_params(order.price, order.size)
+        
+        // Get cached tick sizes (synchronous - no network call!)
+        let up_tick = self.get_cached_tick_size(&market.up_token_id)
+            .unwrap_or(dec!(0.01));
+        let down_tick = self.get_cached_tick_size(&market.down_token_id)
+            .unwrap_or(dec!(0.01));
+        
+        // Quantize prices to tick size
+        let up_price_q = quantize_price(up_price, up_tick);
+        let down_price_q = quantize_price(down_price, down_tick);
+        
+        // Build both orders in parallel
+        let up_future = {
+            let client = client.clone();
+            let signer = signer.clone();
+            let token_id = market.up_token_id.clone();
+            async move {
+                build_single_order(&client, &signer, &token_id, up_price_q, up_size).await
+            }
+        };
+        
+        let down_future = {
+            let client = client.clone();
+            let signer = signer.clone();
+            let token_id = market.down_token_id.clone();
+            async move {
+                build_single_order(&client, &signer, &token_id, down_price_q, down_size).await
+            }
+        };
+        
+        let (up_result, down_result) = tokio::join!(up_future, down_future);
+        
+        let mut orders = Vec::with_capacity(2);
+        if let Some(order) = up_result {
+            orders.push(order);
+        }
+        if let Some(order) = down_result {
+            orders.push(order);
+        }
+        
+        orders
     }
 
     async fn cancel_orders(&self, order_ids: &[String]) -> anyhow::Result<Vec<String>> {
@@ -590,16 +691,17 @@ impl SimpleBot {
 
         match self.client.cancel_orders(&order_id_refs).await {
             Ok(response) => {
-                info!(
-                    requested = order_ids.len(),
-                    cancelled = response.canceled.len(),
-                    not_cancelled = response.not_canceled.len(),
-                    "Batch cancel complete"
-                );
+                // Only log if something was actually cancelled
+                if !response.canceled.is_empty() {
+                    info!(
+                        cancelled = response.canceled.len(),
+                        "Orders cancelled"
+                    );
+                }
                 Ok(response.canceled)
             }
             Err(e) => {
-                error!(error = %e, "Batch cancel failed");
+                debug!(error = %e, "Cancel request failed");
                 Err(e.into())
             }
         }
@@ -618,13 +720,6 @@ impl SimpleBot {
         (840..870).contains(&position_in_window)
     }
 
-    fn cooldown_elapsed(&self, market_id: &str) -> bool {
-        self.last_order_by_market
-            .get(market_id)
-            .map(|t| t.elapsed() >= Duration::from_secs(self.config.cooldown_secs))
-            .unwrap_or(true)
-    }
-
     pub fn market_count(&self) -> usize {
         self.markets.len()
     }
@@ -632,14 +727,6 @@ impl SimpleBot {
     pub fn markets(&self) -> &HashMap<String, ActiveMarket> {
         &self.markets
     }
-}
-
-/// Encapsulates what needs to happen for a market
-struct MarketAction {
-    up_ask: Decimal,
-    down_ask: Decimal,
-    cancellations: Vec<String>,
-    orders: Vec<LadderOrder>,
 }
 
 fn convert_order_params(price: Decimal, size: Decimal) -> Option<(PolyDecimal, PolyDecimal)> {
@@ -660,4 +747,46 @@ fn quantize_price(price: Decimal, tick_size: Decimal) -> Decimal {
     }
     let ticks = (price / tick_size).floor();
     ticks * tick_size
+}
+
+/// Build a single signed order - used by build_arb_orders_fast
+async fn build_single_order(
+    client: &AuthenticatedClient,
+    signer: &alloy::signers::local::PrivateKeySigner,
+    token_id: &str,
+    price: Decimal,
+    size: Decimal,
+) -> Option<SignedOrder> {
+    let (poly_price, poly_size) = convert_order_params(price, size)?;
+    
+    debug!(
+        token_id = %token_id,
+        price = %poly_price,
+        size = %poly_size,
+        "Building order"
+    );
+
+    let signable = match client
+        .limit_order()
+        .token_id(token_id)
+        .price(poly_price)
+        .size(poly_size)
+        .side(ClobSide::Buy)
+        .build()
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, token_id = %token_id, "Failed to build order");
+            return None;
+        }
+    };
+
+    match client.sign(signer, signable).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            error!(error = %e, token_id = %token_id, "Failed to sign order");
+            None
+        }
+    }
 }
