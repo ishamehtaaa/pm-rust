@@ -42,6 +42,14 @@ pub struct LadderOrder {
     pub size: Decimal,
 }
 
+#[derive(Debug, Clone)]
+pub struct SideLadderConfig {
+    pub levels: usize,
+    pub spacing: Decimal,
+    pub size_per_level: Decimal,
+    pub top_offset: Decimal,
+}
+
 #[derive(Debug, Default)]
 pub struct LadderPlan {
     pub orders: Vec<LadderOrder>,
@@ -105,6 +113,60 @@ impl LadderEngine {
         pending_up: Decimal,
         pending_down: Decimal,
         open_orders: &[OpenOrderInfo],
+    ) -> LadderPlan {
+        let up_config = SideLadderConfig {
+            levels: self.config.levels,
+            spacing: self.config.spacing,
+            size_per_level: self.config.size_per_level,
+            top_offset: self.config.top_offset,
+        };
+        let down_config = up_config.clone();
+
+        self.compute_ladder_with_configs(
+            up_ask,
+            down_ask,
+            position,
+            pending_up,
+            pending_down,
+            open_orders,
+            up_config,
+            down_config,
+        )
+    }
+
+    pub fn compute_dynamic_ladder(
+        &self,
+        up_ask: Decimal,
+        down_ask: Decimal,
+        position: &MarketPosition,
+        pending_up: Decimal,
+        pending_down: Decimal,
+        open_orders: &[OpenOrderInfo],
+        up_config: SideLadderConfig,
+        down_config: SideLadderConfig,
+    ) -> LadderPlan {
+        self.compute_ladder_with_configs(
+            up_ask,
+            down_ask,
+            position,
+            pending_up,
+            pending_down,
+            open_orders,
+            up_config,
+            down_config,
+        )
+    }
+
+    fn compute_ladder_with_configs(
+        &self,
+        up_ask: Decimal,
+        down_ask: Decimal,
+        position: &MarketPosition,
+        pending_up: Decimal,
+        pending_down: Decimal,
+        open_orders: &[OpenOrderInfo],
+        up_config: SideLadderConfig,
+        down_config: SideLadderConfig,
     ) -> LadderPlan {
         let mut plan = LadderPlan::default();
 
@@ -180,7 +242,12 @@ impl LadderEngine {
 
         // 6. Generate ladders, skipping already-covered price levels
         if up_room >= MIN_ORDER_SIZE {
-            for order in self.generate_side_ladder(MarketSide::Up, up_ask, up_room) {
+            for order in self.generate_side_ladder_with_config(
+                MarketSide::Up,
+                up_ask,
+                up_room,
+                &up_config,
+            ) {
                 if !covered_up.contains(&order.price) {
                     plan.orders.push(order);
                 }
@@ -188,7 +255,12 @@ impl LadderEngine {
         }
 
         if down_room >= MIN_ORDER_SIZE {
-            for order in self.generate_side_ladder(MarketSide::Down, down_ask, down_room) {
+            for order in self.generate_side_ladder_with_config(
+                MarketSide::Down,
+                down_ask,
+                down_room,
+                &down_config,
+            ) {
                 if !covered_down.contains(&order.price) {
                     plan.orders.push(order);
                 }
@@ -229,11 +301,12 @@ impl LadderEngine {
         to_cancel
     }
 
-    fn generate_side_ladder(
+    fn generate_side_ladder_with_config(
         &self,
         side: MarketSide,
         ask: Decimal,
         room: Decimal,
+        config: &SideLadderConfig,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
 
@@ -242,17 +315,16 @@ impl LadderEngine {
         }
 
         let mut remaining_room = room;
-        let top_price = (ask - self.config.top_offset).max(dec!(0.01));
+        let top_price = (ask - config.top_offset).max(dec!(0.01));
 
-        for level in 0..self.config.levels {
-            let price =
-                (top_price - self.config.spacing * Decimal::from(level as u32)).max(dec!(0.01));
+        for level in 0..config.levels {
+            let price = (top_price - config.spacing * Decimal::from(level as u32)).max(dec!(0.01));
 
             if price >= ask {
                 continue;
             }
 
-            let size = round_size(self.config.size_per_level.min(remaining_room));
+            let size = round_size(config.size_per_level.min(remaining_room));
             if size < MIN_ORDER_SIZE {
                 break;
             }

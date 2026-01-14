@@ -9,8 +9,13 @@ pub mod market_state;
 pub mod predictor;
 pub mod rest_poller;
 pub mod signals;
+pub mod trade_poller;
 
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::clob::Client;
 use rust_decimal::Decimal;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -19,6 +24,7 @@ pub use data_logger::{DataLogger, DataLoggerHandle, LogEvent};
 pub use market_state::{MarketState, MarketStateStore, TradeEvent, TradeSide};
 pub use predictor::{ArbPrediction, ArbPredictor, RecommendedAction};
 pub use rest_poller::spawn_rest_poller;
+pub use trade_poller::spawn_trade_poller;
 pub use signals::{Signal, SignalDetector, SignalType};
 
 /// Market info for initializing the arb finder
@@ -41,7 +47,10 @@ pub struct ArbFinder {
     _rest_poller: Option<tokio::task::JoinHandle<()>>,
     _data_logger_task: Option<tokio::task::JoinHandle<()>>,
     _spread_logger_task: Option<tokio::task::JoinHandle<()>>,
+    _trade_poller: Option<tokio::task::JoinHandle<()>>,
 }
+
+type AuthenticatedClient = Client<Authenticated<Normal>>;
 
 impl ArbFinder {
     /// Create a new arb finder
@@ -62,6 +71,7 @@ impl ArbFinder {
             _rest_poller: None,
             _data_logger_task: Some(logger_task),
             _spread_logger_task: None,
+            _trade_poller: None,
         }
     }
 
@@ -105,6 +115,28 @@ impl ArbFinder {
         self._spread_logger_task = Some(spread_logger.spawn());
 
         info!(market_count = markets.len(), "ArbFinder initialized");
+    }
+
+    /// Start REST trade poller for sweep detection
+    pub fn start_trade_poller(
+        &mut self,
+        client: Arc<AuthenticatedClient>,
+    ) {
+        if let Some(handle) = self._trade_poller.take() {
+            handle.abort();
+        }
+
+        if self.markets.is_empty() {
+            return;
+        }
+
+        self._trade_poller = Some(spawn_trade_poller(
+            self.config.clone(),
+            client,
+            self.state_store.clone(),
+            self.data_logger.clone(),
+            self.markets.clone(),
+        ));
     }
 
     /// Get the state store for external updates
@@ -269,6 +301,15 @@ impl ArbFinder {
         // Round to 2 decimal places
         let final_size = final_size.round_dp(2);
 
+        if final_size < self.config.min_order_size {
+            info!(
+                final_size = %final_size,
+                min_order_size = %self.config.min_order_size,
+                "Arb size below minimum, skipping"
+            );
+            return (Decimal::ZERO, Decimal::ZERO);
+        }
+
         info!(
             base_size = %base_size,
             confidence = %confidence,
@@ -335,4 +376,3 @@ impl SpreadLogger {
         })
     }
 }
-

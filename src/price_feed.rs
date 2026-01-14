@@ -84,7 +84,11 @@ pub fn spawn_price_feed(
                                 continue;
                             }
                         };
-                        let ts: u64 = book.timestamp.try_into().unwrap_or(0);
+                        let mut ts: u64 = book.timestamp.try_into().unwrap_or(0);
+                        // WS timestamp might be in seconds; normalize to ms for age checks.
+                        if ts > 0 && ts < 1_000_000_000_000 {
+                            ts *= 1000;
+                        }
 
                         cache.write().update(book.asset_id, bid_dec, ask_dec, ts);
                     }

@@ -69,6 +69,9 @@ pub struct ArbFinderConfig {
     /// Default size for arb orders
     pub arb_order_size: Decimal,
 
+    /// Minimum allowed order size for arb orders
+    pub min_order_size: Decimal,
+
     /// Maximum total exposure per market
     pub max_exposure_per_market: Decimal,
 
@@ -117,7 +120,8 @@ impl Default for ArbFinderConfig {
 
             // Position sizing
             arb_order_size: dec!(5),
-            max_exposure_per_market: dec!(20),
+            min_order_size: dec!(5),
+            max_exposure_per_market: dec!(40),
 
             // Logging
             enable_data_logging: true,
@@ -141,6 +145,12 @@ impl ArbFinderConfig {
         if let Ok(v) = std::env::var("ARB_ORDER_SIZE") {
             if let Ok(d) = v.parse() {
                 config.arb_order_size = d;
+            }
+        }
+
+        if let Ok(v) = std::env::var("ARB_MIN_ORDER_SIZE") {
+            if let Ok(d) = v.parse() {
+                config.min_order_size = d;
             }
         }
 

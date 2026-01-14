@@ -103,6 +103,49 @@ pub struct TokenState {
     pub recent_trades: VecDeque<TradeEvent>,
     /// Price history for velocity calculation
     pub price_history: VecDeque<(Instant, Decimal)>,
+    /// REST price history for momentum/volatility
+    pub rest_price_history: VecDeque<(Instant, Decimal)>,
+}
+
+fn ema_over_window(
+    history: &VecDeque<(Instant, Decimal)>,
+    window: Duration,
+) -> Option<Decimal> {
+    let now = Instant::now();
+    let cutoff = now - window;
+
+    let mut samples: Vec<(Instant, Decimal)> = history
+        .iter()
+        .cloned()
+        .filter(|(ts, _)| *ts >= cutoff)
+        .collect();
+
+    if samples.len() < 2 {
+        return None;
+    }
+
+    samples.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let first = samples.first()?.0;
+    let last = samples.last()?.0;
+    let duration = last.duration_since(first).as_secs_f64();
+    let avg_interval = if duration > 0.0 {
+        duration / (samples.len().saturating_sub(1) as f64)
+    } else {
+        0.25
+    };
+
+    let window_secs = window.as_secs_f64().max(0.1);
+    let n = (window_secs / avg_interval.max(0.001)).max(2.0);
+    let alpha = 2.0 / (n + 1.0);
+    let alpha_dec = Decimal::try_from(alpha).ok()?;
+
+    let mut ema = samples.first()?.1;
+    for (_, price) in samples.into_iter().skip(1) {
+        ema = (price * alpha_dec) + (ema * (Decimal::ONE - alpha_dec));
+    }
+
+    Some(ema)
 }
 
 impl Default for TokenState {
@@ -117,6 +160,7 @@ impl Default for TokenState {
             depth: DepthSnapshot::default(),
             recent_trades: VecDeque::with_capacity(100),
             price_history: VecDeque::with_capacity(100),
+            rest_price_history: VecDeque::with_capacity(200),
         }
     }
 }
@@ -171,9 +215,24 @@ impl TokenState {
 
     /// Update from REST snapshot
     pub fn update_rest(&mut self, bid: Decimal, ask: Decimal) {
+        let now = Instant::now();
         self.rest_bid = Some(bid);
         self.rest_ask = Some(ask);
-        self.rest_updated = Some(Instant::now());
+        self.rest_updated = Some(now);
+
+        self.rest_price_history.push_back((now, ask));
+        if self.rest_price_history.len() > 200 {
+            self.rest_price_history.pop_front();
+        }
+    }
+
+    /// Update depth snapshot (REST or WS derived)
+    pub fn update_depth(&mut self, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) {
+        self.depth = DepthSnapshot {
+            bids,
+            asks,
+            timestamp: Some(Instant::now()),
+        };
     }
 
     /// Record a trade
@@ -210,6 +269,55 @@ impl TokenState {
         }
 
         Some(price_change / Decimal::try_from(time_secs).ok()?)
+    }
+
+    /// EMA slope between fast and slow windows (REST prices only).
+    pub fn rest_ema_slope(
+        &self,
+        fast_window: Duration,
+        slow_window: Duration,
+    ) -> Option<Decimal> {
+        let fast = ema_over_window(&self.rest_price_history, fast_window)?;
+        let slow = ema_over_window(&self.rest_price_history, slow_window)?;
+        Some(fast - slow)
+    }
+
+    /// REST price range over a window (max - min).
+    pub fn rest_price_range(&self, window: Duration) -> Option<Decimal> {
+        let now = Instant::now();
+        let cutoff = now - window;
+
+        let mut min: Option<Decimal> = None;
+        let mut max: Option<Decimal> = None;
+
+        for (ts, price) in self.rest_price_history.iter() {
+            if *ts < cutoff {
+                continue;
+            }
+            min = Some(min.map(|v| v.min(*price)).unwrap_or(*price));
+            max = Some(max.map(|v| v.max(*price)).unwrap_or(*price));
+        }
+
+        match (min, max) {
+            (Some(min), Some(max)) => Some(max - min),
+            _ => None,
+        }
+    }
+
+    /// Total ask depth within best ask + offset.
+    pub fn ask_depth_within(&self, offset: Decimal) -> Option<Decimal> {
+        let best_ask = self.rest_ask.or(self.ws_ask)?;
+        let limit = best_ask + offset;
+
+        let sum = self
+            .depth
+            .asks
+            .iter()
+            .filter(|l| l.price <= limit)
+            .map(|l| l.size)
+            .sum();
+
+        Some(sum)
     }
 
     /// Get recent trade volume in a window
@@ -380,6 +488,26 @@ impl MarketStateStore {
         }
     }
 
+    /// Update depth snapshot for a token
+    pub fn update_depth(&self, token_id: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) {
+        let (market_id, is_up) = match self.token_index.read().get(token_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
+        let mut store = self.inner.write();
+        let state = match store.get_mut(&market_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if is_up {
+            state.up.update_depth(bids, asks);
+        } else {
+            state.down.update_depth(bids, asks);
+        }
+    }
+
     /// Record a trade for a token
     pub fn record_trade(&self, token_id: &str, trade: TradeEvent) {
         let (market_id, is_up) = match self.token_index.read().get(token_id) {
@@ -410,4 +538,3 @@ impl MarketStateStore {
         self.inner.read().values().cloned().collect()
     }
 }
-

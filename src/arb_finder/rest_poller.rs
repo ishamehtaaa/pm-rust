@@ -8,7 +8,7 @@ use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
 use super::config::ArbFinderConfig;
-use super::market_state::MarketStateStore;
+use super::market_state::{MarketStateStore, PriceLevel};
 use futures_util::stream::{self, StreamExt};
 
 /// Token info for REST polling
@@ -69,12 +69,14 @@ impl RestPoller {
                 let client = client.clone();
                 let state_store = state_store.clone();
                 async move {
-                    if let Some((bid, ask)) = fetch_best_bid_ask(&client, &token.token_id).await {
-                        state_store.update_rest_price(&token.token_id, bid, ask);
+                    if let Some(snapshot) = fetch_orderbook_snapshot(&client, &token.token_id).await
+                    {
+                        state_store.update_rest_price(&token.token_id, snapshot.best_bid, snapshot.best_ask);
+                        state_store.update_depth(&token.token_id, snapshot.bids, snapshot.asks);
                         trace!(
                             token_id = %token.token_id,
-                            bid = %bid,
-                            ask = %ask,
+                            bid = %snapshot.best_bid,
+                            ask = %snapshot.best_ask,
                             "REST price update"
                         );
                     }
@@ -100,11 +102,21 @@ struct BookLevel {
     size: String,
 }
 
-/// Fetch best bid + best ask for a token from REST orderbook.
+struct BookSnapshot {
+    best_bid: Decimal,
+    best_ask: Decimal,
+    bids: Vec<PriceLevel>,
+    asks: Vec<PriceLevel>,
+}
+
+/// Fetch best bid + best ask and depth for a token from REST orderbook.
 ///
 /// Important: we intentionally do NOT rely on array ordering.
 /// We compute best bid as max(bids.price), best ask as min(asks.price).
-async fn fetch_best_bid_ask(client: &reqwest::Client, token_id: &str) -> Option<(Decimal, Decimal)> {
+async fn fetch_orderbook_snapshot(
+    client: &reqwest::Client,
+    token_id: &str,
+) -> Option<BookSnapshot> {
     let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
 
     let response = match client.get(&url).timeout(REST_REQUEST_TIMEOUT).send().await {
@@ -132,22 +144,48 @@ async fn fetch_best_bid_ask(client: &reqwest::Client, token_id: &str) -> Option<
         }
     };
 
-    let best_bid = book
-        .bids
+    let mut bids: Vec<PriceLevel> = Vec::new();
+    for level in book.bids {
+        if let (Ok(price), Ok(size)) = (level.price.parse::<Decimal>(), level.size.parse::<Decimal>()) {
+            bids.push(PriceLevel { price, size });
+        }
+    }
+
+    let mut asks: Vec<PriceLevel> = Vec::new();
+    for level in book.asks {
+        if let (Ok(price), Ok(size)) = (level.price.parse::<Decimal>(), level.size.parse::<Decimal>()) {
+            asks.push(PriceLevel { price, size });
+        }
+    }
+
+    if bids.is_empty() || asks.is_empty() {
+        return None;
+    }
+
+    let best_bid = bids
         .iter()
-        .filter_map(|l| l.price.parse::<Decimal>().ok())
+        .map(|l| l.price)
         .max();
 
-    let best_ask = book
-        .asks
+    let best_ask = asks
         .iter()
-        .filter_map(|l| l.price.parse::<Decimal>().ok())
+        .map(|l| l.price)
         .min();
 
-    match (best_bid, best_ask) {
-        (Some(bid), Some(ask)) => Some((bid, ask)),
-        _ => None,
-    }
+    let (best_bid, best_ask) = match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) => (bid, ask),
+        _ => return None,
+    };
+
+    bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+    asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+    Some(BookSnapshot {
+        best_bid,
+        best_ask,
+        bids,
+        asks,
+    })
 }
 
 /// Spawn REST poller for a set of markets
@@ -172,4 +210,3 @@ pub fn spawn_rest_poller(
     let poller = RestPoller::new(config, state_store, tokens);
     poller.spawn()
 }
-
