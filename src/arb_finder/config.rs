@@ -57,6 +57,10 @@ pub struct ArbFinderConfig {
     pub imbalance_weight: Decimal,
     pub velocity_weight: Decimal,
     pub discrepancy_weight: Decimal,
+    pub composite_weight: Decimal,
+
+    /// Composite signal threshold (0-1)
+    pub composite_signal_threshold: Decimal,
 
     // === Timeouts ===
     /// How long to wait for prediction to materialize before canceling
@@ -71,6 +75,9 @@ pub struct ArbFinderConfig {
 
     /// Minimum allowed order size for arb orders
     pub min_order_size: Decimal,
+
+    /// Allow rounding up to min size for high-confidence pre-positioning
+    pub allow_round_up_min: bool,
 
     /// Maximum total exposure per market
     pub max_exposure_per_market: Decimal,
@@ -113,6 +120,9 @@ impl Default for ArbFinderConfig {
             imbalance_weight: dec!(0.3),
             velocity_weight: dec!(0.2),
             discrepancy_weight: dec!(0.1),
+            composite_weight: dec!(0.3),
+
+            composite_signal_threshold: dec!(0.6),
 
             // Timeouts
             prediction_timeout: Duration::from_secs(5),
@@ -121,6 +131,7 @@ impl Default for ArbFinderConfig {
             // Position sizing
             arb_order_size: dec!(5),
             min_order_size: dec!(5),
+            allow_round_up_min: true,
             max_exposure_per_market: dec!(40),
 
             // Logging
@@ -152,6 +163,10 @@ impl ArbFinderConfig {
             if let Ok(d) = v.parse() {
                 config.min_order_size = d;
             }
+        }
+
+        if let Ok(v) = std::env::var("ARB_ROUND_UP_MIN") {
+            config.allow_round_up_min = v == "true" || v == "1";
         }
 
         if let Ok(v) = std::env::var("ARB_SWEEP_THRESHOLD") {

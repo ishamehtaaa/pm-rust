@@ -158,6 +158,16 @@ impl LogEvent {
                 "{{\"token_id\":\"{}\",\"rest_price\":\"{}\",\"ws_price\":\"{}\",\"diff\":\"{}\"}}",
                 token_id, rest_price, ws_price, diff
             ),
+            SignalDetails::Composite {
+                score,
+                momentum,
+                volatility,
+                imbalance,
+                time_to_end_secs,
+            } => format!(
+                "{{\"score\":\"{}\",\"momentum\":\"{}\",\"volatility\":\"{}\",\"imbalance\":\"{}\",\"time_to_end_secs\":{}}}",
+                score, momentum, volatility, imbalance, time_to_end_secs
+            ),
         };
 
         LogEvent::SignalDetected {
@@ -340,4 +350,3 @@ impl DataLogger {
         }
     }
 }
-

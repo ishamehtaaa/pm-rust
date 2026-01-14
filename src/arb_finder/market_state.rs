@@ -3,6 +3,7 @@
 // Aggregated view of a market's current state, combining data from
 // multiple sources (WS orderbook, REST snapshots, trades).
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, VecDeque};
@@ -354,16 +355,23 @@ pub struct MarketState {
     pub market_id: String,
     pub up_token_id: String,
     pub down_token_id: String,
+    pub end_time: DateTime<Utc>,
     pub up: TokenState,
     pub down: TokenState,
 }
 
 impl MarketState {
-    pub fn new(market_id: String, up_token_id: String, down_token_id: String) -> Self {
+    pub fn new(
+        market_id: String,
+        up_token_id: String,
+        down_token_id: String,
+        end_time: DateTime<Utc>,
+    ) -> Self {
         Self {
             market_id,
             up_token_id,
             down_token_id,
+            end_time,
             up: TokenState::default(),
             down: TokenState::default(),
         }
@@ -433,12 +441,23 @@ impl MarketStateStore {
     }
 
     /// Initialize state for a market
-    pub fn init_market(&self, market_id: String, up_token_id: String, down_token_id: String) {
+    pub fn init_market(
+        &self,
+        market_id: String,
+        up_token_id: String,
+        down_token_id: String,
+        end_time: DateTime<Utc>,
+    ) {
         {
             let mut store = self.inner.write();
             store.insert(
                 market_id.clone(),
-                MarketState::new(market_id.clone(), up_token_id.clone(), down_token_id.clone()),
+                MarketState::new(
+                    market_id.clone(),
+                    up_token_id.clone(),
+                    down_token_id.clone(),
+                    end_time,
+                ),
             );
         }
 

@@ -140,6 +140,7 @@ impl ArbPredictor {
                 SignalType::Imbalance => self.config.imbalance_weight,
                 SignalType::Velocity => self.config.velocity_weight,
                 SignalType::Discrepancy => self.config.discrepancy_weight,
+                SignalType::Composite => self.config.composite_weight,
             };
 
             weighted_sum += signal.strength * weight;
@@ -193,4 +194,3 @@ mod tests {
         assert_eq!(confidence, Decimal::ZERO);
     }
 }
-

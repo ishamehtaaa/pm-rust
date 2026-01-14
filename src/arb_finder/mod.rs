@@ -33,6 +33,7 @@ pub struct MarketInfo {
     pub market_id: String,
     pub up_token_id: String,
     pub down_token_id: String,
+    pub end_time: chrono::DateTime<chrono::Utc>,
 }
 
 /// Main arb finder that coordinates all components
@@ -83,6 +84,7 @@ impl ArbFinder {
                 market.market_id.clone(),
                 market.up_token_id.clone(),
                 market.down_token_id.clone(),
+                market.end_time,
             );
         }
 
@@ -261,6 +263,7 @@ impl ArbFinder {
         current_up_shares: Decimal,
         current_down_shares: Decimal,
         confidence: Decimal,
+        allow_round_up: bool,
     ) -> (Decimal, Decimal) {
         let base_size = self.config.arb_order_size;
         let max_exposure = self.config.max_exposure_per_market;
@@ -288,8 +291,12 @@ impl ArbFinder {
             // Scale between 0.5 and 1.0 based on confidence
             let min_multiplier = rust_decimal_macros::dec!(0.5);
             let range = Decimal::ONE - min_multiplier;
-            let confidence_normalized = (confidence - self.config.pre_position_confidence)
-                / (self.config.aggressive_confidence - self.config.pre_position_confidence);
+            let denom = self.config.aggressive_confidence - self.config.pre_position_confidence;
+            let confidence_normalized = if denom <= Decimal::ZERO {
+                Decimal::ONE
+            } else {
+                (confidence - self.config.pre_position_confidence) / denom
+            };
             min_multiplier + (range * confidence_normalized.max(Decimal::ZERO).min(Decimal::ONE))
         };
 
@@ -302,6 +309,14 @@ impl ArbFinder {
         let final_size = final_size.round_dp(2);
 
         if final_size < self.config.min_order_size {
+            if allow_round_up && self.config.allow_round_up_min {
+                info!(
+                    final_size = %final_size,
+                    min_order_size = %self.config.min_order_size,
+                    "Arb size below minimum, rounding up"
+                );
+                return (self.config.min_order_size, self.config.min_order_size);
+            }
             info!(
                 final_size = %final_size,
                 min_order_size = %self.config.min_order_size,

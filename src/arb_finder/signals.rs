@@ -4,8 +4,10 @@
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use rust_decimal::prelude::FromPrimitive;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use super::config::ArbFinderConfig;
 use super::market_state::{MarketState, ThinSide, TradeSide};
 
@@ -28,6 +30,8 @@ pub enum SignalType {
     Velocity,
     /// REST/WS price discrepancy
     Discrepancy,
+    /// Composite signal (momentum + volatility + depth + time)
+    Composite,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +56,13 @@ pub enum SignalDetails {
         rest_price: Decimal,
         ws_price: Decimal,
         diff: Decimal,
+    },
+    Composite {
+        score: Decimal,
+        momentum: Decimal,
+        volatility: Decimal,
+        imbalance: Decimal,
+        time_to_end_secs: i64,
     },
 }
 
@@ -86,6 +97,10 @@ impl SignalDetector {
         }
 
         if let Some(signal) = self.detect_discrepancy_down(state) {
+            signals.push(signal);
+        }
+
+        if let Some(signal) = self.detect_composite(state) {
             signals.push(signal);
         }
 
@@ -287,5 +302,69 @@ impl SignalDetector {
             },
         })
     }
-}
 
+    fn detect_composite(&self, state: &MarketState) -> Option<Signal> {
+        let momentum_up = state
+            .up
+            .rest_ema_slope(Duration::from_secs(3), Duration::from_secs(12))
+            .unwrap_or(Decimal::ZERO)
+            .abs();
+        let momentum_down = state
+            .down
+            .rest_ema_slope(Duration::from_secs(3), Duration::from_secs(12))
+            .unwrap_or(Decimal::ZERO)
+            .abs();
+        let momentum = (momentum_up + momentum_down) / dec!(2.0);
+
+        let vol_up = state
+            .up
+            .rest_price_range(Duration::from_secs(10))
+            .unwrap_or(Decimal::ZERO);
+        let vol_down = state
+            .down
+            .rest_price_range(Duration::from_secs(10))
+            .unwrap_or(Decimal::ZERO);
+        let volatility = (vol_up + vol_down) / dec!(2.0);
+
+        let imbalance_ratio = state.depth_imbalance_ratio().unwrap_or(Decimal::ONE);
+        let imbalance = if imbalance_ratio >= Decimal::ONE {
+            imbalance_ratio - Decimal::ONE
+        } else {
+            (Decimal::ONE / imbalance_ratio) - Decimal::ONE
+        };
+
+        let time_to_end_secs = (state.end_time - Utc::now()).num_seconds();
+
+        let momentum_score = (momentum / dec!(0.02)).min(Decimal::ONE);
+        let volatility_score = (volatility / dec!(0.03)).min(Decimal::ONE);
+        let imbalance_score = (imbalance / self.config.imbalance_ratio_threshold)
+            .min(Decimal::ONE);
+        let time_score = if time_to_end_secs <= 0 {
+            Decimal::ONE
+        } else if time_to_end_secs <= 300 {
+            let secs = Decimal::from_i64(time_to_end_secs).unwrap_or(Decimal::ZERO);
+            Decimal::ONE - (secs / dec!(300))
+        } else {
+            Decimal::ZERO
+        };
+
+        let score = (momentum_score + volatility_score + imbalance_score + time_score) / dec!(4.0);
+
+        if score < self.config.composite_signal_threshold {
+            return None;
+        }
+
+        Some(Signal {
+            signal_type: SignalType::Composite,
+            strength: score,
+            timestamp: Instant::now(),
+            details: SignalDetails::Composite {
+                score,
+                momentum,
+                volatility,
+                imbalance,
+                time_to_end_secs,
+            },
+        })
+    }
+}
