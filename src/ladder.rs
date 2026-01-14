@@ -47,8 +47,15 @@ impl Default for LadderConfig {
 #[derive(Debug, Clone)]
 pub struct LadderOrder {
     pub side: MarketSide,
+    pub order_side: OrderSide,
     pub price: Decimal,
     pub size: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OrderSide {
+    Buy,
+    Sell,
 }
 
 #[derive(Debug, Default)]
@@ -323,11 +330,13 @@ impl LadderEngine {
 
             orders.push(LadderOrder {
                 side: MarketSide::Up,
+                order_side: OrderSide::Buy,
                 price: price_up,
                 size,
             });
             orders.push(LadderOrder {
                 side: MarketSide::Down,
+                order_side: OrderSide::Buy,
                 price: price_down,
                 size,
             });
@@ -392,7 +401,12 @@ impl LadderEngine {
                 break;
             }
 
-            orders.push(LadderOrder { side, price, size });
+            orders.push(LadderOrder {
+                side,
+                order_side: OrderSide::Buy,
+                price,
+                size,
+            });
             remaining_room -= size;
         }
 
@@ -438,6 +452,7 @@ fn floor_to_tick(price: Decimal, tick: Decimal) -> Decimal {
 pub struct OpenOrderInfo {
     pub order_id: String,
     pub side: MarketSide,
+    pub order_side: OrderSide,
     pub price: Decimal,
     pub remaining_size: Decimal,
 }

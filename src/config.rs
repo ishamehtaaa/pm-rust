@@ -16,12 +16,13 @@ const DEFAULT_MAX_SIDE_SPREAD: Decimal = dec!(0.05);
 const DEFAULT_SWING_ZONE_LOW: Decimal = dec!(0.35);
 const DEFAULT_SWING_ZONE_HIGH: Decimal = dec!(0.65);
 const DEFAULT_SWING_ZONE_TARGET_FACTOR: Decimal = dec!(0.6);
+const DEFAULT_SWING_ZONE_SPREAD_MULTIPLIER: Decimal = dec!(1.2);
 const DEFAULT_NEWS_GUARD_WINDOW_SECS: u64 = 300;
 const DEFAULT_NEWS_EVENT_TIMES: &[&str] = &[];
 const DEFAULT_DIRECTIONAL_MOVE_THRESHOLD: Decimal = dec!(0.05);
 const DEFAULT_HIGH_VOL_REVERSION_THRESHOLD: Decimal = dec!(0.02);
 const DEFAULT_MIN_LIQUIDITY_SCALE: Decimal = dec!(0.2);
-const DEFAULT_LAMBDA_PAUSE_THRESHOLD: f64 = 0.25;
+const DEFAULT_LAMBDA_PAUSE_THRESHOLD: f64 = 0.40;
 const DEFAULT_TICK_SIZE: Decimal = dec!(0.01);
 const DEFAULT_EDGE_THRESHOLD: Decimal = dec!(0.0025);
 const DEFAULT_SIZE_SCALE_MIN: Decimal = dec!(0.5);
@@ -31,6 +32,11 @@ const DEFAULT_DRIFT_FLICKER_THRESHOLD: f64 = 0.0005;
 const DEFAULT_PINNED_LOW: Decimal = dec!(0.05);
 const DEFAULT_PINNED_HIGH: Decimal = dec!(0.95);
 const DEFAULT_DURATION: MarketDuration = MarketDuration::FifteenMin;
+const DEFAULT_ORDER_IMBALANCE_WINDOW_SECS: u64 = 5;
+const DEFAULT_ORDER_IMBALANCE_THRESHOLD: f64 = 0.8;
+const DEFAULT_RNJD_RISK_AVERSION: f64 = 0.01;
+const DEFAULT_RNJD_TIME_HORIZON: f64 = 30.0;
+const DEFAULT_RNJD_K_LIQUIDITY: f64 = 1.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketDuration {
@@ -108,6 +114,7 @@ pub struct Config {
     pub swing_zone_low: Decimal,
     pub swing_zone_high: Decimal,
     pub swing_zone_target_factor: Decimal,
+    pub swing_zone_spread_multiplier: Decimal,
     pub news_guard_window_secs: u64,
     pub news_event_times: Vec<chrono::DateTime<chrono::Utc>>,
     pub directional_move_threshold: Decimal,
@@ -123,6 +130,11 @@ pub struct Config {
     pub pinned_low: Decimal,
     pub pinned_high: Decimal,
     pub target_duration: MarketDuration,
+    pub order_imbalance_window_secs: u64,
+    pub order_imbalance_threshold: f64,
+    pub rnjd_risk_aversion: f64,
+    pub rnjd_time_horizon: f64,
+    pub rnjd_k_liquidity: f64,
 }
 
 impl Config {
@@ -151,6 +163,7 @@ impl Config {
             swing_zone_low: DEFAULT_SWING_ZONE_LOW,
             swing_zone_high: DEFAULT_SWING_ZONE_HIGH,
             swing_zone_target_factor: DEFAULT_SWING_ZONE_TARGET_FACTOR,
+            swing_zone_spread_multiplier: DEFAULT_SWING_ZONE_SPREAD_MULTIPLIER,
             news_guard_window_secs: DEFAULT_NEWS_GUARD_WINDOW_SECS,
             news_event_times: DEFAULT_NEWS_EVENT_TIMES
                 .iter()
@@ -171,6 +184,11 @@ impl Config {
             pinned_low: DEFAULT_PINNED_LOW,
             pinned_high: DEFAULT_PINNED_HIGH,
             target_duration: DEFAULT_DURATION,
+            order_imbalance_window_secs: DEFAULT_ORDER_IMBALANCE_WINDOW_SECS,
+            order_imbalance_threshold: DEFAULT_ORDER_IMBALANCE_THRESHOLD,
+            rnjd_risk_aversion: DEFAULT_RNJD_RISK_AVERSION,
+            rnjd_time_horizon: DEFAULT_RNJD_TIME_HORIZON,
+            rnjd_k_liquidity: DEFAULT_RNJD_K_LIQUIDITY,
             dry_run: false,
         })
     }
