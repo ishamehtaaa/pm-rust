@@ -126,6 +126,75 @@ impl RoundState {
             }
         }
     }
+
+    /// Calculate hedge urgency level and which side needs hedging
+    /// Returns (side_that_needs_more, urgency_level)
+    /// Urgency level: 0.0 = balanced, 1.0 = critical (at max exposure)
+    pub fn hedge_urgency(&self, max_unpaired: Decimal) -> HedgeUrgency {
+        let unpaired_up = self.unpaired_up();
+        let unpaired_down = self.unpaired_down();
+
+        if unpaired_up > unpaired_down && unpaired_up > dec!(1) {
+            // We have more Up shares, need to buy Down
+            let urgency = if max_unpaired > Decimal::ZERO {
+                (unpaired_up / max_unpaired).min(dec!(1))
+            } else {
+                dec!(1)
+            };
+            HedgeUrgency {
+                needs_side: MarketSide::Down,
+                urgency_level: urgency,
+                unpaired_shares: unpaired_up,
+            }
+        } else if unpaired_down > unpaired_up && unpaired_down > dec!(1) {
+            // We have more Down shares, need to buy Up
+            let urgency = if max_unpaired > Decimal::ZERO {
+                (unpaired_down / max_unpaired).min(dec!(1))
+            } else {
+                dec!(1)
+            };
+            HedgeUrgency {
+                needs_side: MarketSide::Up,
+                urgency_level: urgency,
+                unpaired_shares: unpaired_down,
+            }
+        } else {
+            // Balanced
+            HedgeUrgency {
+                needs_side: MarketSide::Up,  // Arbitrary, won't be used
+                urgency_level: Decimal::ZERO,
+                unpaired_shares: Decimal::ZERO,
+            }
+        }
+    }
+}
+
+/// Represents the urgency to hedge an exposed position
+#[derive(Debug, Clone)]
+pub struct HedgeUrgency {
+    /// The side we need to buy to balance
+    pub needs_side: MarketSide,
+    /// Urgency level from 0.0 (balanced) to 1.0 (critical)
+    pub urgency_level: Decimal,
+    /// Number of unpaired shares on the opposite side
+    pub unpaired_shares: Decimal,
+}
+
+impl HedgeUrgency {
+    /// Returns true if urgency is significant (> 0.3)
+    pub fn is_significant(&self) -> bool {
+        self.urgency_level > dec!(0.3)
+    }
+
+    /// Returns true if urgency is high (> 0.5)
+    pub fn is_high(&self) -> bool {
+        self.urgency_level > dec!(0.5)
+    }
+
+    /// Returns true if urgency is critical (> 0.8)
+    pub fn is_critical(&self) -> bool {
+        self.urgency_level > dec!(0.8)
+    }
 }
 
 impl MarketPairState {
@@ -286,6 +355,13 @@ impl PairTracker {
             Some(state) => state.room_for_side(side, target_per_round, max_unpaired),
             None => target_per_round, // No state, full room
         }
+    }
+
+    /// Get hedge urgency for a market
+    pub fn hedge_urgency(&self, market_id: &str, max_unpaired: Decimal) -> Option<HedgeUrgency> {
+        self.markets
+            .get(market_id)
+            .map(|state| state.current_round.hedge_urgency(max_unpaired))
     }
 
     /// Get completed rounds for a market

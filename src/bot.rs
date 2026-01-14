@@ -1,4 +1,5 @@
-use crate::clob_api::fetch_token_balances;
+use crate::arb_detector::{ArbDetector, ArbDetectorConfig};
+use crate::clob_api::{SharedTickSizeCache, TickSizeCache, fetch_token_balances};
 use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
 use crate::market_cache::MarketCache;
@@ -7,6 +8,7 @@ use crate::poller::{
     LedgerHandle, MarketSide, spawn_ledger_actor, spawn_order_feed, spawn_reconciliation_poller,
 };
 use crate::price_feed::{PriceCache, spawn_price_feed};
+use rust_decimal_macros::dec;
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::{Timelike, Utc};
@@ -20,7 +22,7 @@ use polymarket_client_sdk::clob::types::{Side as ClobSide, SignatureType, Signed
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
-use polymarket_client_sdk::ws::config::Config as WsConfig;
+use polymarket_client_sdk::clob::ws::config::Config as WsConfig;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -31,10 +33,12 @@ use tracing::{debug, error, info, instrument, trace, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(500);  // Slower loop - less churn
+const LOOP_DELAY: Duration = Duration::from_millis(250);  // Constant participation
+const LOOP_DELAY_FAST: Duration = Duration::from_millis(100);  // Faster when imbalanced
+const HIGH_EDGE_BPS_THRESHOLD: i32 = 50;  // Triggers faster mode
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
-const PREFETCH_CONCURRENCY: usize = 6;
-const SIGN_CONCURRENCY: usize = 4;
+const PREFETCH_CONCURRENCY: usize = 8;
+const SIGN_CONCURRENCY: usize = 12;  // High concurrency for rapid order placement
 
 /// Consolidated view of a market we're trading
 #[derive(Clone)]
@@ -90,6 +94,12 @@ pub struct SimpleBot {
     /// Ladder strategy
     ladder_engine: LadderEngine,
     ladder_state: LadderState,
+
+    /// Arbitrage opportunity detector
+    arb_detector: ArbDetector,
+
+    /// Tick size cache for faster order building
+    tick_size_cache: SharedTickSizeCache,
 }
 
 impl SimpleBot {
@@ -131,13 +141,20 @@ impl SimpleBot {
             spawn_reconciliation_poller(client.clone(), ledger.clone(), Duration::from_secs(3));
 
         let target_assets = config.target_assets.clone();
+        let market_duration = config.market_duration;
+
+        // Initialize arb detector with default config
+        let arb_detector = ArbDetector::new(ArbDetectorConfig::default())?;
+
+        // Initialize tick size cache
+        let tick_size_cache = Arc::new(TickSizeCache::default());
 
         Ok(Self {
             config,
             client,
             ws_client,
             signer,
-            market_cache: MarketCache::new(target_assets),
+            market_cache: MarketCache::new(target_assets, market_duration),
             markets: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
@@ -148,6 +165,8 @@ impl SimpleBot {
             _reconciliation_poller: reconciliation_poller,
             ladder_engine: LadderEngine::new(LadderConfig::default()),
             ladder_state: LadderState::default(),
+            arb_detector,
+            tick_size_cache,
         })
     }
 
@@ -162,8 +181,28 @@ impl SimpleBot {
             }
 
             self.scan().await;
-            tokio::time::sleep(LOOP_DELAY).await;
+
+            // Use faster loop delay when high edge opportunities exist
+            let delay = self.compute_loop_delay();
+            tokio::time::sleep(delay).await;
         }
+    }
+
+    /// Compute loop delay based on current arb opportunities
+    fn compute_loop_delay(&self) -> Duration {
+        // Check if any market has high edge
+        for market in self.markets.values() {
+            let edge_bps = self.arb_detector.edge_bps(&market.market_id);
+            if edge_bps >= HIGH_EDGE_BPS_THRESHOLD {
+                debug!(
+                    market_id = %market.market_id,
+                    edge_bps,
+                    "High edge detected, using fast loop"
+                );
+                return LOOP_DELAY_FAST;
+            }
+        }
+        LOOP_DELAY
     }
 
     #[instrument(skip(self), fields(markets = self.markets.len()))]
@@ -259,12 +298,15 @@ impl SimpleBot {
         token_ids.sort();
         token_ids.dedup();
 
+        // Prefetch tick sizes into cache
+        self.tick_size_cache.prefetch(&self.client, &token_ids).await;
+
+        // Also fetch neg_risk in parallel
         let client = self.client.clone();
         stream::iter(token_ids)
             .map(|token_id| {
                 let client = client.clone();
                 async move {
-                    let _ = client.tick_size(&token_id).await;
                     let _ = client.neg_risk(&token_id).await;
                 }
             })
@@ -321,7 +363,7 @@ impl SimpleBot {
     }
 
     /// Evaluate a single market, returning an action if needed
-    async fn evaluate_market(&self, market: &ActiveMarket) -> Option<MarketAction> {
+    async fn evaluate_market(&mut self, market: &ActiveMarket) -> Option<MarketAction> {
         // Safety check: don't place new orders too close to market end
         let now = Utc::now();
         let seconds_until_end = (market.end_time - now).num_seconds();
@@ -337,18 +379,30 @@ impl SimpleBot {
             return None;
         }
 
-        // Get prices
-        let (up_ask, down_ask) = {
+        // Get prices and liquidity
+        let (up_ask, down_ask, up_liq, down_liq) = {
             let cache = self.price_cache.read();
             let up = cache.get(&market.up_token_id)?.1;
             let down = cache.get(&market.down_token_id)?.1;
-            (up, down)
+            // For now, use a default liquidity value; could be enhanced with orderbook depth
+            (up, down, dec!(100), dec!(100))
         };
+
+        // Check for arb opportunity and log it
+        let _arb_opp = self.arb_detector.check_opportunity(
+            &market.market_id,
+            &market.asset,
+            up_ask,
+            down_ask,
+            up_liq,
+            down_liq,
+        );
 
         trace!(
             market_id = %market.market_id,
             up_ask = %up_ask,
             down_ask = %down_ask,
+            edge_bps = self.arb_detector.edge_bps(&market.market_id),
             "Price check"
         );
 
@@ -368,9 +422,23 @@ impl SimpleBot {
         let snapshot = self.ledger.get_state(&market.market_id).await;
         let locked_pairs = self.ledger.get_locked_pairs(&market.market_id).await;
         let (max_up_price, max_down_price) = self.ledger.get_max_hedge_prices(&market.market_id).await;
+        let hedge_urgency = self.ledger.get_hedge_urgency(&market.market_id).await;
 
-        // Compute ladder
-        let plan = self.ladder_engine.compute_ladder(
+        // Log if we have urgency
+        if let Some(ref u) = hedge_urgency {
+            if u.is_significant() {
+                debug!(
+                    market_id = %market.market_id,
+                    needs_side = ?u.needs_side,
+                    urgency_level = %u.urgency_level,
+                    unpaired = %u.unpaired_shares,
+                    "Hedge urgency detected"
+                );
+            }
+        }
+
+        // Compute ladder with urgency awareness
+        let plan = self.ladder_engine.compute_ladder_with_urgency(
             up_ask,
             down_ask,
             &snapshot.position,
@@ -380,6 +448,7 @@ impl SimpleBot {
             locked_pairs,
             max_up_price,
             max_down_price,
+            hedge_urgency.as_ref(),
         );
 
         if plan.cancellations.is_empty() && plan.orders.is_empty() {
@@ -507,6 +576,7 @@ impl SimpleBot {
         let client = self.client.clone();
         let up_token_id = market.up_token_id.clone();
         let down_token_id = market.down_token_id.clone();
+        let tick_size_cache = self.tick_size_cache.clone();
 
         stream::iter(orders.iter().cloned())
             .map(|order| {
@@ -514,14 +584,16 @@ impl SimpleBot {
                 let signer = signer.clone();
                 let up_token_id = up_token_id.clone();
                 let down_token_id = down_token_id.clone();
+                let tick_size_cache = tick_size_cache.clone();
                 async move {
                     let token_id = match order.side {
                         MarketSide::Up => up_token_id.as_str(),
                         MarketSide::Down => down_token_id.as_str(),
                     };
 
-                    let tick_size = match client.tick_size(token_id).await {
-                        Ok(resp) => resp.minimum_tick_size.as_decimal(),
+                    // Use cached tick size for faster builds
+                    let tick_size = match tick_size_cache.get_or_fetch(&client, token_id).await {
+                        Ok(ts) => ts,
                         Err(e) => {
                             error!(error = %e, "Failed to fetch tick size");
                             return None;

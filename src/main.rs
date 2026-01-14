@@ -1,9 +1,10 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::{Config, resolve_target_assets};
+use polymarket::config::{Config, MarketDuration, resolve_target_assets};
+use std::str::FromStr;
 use tracing_subscriber::{
     EnvFilter,
-    fmt::{self, time::ChronoLocal},
+    fmt::time::ChronoLocal,
 };
 
 #[derive(Parser)]
@@ -22,6 +23,12 @@ struct Args {
         help = "Comma-separated asset names or prefixes to target"
     )]
     assets: Option<Vec<String>>,
+
+    #[arg(
+        long,
+        help = "Market duration to target: 15m or 1hr"
+    )]
+    duration: Option<String>,
 }
 
 #[tokio::main]
@@ -53,6 +60,10 @@ async fn main() -> anyhow::Result<()> {
         config.target_assets = resolved;
     }
 
+    if let Some(duration) = args.duration {
+        config.market_duration = MarketDuration::from_str(&duration)?;
+    }
+
     /* Initialize the logger with a custom timestamp and quieting noisy logs. */
     tracing_subscriber::fmt()
         .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
@@ -60,8 +71,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!(
-        "Starting Polymarket bot (dry_run={}, targets={:?})",
+        "Starting Polymarket bot (dry_run={}, duration={}, targets={:?})",
         config.dry_run,
+        config.market_duration,
         config.target_assets
     );
 

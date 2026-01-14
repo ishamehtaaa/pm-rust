@@ -2,8 +2,97 @@ use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+
+/// Market duration types for Up/Down markets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarketDuration {
+    /// 15-minute markets (tag: 102467, slug: btc-updown-15m-*)
+    FifteenMin,
+    /// 1-hour markets (tag: 102175, slug: ethereum-up-or-down-january-13-6pm-et)
+    OneHour,
+}
+
+impl MarketDuration {
+    /// Get the Gamma API tag_id for this duration
+    pub fn tag_id(&self) -> &'static str {
+        match self {
+            MarketDuration::FifteenMin => "102467",
+            MarketDuration::OneHour => "102175",
+        }
+    }
+
+    /// Get human-readable name
+    pub fn name(&self) -> &'static str {
+        match self {
+            MarketDuration::FifteenMin => "15m",
+            MarketDuration::OneHour => "1hr",
+        }
+    }
+
+    /// Check if a slug matches this duration's pattern
+    pub fn matches_slug(&self, slug: &str) -> bool {
+        match self {
+            MarketDuration::FifteenMin => {
+                // Pattern: {asset}-updown-15m-{number}
+                let parts: Vec<&str> = slug.split('-').collect();
+                parts.len() >= 4 
+                    && parts.get(1) == Some(&"updown") 
+                    && parts.get(2) == Some(&"15m")
+            }
+            MarketDuration::OneHour => {
+                // Pattern: {asset}-up-or-down-{month}-{day}-{time}-et
+                // e.g., "ethereum-up-or-down-january-13-6pm-et"
+                slug.contains("-up-or-down-") && slug.ends_with("-et")
+            }
+        }
+    }
+
+    /// Extract asset prefix from slug based on duration pattern
+    pub fn extract_asset_prefix(&self, slug: &str) -> Option<String> {
+        match self {
+            MarketDuration::FifteenMin => {
+                // First part before first dash
+                slug.split('-').next().map(|s| s.to_ascii_lowercase())
+            }
+            MarketDuration::OneHour => {
+                // First part before "-up-or-down-"
+                slug.split("-up-or-down-")
+                    .next()
+                    .map(|s| s.to_ascii_lowercase())
+            }
+        }
+    }
+}
+
+impl Default for MarketDuration {
+    fn default() -> Self {
+        MarketDuration::FifteenMin
+    }
+}
+
+impl FromStr for MarketDuration {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "15m" | "15min" | "fifteen" | "fifteenmin" => Ok(MarketDuration::FifteenMin),
+            "1h" | "1hr" | "hour" | "onehour" | "1hour" => Ok(MarketDuration::OneHour),
+            _ => Err(anyhow::anyhow!(
+                "Unknown market duration '{}'. Valid options: 15m, 1hr",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for MarketDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
@@ -87,6 +176,7 @@ pub struct Config {
     pub polymarket_private_key: String,
     pub polymarket_proxy_address: String,
     pub target_assets: HashSet<String>,
+    pub market_duration: MarketDuration,
     pub shares_target_per_side: Decimal,
     pub order_size: Decimal,
     pub target_total_cost: Decimal,
@@ -112,12 +202,17 @@ impl Config {
             Err(_) => TARGET_ASSETS.clone(),
         };
 
+        let market_duration = match std::env::var("MARKET_DURATION") {
+            Ok(v) => MarketDuration::from_str(&v)?,
+            Err(_) => MarketDuration::default(),
+        };
+
         let shares_target_per_side = parse_decimal_env("SHARES_TARGET_PER_SIDE", dec!(25))?;
         let order_size = parse_decimal_env("ORDER_SIZE", dec!(5))?;
         let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
         let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
         let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
-        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 10)?;  // 10s cooldown - let orders sit
+        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 2)?;  // 2s cooldown - constant hunting
 
         if shares_target_per_side <= Decimal::ZERO {
             return Err(anyhow::anyhow!(
@@ -155,6 +250,7 @@ impl Config {
             polymarket_private_key,
             polymarket_proxy_address,
             target_assets,
+            market_duration,
             shares_target_per_side,
             order_size,
             target_total_cost,

@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::Client;
@@ -5,11 +6,94 @@ use polymarket_client_sdk::clob::types::AssetType;
 use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, TradesRequest};
 use polymarket_client_sdk::clob::types::response::{Page, TradeResponse};
 use rust_decimal::Decimal;
-use tracing::{error, info};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info};
 
 use crate::constants::to_shares;
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
+
+/// Cache for tick sizes to avoid repeated API calls
+/// Tick sizes rarely change, so we cache them with a TTL
+#[derive(Debug)]
+pub struct TickSizeCache {
+    cache: RwLock<HashMap<String, (Decimal, Instant)>>,
+    ttl: Duration,
+}
+
+impl Default for TickSizeCache {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300)) // 5 minute TTL
+    }
+}
+
+impl TickSizeCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            cache: RwLock::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Get cached tick size or None if not cached/expired
+    pub fn get(&self, token_id: &str) -> Option<Decimal> {
+        let cache = self.cache.read();
+        if let Some((tick_size, inserted_at)) = cache.get(token_id) {
+            if inserted_at.elapsed() < self.ttl {
+                return Some(*tick_size);
+            }
+        }
+        None
+    }
+
+    /// Insert a tick size into the cache
+    pub fn insert(&self, token_id: String, tick_size: Decimal) {
+        let mut cache = self.cache.write();
+        cache.insert(token_id, (tick_size, Instant::now()));
+    }
+
+    /// Get tick size, fetching from API if not cached
+    pub async fn get_or_fetch(
+        &self,
+        client: &AuthenticatedClient,
+        token_id: &str,
+    ) -> anyhow::Result<Decimal> {
+        // Check cache first
+        if let Some(tick_size) = self.get(token_id) {
+            debug!(token_id = %token_id, tick_size = %tick_size, "Tick size cache hit");
+            return Ok(tick_size);
+        }
+
+        // Fetch from API
+        let resp = client.tick_size(token_id).await?;
+        let tick_size = resp.minimum_tick_size.as_decimal();
+        
+        debug!(token_id = %token_id, tick_size = %tick_size, "Tick size fetched and cached");
+        self.insert(token_id.to_string(), tick_size);
+        
+        Ok(tick_size)
+    }
+
+    /// Prefetch tick sizes for multiple tokens
+    pub async fn prefetch(
+        &self,
+        client: &AuthenticatedClient,
+        token_ids: &[String],
+    ) {
+        for token_id in token_ids {
+            if self.get(token_id).is_none() {
+                if let Ok(resp) = client.tick_size(token_id).await {
+                    self.insert(token_id.clone(), resp.minimum_tick_size.as_decimal());
+                }
+            }
+        }
+    }
+}
+
+/// Shared tick size cache wrapped in Arc for multi-threaded use
+pub type SharedTickSizeCache = Arc<TickSizeCache>;
 
 pub async fn fetch_token_balances(
     client: &AuthenticatedClient,

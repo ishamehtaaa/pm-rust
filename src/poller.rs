@@ -75,6 +75,11 @@ pub enum LedgerCommand {
         market_id: String,
         reply: tokio::sync::oneshot::Sender<(Option<Decimal>, Option<Decimal>)>, // (max_up, max_down)
     },
+    /// Request hedge urgency for a market
+    GetHedgeUrgency {
+        market_id: String,
+        reply: tokio::sync::oneshot::Sender<Option<crate::pair_tracker::HedgeUrgency>>,
+    },
 }
 
 /// Snapshot of ledger state for a market
@@ -337,6 +342,12 @@ impl LedgerActor {
                     (None, None)
                 };
                 let _ = reply.send((max_up, max_down));
+            }
+            LedgerCommand::GetHedgeUrgency { market_id, reply } => {
+                let urgency = self
+                    .pair_tracker
+                    .hedge_urgency(&market_id, self.round_config.max_unpaired);
+                let _ = reply.send(urgency);
             }
         }
     }
@@ -642,6 +653,22 @@ impl LedgerHandle {
             })
             .await;
         reply_rx.await.unwrap_or((None, None))
+    }
+
+    /// Get hedge urgency for a market
+    pub async fn get_hedge_urgency(
+        &self,
+        market_id: &str,
+    ) -> Option<crate::pair_tracker::HedgeUrgency> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .tx
+            .send(LedgerCommand::GetHedgeUrgency {
+                market_id: market_id.to_string(),
+                reply: reply_tx,
+            })
+            .await;
+        reply_rx.await.unwrap_or(None)
     }
 }
 

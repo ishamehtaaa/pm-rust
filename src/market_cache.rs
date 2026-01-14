@@ -1,4 +1,4 @@
-use crate::config::ASSETS_BY_PREFIX;
+use crate::config::{ASSETS_BY_PREFIX, MarketDuration};
 use crate::models::{duration_label, MarketInfo};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
@@ -19,13 +19,20 @@ pub enum MarketCacheError {
 pub struct MarketCache {
     client: GammaClient,
     target_assets: HashSet<String>,
+    market_duration: MarketDuration,
 }
 
 impl MarketCache {
-    pub fn new(target_assets: HashSet<String>) -> Self {
+    pub fn new(target_assets: HashSet<String>, market_duration: MarketDuration) -> Self {
+        info!(
+            duration = %market_duration,
+            tag_id = market_duration.tag_id(),
+            "MarketCache initialized"
+        );
         Self {
             client: GammaClient::default(),
             target_assets,
+            market_duration,
         }
     }
 
@@ -44,7 +51,7 @@ impl MarketCache {
 
     async fn fetch_raw_markets(&self) -> Result<Vec<GammaMarket>, MarketCacheError> {
         let request = MarketsRequest::builder()
-            .tag_id("102467")
+            .tag_id(self.market_duration.tag_id())
             .limit(1200)
             .closed(false)
             .ascending(false)
@@ -59,11 +66,13 @@ impl MarketCache {
     fn convert_market(&self, m: GammaMarket) -> Option<MarketInfo> {
         let slug = m.slug.as_deref()?;
          
-        if !is_15m_market(slug) {
+        // Check if slug matches the configured duration pattern
+        if !self.market_duration.matches_slug(slug) {
             return None;
         }
 
-        let prefix = slug.split('-').next()?.to_ascii_lowercase();
+        // Extract asset prefix based on duration pattern
+        let prefix = self.market_duration.extract_asset_prefix(slug)?;
         let asset_info = ASSETS_BY_PREFIX.get(&prefix)?;
 
         // Must be a target asset
@@ -103,25 +112,44 @@ impl MarketCache {
     }
 }
 
-
-fn is_15m_market(slug: &str) -> bool {
-    // Match pattern: {asset}-updown-15m-{number}
-    let parts: Vec<&str> = slug.split('-').collect();
-    if parts.len() < 4 {
-        return false;
-    }
-    parts.get(1) == Some(&"updown") && parts.get(2) == Some(&"15m")
-}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_is_15m_market() {
-        assert!(is_15m_market("btc-updown-15m-123"));
-        assert!(is_15m_market("btc-updown-15m-1767301200"));
-        assert!(!is_15m_market("btc-up-or-down-1hr"));
-        assert!(!is_15m_market("btc-updown-1hr-123"));
-        assert!(!is_15m_market("random-slug"));
+    fn test_15m_market_matching() {
+        let duration = MarketDuration::FifteenMin;
+        assert!(duration.matches_slug("btc-updown-15m-123"));
+        assert!(duration.matches_slug("btc-updown-15m-1767301200"));
+        assert!(!duration.matches_slug("btc-up-or-down-1hr"));
+        assert!(!duration.matches_slug("btc-updown-1hr-123"));
+        assert!(!duration.matches_slug("random-slug"));
+        assert!(!duration.matches_slug("ethereum-up-or-down-january-13-6pm-et"));
+    }
+
+    #[test]
+    fn test_1hr_market_matching() {
+        let duration = MarketDuration::OneHour;
+        assert!(duration.matches_slug("ethereum-up-or-down-january-13-6pm-et"));
+        assert!(duration.matches_slug("bitcoin-up-or-down-january-14-3am-et"));
+        assert!(duration.matches_slug("solana-up-or-down-february-1-12pm-et"));
+        assert!(!duration.matches_slug("btc-updown-15m-123"));
+        assert!(!duration.matches_slug("random-slug"));
+    }
+
+    #[test]
+    fn test_asset_extraction_15m() {
+        let duration = MarketDuration::FifteenMin;
+        assert_eq!(duration.extract_asset_prefix("btc-updown-15m-123"), Some("btc".to_string()));
+        assert_eq!(duration.extract_asset_prefix("eth-updown-15m-456"), Some("eth".to_string()));
+        assert_eq!(duration.extract_asset_prefix("sol-updown-15m-789"), Some("sol".to_string()));
+    }
+
+    #[test]
+    fn test_asset_extraction_1hr() {
+        let duration = MarketDuration::OneHour;
+        assert_eq!(duration.extract_asset_prefix("ethereum-up-or-down-january-13-6pm-et"), Some("ethereum".to_string()));
+        assert_eq!(duration.extract_asset_prefix("bitcoin-up-or-down-january-14-3am-et"), Some("bitcoin".to_string()));
+        assert_eq!(duration.extract_asset_prefix("solana-up-or-down-february-1-12pm-et"), Some("solana".to_string()));
     }
 }
