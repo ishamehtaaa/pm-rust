@@ -3,9 +3,11 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use rust_decimal::Decimal;
+use alloy::primitives::U256;
+use std::str::FromStr;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Shared price state updated by WebSocket feed
 #[derive(Debug, Default)]
@@ -36,9 +38,17 @@ pub fn spawn_price_feed(
     cache: Arc<RwLock<PriceCache>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let client = WsClient::new(ws_endpoint, Default::default())?;
+    let asset_ids: anyhow::Result<Vec<U256>> = asset_ids
+        .into_iter()
+        .map(|id| {
+            U256::from_str(&id).map_err(|e| anyhow::anyhow!("Invalid asset id {}: {}", id, e))
+        })
+        .collect();
+    let asset_ids = asset_ids?;
 
     let handle = tokio::spawn(async move {
         // Subscribe inside the async block so client lives as long as stream
+        trace!(asset_ids = ?asset_ids, "Subscribing to orderbook");
         let stream = match client.subscribe_orderbook(asset_ids) {
             Ok(s) => s,
             Err(e) => {
@@ -52,6 +62,7 @@ pub fn spawn_price_feed(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(book) => {
+                    trace!(asset_id = %book.asset_id, bids = book.bids.len(), asks = book.asks.len(), "Orderbook update");
                     let best_bid = book.bids.iter()
                         .map(|l| l.price)
                         .max();
@@ -62,11 +73,12 @@ pub fn spawn_price_feed(
                         .min();
 
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                        let bid_dec: Decimal = bid.to_string().parse().unwrap_or_default();
-                        let ask_dec: Decimal = ask.to_string().parse().unwrap_or_default();
                         let ts: u64 = book.timestamp.try_into().unwrap_or(0);
-
-                        cache.write().update(book.asset_id, bid_dec, ask_dec, ts);
+                        cache
+                            .write()
+                            .update(book.asset_id.to_string(), bid, ask, ts);
+                    } else {
+                        trace!(asset_id = %book.asset_id, "Orderbook update without best bid/ask");
                     }
                 }
                 Err(e) => {

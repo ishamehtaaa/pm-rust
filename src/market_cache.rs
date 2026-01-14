@@ -71,12 +71,12 @@ impl MarketCache {
             return None;
         }
 
-        // Parse outcomes from JSON string
-        let outcomes_str = m.outcomes.as_deref()?;
-        let outcomes: Vec<String> = serde_json::from_str(outcomes_str).ok()?;
-
-        let clob_token_ids_str = m.clob_token_ids.as_deref()?;
-        let clob_token_ids: Vec<String> = serde_json::from_str(clob_token_ids_str).ok()?;
+        let outcomes = m.outcomes?;
+        let clob_token_ids = m.clob_token_ids?;
+        let clob_token_ids: Vec<String> = clob_token_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
 
         if outcomes.len() != 2 || clob_token_ids.len() != 2 {
             return None;

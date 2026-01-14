@@ -27,5 +27,7 @@ anyhow = "1"
 
 parking_lot = "0.12"
 once_cell = "1"
-polymarket-client-sdk = {version = "0.3.3", features = ["gamma", "rtds", "ws"]}
+polymarket-client-sdk = {version = "0.4.1", features = ["gamma", "rtds", "ws", "clob"]}
 futures = "0.3.31"
+rand = "0.8"
+rand_distr = "0.4"

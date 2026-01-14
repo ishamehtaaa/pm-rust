@@ -9,8 +9,9 @@ use polymarket_client_sdk::clob::types::response::NotificationPayload;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, trace};
 use chrono::Utc;
 
 use crate::ladder::OpenOrderInfo;
@@ -40,6 +41,10 @@ pub struct InventoryLedger {
     tracked_orders: HashMap<String, TrackedOrder>,
     /// Maps asset_id -> (market_id, side) for quick notification processing
     asset_to_market: HashMap<String, (String, MarketSide)>,
+    /// Maps market_id -> display label
+    market_labels: HashMap<String, String>,
+    /// Throttle unregistered asset logs
+    last_unregistered_asset_log: HashMap<String, Instant>,
     /// Track processed notification IDs to avoid duplicates (order_id -> last_matched_size)
     processed_notifications: HashMap<String, Decimal>,
 }
@@ -53,28 +58,69 @@ pub struct MarketPosition {
 }
 
 impl InventoryLedger {
+    fn should_log_unregistered_asset(&mut self, asset_id: &str) -> bool {
+        let now = Instant::now();
+        let min_interval = Duration::from_secs(10);
+        match self.last_unregistered_asset_log.get(asset_id) {
+            Some(last) if now.duration_since(*last) < min_interval => false,
+            _ => {
+                self.last_unregistered_asset_log
+                    .insert(asset_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    fn market_label(&self, market_id: &str) -> String {
+        self.market_labels
+            .get(market_id)
+            .cloned()
+            .unwrap_or_else(|| market_id.to_string())
+    }
+
     /// Register a market so notifications can be routed correctly
     pub fn register_market(
         &mut self,
         market_id: String,
         up_token_id: String,
         down_token_id: String,
+        label: String,
     ) {
+        let market_label = label.clone();
         debug!(
-            market_id = %market_id,
+            market = %market_label,
             up_token = %up_token_id,
             down_token = %down_token_id,
             "Registering market tokens"
         );
 
+        self.market_labels.insert(market_id.clone(), label);
         self.asset_to_market.insert(
             up_token_id,
             (market_id.clone(), MarketSide::Up),
         );
         self.asset_to_market.insert(
             down_token_id,
-            (market_id, MarketSide::Down),
+            (market_id.clone(), MarketSide::Down),
         );
+    }
+
+    pub fn unregister_market(&mut self, market_id: &str, up_token_id: &str, down_token_id: &str) {
+        self.positions.remove(market_id);
+        self.market_labels.remove(market_id);
+        self.asset_to_market.remove(up_token_id);
+        self.asset_to_market.remove(down_token_id);
+
+        let removed_orders: Vec<String> = self
+            .tracked_orders
+            .iter()
+            .filter(|(_, o)| o.market_id == market_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for order_id in removed_orders {
+            self.tracked_orders.remove(&order_id);
+            self.processed_notifications.remove(&order_id);
+        }
     }
 
     pub fn record_order_placed(
@@ -86,6 +132,7 @@ impl InventoryLedger {
         size: Decimal,
         price: Decimal,
     ) {
+        let market_label = self.market_label(&market_id);
         // Register token_id -> (market_id, side) if not already registered
         self.asset_to_market.entry(token_id.clone())
             .or_insert((market_id.clone(), side));
@@ -94,7 +141,7 @@ impl InventoryLedger {
             order_id.clone(),
             TrackedOrder {
                 order_id,
-                market_id,
+                market_id: market_id.clone(),
                 side,
                 original_size: size,
                 filled_size: Decimal::ZERO,
@@ -104,6 +151,7 @@ impl InventoryLedger {
         );
 
         debug!(
+            market = %market_label,
             token_id = %token_id,
             side = ?side,
             size = %size,
@@ -123,7 +171,7 @@ impl InventoryLedger {
         pos.down_shares = down_shares;
 
         info!(
-            market_id = %market_id,
+            market = %self.market_label(&market_id),
             up_shares = %up_shares,
             down_shares = %down_shares,
             "Initial position set"
@@ -135,9 +183,9 @@ impl InventoryLedger {
         let order_id = &notif.order_id;
 
         // Parse notification sizes
-        let matched: Decimal = notif.matched_size.to_string().parse().unwrap_or_default();
-        let remaining: Decimal = notif.remaining_size.to_string().parse().unwrap_or_default();
-        let original: Decimal = notif.original_size.to_string().parse().unwrap_or_default();
+        let matched = notif.matched_size;
+        let remaining = notif.remaining_size;
+        let original = notif.original_size;
 
         // Check if we've already processed this exact notification state
         if let Some(&last_matched) = self.processed_notifications.get(order_id) {
@@ -156,25 +204,30 @@ impl InventoryLedger {
         self.processed_notifications.insert(order_id.clone(), matched);
 
         // Determine market_id and side from asset_id
-        let (market_id, side) = match self.asset_to_market.get(&notif.asset_id) {
+        let asset_id = notif.asset_id.to_string();
+        let (market_id, side) = match self.asset_to_market.get(&asset_id) {
             Some((m, s)) => (m.clone(), *s),
             None => {
-                warn!(
-                    asset_id = %notif.asset_id,
-                    "Notification for unregistered asset"
-                );
+                if self.should_log_unregistered_asset(&asset_id) {
+                    trace!(
+                        asset_id = %asset_id,
+                        "Notification for unregistered asset"
+                    );
+                }
                 return;
             }
         };
 
-        let price: Decimal = notif.price.to_string().parse().unwrap_or_default();
+        let price = notif.price;
 
-        info!(
+        let market_label = self.market_label(&market_id);
+        debug!(
             order_id = %order_id,
             outcome = %notif.outcome,
             matched = %matched,
             remaining = %remaining,
             side = ?side,
+            market = %market_label,
             "📬 Fill notification"
         );
 
@@ -205,13 +258,14 @@ impl InventoryLedger {
                 MarketSide::Down => pos.down_shares += fill_delta,
             }
 
-            info!(
+            debug!(
                 order_id = %order_id,
                 side = ?side,
                 fill_delta = %fill_delta,
                 total_filled = %new_filled,
                 up_shares = %pos.up_shares,
                 down_shares = %pos.down_shares,
+                market = %market_label,
                 "✅ Position updated"
             );
         }
@@ -221,10 +275,11 @@ impl InventoryLedger {
         tracked.is_open = remaining > Decimal::ZERO;
 
         if !tracked.is_open {
-            info!(
+            debug!(
                 order_id = %order_id,
                 filled = %tracked.filled_size,
                 original = %tracked.original_size,
+                market = %market_label,
                 "Order fully filled/closed"
             );
         }
@@ -252,16 +307,26 @@ impl InventoryLedger {
 
     pub fn mark_orders_cancelled(&mut self, order_ids: &[String]) {
         for order_id in order_ids {
+            let mut cancelled = None;
             if let Some(tracked) = self.tracked_orders.get_mut(order_id) {
                 if tracked.is_open {
                     tracked.is_open = false;
-                    info!(
-                        order_id = %order_id,
-                        filled = %tracked.filled_size,
-                        original = %tracked.original_size,
-                        "Order cancelled"
-                    );
+                    cancelled = Some((
+                        tracked.market_id.clone(),
+                        tracked.filled_size,
+                        tracked.original_size,
+                    ));
                 }
+            }
+            if let Some((market_id, filled, original)) = cancelled {
+                let market_label = self.market_label(&market_id);
+                debug!(
+                    order_id = %order_id,
+                    filled = %filled,
+                    original = %original,
+                    market = %market_label,
+                    "Order cancelled"
+                );
             }
         }
     }
@@ -295,7 +360,7 @@ pub fn spawn_order_poller(
                 Ok(notifications) => {
                     let count = notifications.len();
                     if count > 0 {
-                        info!("📬 Processing {} notifications", count);
+                        debug!("📬 Processing {} notifications", count);
                         let mut ledger_write = ledger.write();
                         for notif in notifications {
                             ledger_write.process_notification(&notif.payload);
@@ -315,7 +380,7 @@ pub fn spawn_order_poller(
             }
 
             if notification_count == 0 {
-                debug!("No new notifications or trades");
+                trace!("No new notifications or trades");
             }
         }
     })
@@ -343,14 +408,14 @@ async fn fetch_and_log_trades(
     info!("🔄 Fetched {} recent trades for comparison", page.data.len());
 
     // Build a map of our tracked orders for quick lookup
-    let tracked_map: HashMap<String, (Decimal, Decimal, MarketSide)> = {
-        let ledger_read = ledger.read();
-        ledger_read.tracked_orders
-            .iter()
-            .filter(|(_, o)| o.is_open)
-            .map(|(id, o)| (id.clone(), (o.filled_size, o.original_size, o.side)))
-            .collect()
-    };
+        let tracked_map: HashMap<String, (Decimal, Decimal, MarketSide)> = {
+            let ledger_read = ledger.read();
+            ledger_read.tracked_orders
+                .iter()
+                .filter(|(_, o)| o.is_open)
+                .map(|(id, o)| (id.clone(), (o.filled_size, o.original_size, o.side)))
+                .collect()
+        };
 
     if tracked_map.is_empty() {
         return Ok(());
@@ -359,8 +424,8 @@ async fn fetch_and_log_trades(
     for trade in &page.data {
         // Check if this trade is for one of our tracked orders
         if let Some((known_filled, original_size, side)) = tracked_map.get(&trade.taker_order_id) {
-            let trade_size: Decimal = trade.size.to_string().parse().unwrap_or_default();
-            let price: Decimal = trade.price.to_string().parse().unwrap_or_default();
+            let trade_size: Decimal = trade.size;
+            let price: Decimal = trade.price;
             
             info!("🔍 TRADE COMPARISON for order {}", trade.taker_order_id);
             info!("   Side: {:?} | Price: {}", side, price);

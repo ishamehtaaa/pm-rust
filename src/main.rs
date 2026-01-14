@@ -1,6 +1,8 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::Config;
+use polymarket::config::{Config, ASSETS_BY_NAME, ASSETS_BY_PREFIX};
+use rust_decimal::Decimal;
+use std::collections::HashSet;
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, time::ChronoLocal},
@@ -14,6 +16,12 @@ struct Args {
 
     #[arg(long)]
     dry_run: bool,
+
+    #[arg(long, default_value = "20", value_parser = clap::value_parser!(Decimal))]
+    shares_target_per_side: Decimal,
+
+    #[arg(long, value_delimiter = ',', default_value = "bitcoin")]
+    assets: Vec<String>,
 }
 
 fn init_tracing(log_level: &str) {
@@ -50,6 +58,33 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::from_env()?;
     config.dry_run = args.dry_run;
+    if args.shares_target_per_side <= Decimal::ZERO {
+        anyhow::bail!(
+            "shares_target_per_side must be > 0, got {}",
+            args.shares_target_per_side
+        );
+    }
+    config.shares_target_per_side = args.shares_target_per_side;
+    let mut target_assets = HashSet::new();
+    for raw in args.assets {
+        let key = raw.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(info) = ASSETS_BY_NAME.get(&key) {
+            target_assets.insert(info.asset.clone());
+            continue;
+        }
+        if let Some(info) = ASSETS_BY_PREFIX.get(&key) {
+            target_assets.insert(info.asset.clone());
+            continue;
+        }
+        anyhow::bail!("Unknown asset: {}", raw);
+    }
+    if target_assets.is_empty() {
+        anyhow::bail!("No valid assets provided");
+    }
+    config.target_assets = target_assets;
 
     tracing::info!(
         "Starting Polymarket bot (dry_run={}, targets={:?})",
@@ -58,23 +93,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut bot = SimpleBot::new(config).await?;
-    bot.discover_markets().await;
-
-    if bot.market_count() == 0 {
-        tracing::warn!("No markets discovered, will retry in main loop");
-    }
-
-    for (market_id, state) in bot.markets() {
-        tracing::info!(
-            "Market: {} | {} | {}",
-            state.info.asset,
-            state.info.duration,
-            market_id,
-        );
-    }
-
     bot.run().await;
     Ok(())
 }
-
-

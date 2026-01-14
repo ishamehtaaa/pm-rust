@@ -4,6 +4,32 @@ use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+const DEFAULT_SHARES_TARGET_PER_SIDE: Decimal = dec!(20);
+const DEFAULT_ORDER_SIZE: Decimal = dec!(5);
+const DEFAULT_TARGET_TOTAL_COST: Decimal = dec!(0.98);
+const DEFAULT_MAKER_PRICE_OFFSET: Decimal = dec!(0.01);
+const DEFAULT_MAX_PRICE_AGE_MS: i64 = 2_500;
+const DEFAULT_COOLDOWN_SECS: u64 = 2;
+const DEFAULT_TREND_WINDOW_SECS: u64 = 8;
+const DEFAULT_TREND_MAX_RANGE: Decimal = dec!(0.10);
+const DEFAULT_MAX_SIDE_SPREAD: Decimal = dec!(0.05);
+const DEFAULT_SWING_ZONE_LOW: Decimal = dec!(0.35);
+const DEFAULT_SWING_ZONE_HIGH: Decimal = dec!(0.65);
+const DEFAULT_SWING_ZONE_TARGET_FACTOR: Decimal = dec!(0.6);
+const DEFAULT_NEWS_GUARD_WINDOW_SECS: u64 = 300;
+const DEFAULT_NEWS_EVENT_TIMES: &[&str] = &[];
+const DEFAULT_DIRECTIONAL_MOVE_THRESHOLD: Decimal = dec!(0.05);
+const DEFAULT_HIGH_VOL_REVERSION_THRESHOLD: Decimal = dec!(0.02);
+const DEFAULT_MIN_LIQUIDITY_SCALE: Decimal = dec!(0.2);
+const DEFAULT_LAMBDA_PAUSE_THRESHOLD: f64 = 0.25;
+const DEFAULT_TICK_SIZE: Decimal = dec!(0.01);
+const DEFAULT_EDGE_THRESHOLD: Decimal = dec!(0.0025);
+const DEFAULT_SIZE_SCALE_MIN: Decimal = dec!(0.5);
+const DEFAULT_SIZE_SCALE_MAX: Decimal = dec!(2.0);
+const DEFAULT_WIDEN_FACTOR: Decimal = dec!(2.0);
+const DEFAULT_DRIFT_FLICKER_THRESHOLD: f64 = 0.0005;
+const DEFAULT_PINNED_LOW: Decimal = dec!(0.05);
+const DEFAULT_PINNED_HIGH: Decimal = dec!(0.95);
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
@@ -60,101 +86,74 @@ pub struct Config {
     pub maker_price_offset: Decimal,
     pub max_price_age_ms: i64,
     pub cooldown_secs: u64,
+    pub trend_window_secs: u64,
+    pub trend_max_range: Decimal,
+    pub max_side_spread: Decimal,
+    pub swing_zone_low: Decimal,
+    pub swing_zone_high: Decimal,
+    pub swing_zone_target_factor: Decimal,
+    pub news_guard_window_secs: u64,
+    pub news_event_times: Vec<chrono::DateTime<chrono::Utc>>,
+    pub directional_move_threshold: Decimal,
+    pub high_vol_reversion_threshold: Decimal,
+    pub min_liquidity_scale: Decimal,
+    pub lambda_pause_threshold: f64,
+    pub tick_size: Decimal,
+    pub edge_threshold: Decimal,
+    pub size_scale_min: Decimal,
+    pub size_scale_max: Decimal,
+    pub widen_factor: Decimal,
+    pub drift_flicker_threshold: f64,
+    pub pinned_low: Decimal,
+    pub pinned_high: Decimal,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let dry_run = std::env::var("DRY_RUN")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
         let polymarket_private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
             .map_err(|_| anyhow::anyhow!("POLYMARKET_PRIVATE_KEY env var is required"))?;
 
         let polymarket_proxy_address =
             std::env::var("POLYMARKET_PROXY_ADDRESS").unwrap_or_default();
 
-        let target_assets = match std::env::var("TARGET_ASSETS") {
-            Ok(v) => v
-                .split(',')
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            Err(_) => TARGET_ASSETS.clone(),
-        };
-
-        let shares_target_per_side = parse_decimal_env("SHARES_TARGET_PER_SIDE", dec!(25))?;
-        let order_size = parse_decimal_env("ORDER_SIZE", dec!(5))?;
-        let target_total_cost = parse_decimal_env("TARGET_TOTAL_COST", dec!(0.97))?;
-        let maker_price_offset = parse_decimal_env("MAKER_PRICE_OFFSET", dec!(0.01))?;
-        let max_price_age_ms = parse_i64_env("MAX_PRICE_AGE_MS", 2_500)?;
-        let cooldown_secs = parse_u64_env("COOLDOWN_SECS", 2)?;
-
-        if shares_target_per_side <= Decimal::ZERO {
-            return Err(anyhow::anyhow!(
-                "SHARES_TARGET_PER_SIDE must be > 0, got {}",
-                shares_target_per_side
-            ));
-        }
-        if order_size <= Decimal::ZERO {
-            return Err(anyhow::anyhow!("ORDER_SIZE must be > 0, got {}", order_size));
-        }
-        if target_total_cost <= Decimal::ZERO || target_total_cost >= dec!(1.00) {
-            return Err(anyhow::anyhow!(
-                "TARGET_TOTAL_COST must be in (0, 1.00), got {}",
-                target_total_cost
-            ));
-        }
-        if maker_price_offset < Decimal::ZERO {
-            return Err(anyhow::anyhow!(
-                "MAKER_PRICE_OFFSET must be >= 0, got {}",
-                maker_price_offset
-            ));
-        }
-        if max_price_age_ms <= 0 {
-            return Err(anyhow::anyhow!(
-                "MAX_PRICE_AGE_MS must be > 0, got {}",
-                max_price_age_ms
-            ));
-        }
+        let target_assets = TARGET_ASSETS.clone();
 
         Ok(Self {
-            dry_run,
             polymarket_private_key,
             polymarket_proxy_address,
             target_assets,
-            shares_target_per_side,
-            order_size,
-            target_total_cost,
-            maker_price_offset,
-            max_price_age_ms,
-            cooldown_secs,
+            shares_target_per_side: DEFAULT_SHARES_TARGET_PER_SIDE,
+            order_size: DEFAULT_ORDER_SIZE,
+            target_total_cost: DEFAULT_TARGET_TOTAL_COST,
+            maker_price_offset: DEFAULT_MAKER_PRICE_OFFSET,
+            max_price_age_ms: DEFAULT_MAX_PRICE_AGE_MS,
+            cooldown_secs: DEFAULT_COOLDOWN_SECS,
+            trend_window_secs: DEFAULT_TREND_WINDOW_SECS,
+            trend_max_range: DEFAULT_TREND_MAX_RANGE,
+            max_side_spread: DEFAULT_MAX_SIDE_SPREAD,
+            swing_zone_low: DEFAULT_SWING_ZONE_LOW,
+            swing_zone_high: DEFAULT_SWING_ZONE_HIGH,
+            swing_zone_target_factor: DEFAULT_SWING_ZONE_TARGET_FACTOR,
+            news_guard_window_secs: DEFAULT_NEWS_GUARD_WINDOW_SECS,
+            news_event_times: DEFAULT_NEWS_EVENT_TIMES
+                .iter()
+                .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+                .map(|r| r.map(|dt| dt.with_timezone(&chrono::Utc)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("Invalid news event time: {}", e))?,
+            directional_move_threshold: DEFAULT_DIRECTIONAL_MOVE_THRESHOLD,
+            high_vol_reversion_threshold: DEFAULT_HIGH_VOL_REVERSION_THRESHOLD,
+            min_liquidity_scale: DEFAULT_MIN_LIQUIDITY_SCALE,
+            lambda_pause_threshold: DEFAULT_LAMBDA_PAUSE_THRESHOLD,
+            tick_size: DEFAULT_TICK_SIZE,
+            edge_threshold: DEFAULT_EDGE_THRESHOLD,
+            size_scale_min: DEFAULT_SIZE_SCALE_MIN,
+            size_scale_max: DEFAULT_SIZE_SCALE_MAX,
+            widen_factor: DEFAULT_WIDEN_FACTOR,
+            drift_flicker_threshold: DEFAULT_DRIFT_FLICKER_THRESHOLD,
+            pinned_low: DEFAULT_PINNED_LOW,
+            pinned_high: DEFAULT_PINNED_HIGH,
+            dry_run: false,
         })
-    }
-}
-
-fn parse_decimal_env(key: &str, default: Decimal) -> anyhow::Result<Decimal> {
-    match std::env::var(key) {
-        Ok(v) => Decimal::from_str_exact(&v)
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_i64_env(key: &str, default: i64) -> anyhow::Result<i64> {
-    match std::env::var(key) {
-        Ok(v) => v
-            .parse::<i64>()
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_u64_env(key: &str, default: u64) -> anyhow::Result<u64> {
-    match std::env::var(key) {
-        Ok(v) => v
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e)),
-        Err(_) => Ok(default),
     }
 }
