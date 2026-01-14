@@ -1388,7 +1388,7 @@ fn build_ladder_overrides(
     up_bid: Decimal,
     up_ask: Decimal,
     down_bid: Decimal,
-    _down_ask: Decimal,
+    down_ask: Decimal,
     mid_start_end: Option<(f64, f64)>,
     edge_threshold: Decimal,
     size_scale_min: Decimal,
@@ -1406,16 +1406,40 @@ fn build_ladder_overrides(
     overrides.spacing_multiplier = Decimal::ONE;
     overrides.extra_offset = Decimal::ZERO;
 
-    if high_vol_widen {
-        overrides.spacing_multiplier = widen_factor;
-        if widen_factor > Decimal::ONE {
-            overrides.extra_offset = tick_size * (widen_factor - Decimal::ONE);
-        }
-    }
-
     let Some(summary) = summary else {
+        // No summary yet - use conservative defaults
+        if high_vol_widen {
+            overrides.spacing_multiplier = widen_factor;
+            if widen_factor > Decimal::ONE {
+                overrides.extra_offset = tick_size * (widen_factor - Decimal::ONE);
+            }
+        }
         return overrides;
     };
+
+    // === VOLATILITY-ADAPTIVE SPREAD SIZING ===
+    // Key insight: tighter spreads in calm markets (more fills), wider when volatile
+    let vol_metrics = summary.vol_metrics;
+    
+    // Base spread multiplier on calmness (0 = volatile, 1 = calm)
+    // When calm (calmness ~1.0): multiplier ~0.8 (tighter spreads)
+    // When volatile (calmness ~0.0): multiplier ~1.5 (wider spreads)
+    let vol_spread_mult = 1.5 - (0.7 * vol_metrics.calmness);
+    
+    // If high_vol_widen flag is set (from range checks), apply additional widening
+    let base_mult = if high_vol_widen {
+        vol_spread_mult * widen_factor.to_f64().unwrap_or(2.0)
+    } else {
+        vol_spread_mult
+    };
+    
+    overrides.spacing_multiplier = Decimal::from_f64(base_mult.clamp(0.8, 2.5))
+        .unwrap_or(Decimal::ONE);
+    
+    if overrides.spacing_multiplier > Decimal::ONE {
+        let extra = tick_size * (overrides.spacing_multiplier - Decimal::ONE);
+        overrides.extra_offset = extra;
+    }
 
     let rn_mid = (summary.rn_bid + summary.rn_ask) / 2.0;
     let up_bid_f = up_bid.to_f64().unwrap_or(0.0);
@@ -1426,12 +1450,14 @@ fn build_ladder_overrides(
     let dist_to_bid = (rn_mid - up_bid_f).max(0.0);
     let dist_to_ask = (up_ask_f - rn_mid).max(0.0);
 
+    // Size scaling based on edge (where fair value is vs market)
     if dist_to_ask <= edge_threshold_f {
         overrides.size_multiplier = size_scale_max;
     } else if dist_to_bid <= edge_threshold_f {
         overrides.size_multiplier = size_scale_min;
     }
 
+    // Reduce size when market is flickering with no clear direction
     if let Some((start, end)) = mid_start_end {
         let move_abs = (end - start).abs();
         if move_abs < tick_size_f && summary.drift.abs() < drift_flicker_threshold {
@@ -1450,6 +1476,8 @@ fn build_ladder_overrides(
         overrides.size_multiplier = size_scale_max;
     }
 
+    // === IMPROVED PRICE LEVEL CALCULATION ===
+    // Use fair value from RN-JD model, but validate against market
     let rn_spread = (summary.rn_ask - summary.rn_bid).max(0.0);
     let raw_levels = (rn_spread / tick_size_f).ceil();
     let max_levels = if raw_levels.is_finite() && raw_levels > 0.0 {
@@ -1459,24 +1487,99 @@ fn build_ladder_overrides(
     };
     overrides.max_levels = Some(max_levels.clamp(1, max_levels_default));
 
-    let target_up = target_bid_price(
+    // Target bid price: use RN fair value but don't be too aggressive
+    // The key fix: place orders AT or BELOW the current market bid,
+    // never crossing the spread unless we have strong edge
+    // Returns None if we shouldn't buy that side (no edge)
+    let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
+    let down_ask_f = down_ask.to_f64().unwrap_or(1.0);
+    
+    let target_up = conservative_bid_price(
         rn_mid,
         up_bid_f,
+        up_ask_f,
         edge_threshold_f,
         tick_size_f,
+        vol_metrics.calmness,
     );
+    
     let target_down_mid = 1.0 - rn_mid;
-    let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
-    let target_down = target_bid_price(
+    let target_down = conservative_bid_price(
         target_down_mid,
         down_bid_f,
+        down_ask_f,
         edge_threshold_f,
         tick_size_f,
+        vol_metrics.calmness,
     );
-    overrides.up_price_cap = Decimal::from_f64(target_up);
-    overrides.down_price_cap = Decimal::from_f64(target_down);
+    
+    // Log edge calculations for debugging
+    let up_edge = rn_mid - up_bid_f;
+    let down_edge = target_down_mid - down_bid_f;
+    debug!(
+        up_fair = %format!("{:.4}", rn_mid),
+        up_bid = %format!("{:.4}", up_bid_f),
+        up_edge = %format!("{:.4}", up_edge),
+        up_cap = ?target_up.map(|v| format!("{:.4}", v)),
+        down_fair = %format!("{:.4}", target_down_mid),
+        down_bid = %format!("{:.4}", down_bid_f),
+        down_edge = %format!("{:.4}", down_edge),
+        down_cap = ?target_down.map(|v| format!("{:.4}", v)),
+        combined_fair = %format!("{:.4}", rn_mid + target_down_mid),
+        combined_bid = %format!("{:.4}", up_bid_f + down_bid_f),
+        "Edge calculation"
+    );
+    
+    // If conservative_bid_price returns None, we have no edge on that side
+    overrides.up_price_cap = target_up.and_then(Decimal::from_f64);
+    overrides.down_price_cap = target_down.and_then(Decimal::from_f64);
 
     overrides
+}
+
+/// Calculate a conservative bid price that will actually get filled.
+/// Key principle: we want CONSISTENT fills, not aggressive pricing.
+/// Returns None if we shouldn't be buying at current prices (no edge).
+fn conservative_bid_price(
+    fair_value: f64,
+    market_bid: f64,
+    market_ask: f64,
+    edge_threshold: f64,
+    tick: f64,
+    calmness: f64,
+) -> Option<f64> {
+    // CRITICAL: Only buy if fair value is ABOVE market bid
+    // This prevents buying overpriced sides
+    let edge_above_bid = fair_value - market_bid;
+    
+    if edge_above_bid < edge_threshold {
+        // Fair value is at or below market bid - NO EDGE, don't buy
+        return None;
+    }
+    
+    let spread = market_ask - market_bid;
+    
+    // How much can we improve on the market bid?
+    // When calm: can be more aggressive (up to 30% into spread)
+    // When volatile: stay at or below market bid
+    let max_improvement_pct = 0.3 * calmness;
+    let max_improvement = spread * max_improvement_pct;
+    
+    // If fair value suggests we have edge (fair > ask), be more aggressive
+    let edge_above_ask = (fair_value - market_ask).max(0.0);
+    
+    let price = if edge_above_ask >= edge_threshold {
+        // Strong edge: can bid up to market_bid + max_improvement
+        let aggressive_bid = market_bid + max_improvement;
+        // But never above fair value minus a tick
+        aggressive_bid.min(fair_value - tick).max(tick)
+    } else {
+        // Moderate edge: bid at market_bid or slightly above
+        let slight_improvement = (max_improvement * 0.5).min(tick);
+        (market_bid + slight_improvement).min(fair_value - tick).max(tick)
+    };
+    
+    Some(price)
 }
 
 fn apply_imbalance_override(
@@ -1508,17 +1611,6 @@ fn apply_imbalance_override(
         overrides.allow_imbalance_side = Some(MarketSide::Down);
     } else if imbalance < Decimal::ZERO && up_edge >= edge_threshold_f {
         overrides.allow_imbalance_side = Some(MarketSide::Up);
-    }
-}
-
-fn target_bid_price(rn_mid: f64, bid: f64, edge_threshold: f64, tick: f64) -> f64 {
-    let back_off = (bid - tick).max(tick);
-    if rn_mid >= bid + edge_threshold {
-        bid
-    } else if rn_mid <= bid - edge_threshold {
-        back_off
-    } else {
-        bid
     }
 }
 

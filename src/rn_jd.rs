@@ -4,6 +4,10 @@ const DT: f64 = 1.0;
 const TRUNCATION_CUTOFF: f64 = 1.0;
 const EPSILON: f64 = 1e-5;
 
+/// Smoothing factor for parameter estimates (0 = no smoothing, 1 = full smoothing)
+/// 0.3 means 30% weight on new estimate, 70% on previous
+const PARAM_SMOOTHING_ALPHA: f64 = 0.3;
+
 #[derive(Debug, Clone, Copy)]
 pub struct MarketParams {
     pub sigma_b: f64,
@@ -100,6 +104,8 @@ pub fn quote_with_drift(
     }
 }
 
+/// Calibrate jump-diffusion parameters using EM algorithm with exponential smoothing.
+/// Smoothing reduces noise from short windows, giving more stable fair value estimates.
 pub fn calibrate_step_em(log_odds_increments: &[f64], current_params: &MarketParams) -> MarketParams {
     let mut new_sigma_sq_sum = 0.0;
     let mut new_lambda_sum = 0.0;
@@ -124,12 +130,26 @@ pub fn calibrate_step_em(log_odds_increments: &[f64], current_params: &MarketPar
     }
 
     let n = log_odds_increments.len() as f64;
-    let sigma_b = if weights_sum > 0.0 {
+    
+    // Raw estimates from this window
+    let raw_sigma_b = if weights_sum > 0.0 {
         (new_sigma_sq_sum / (weights_sum * DT)).sqrt()
     } else {
         current_params.sigma_b
     };
-    let jump_intensity = if n > 0.0 { (new_lambda_sum / n) / DT } else { 0.0 };
+    let raw_jump_intensity = if n > 0.0 { (new_lambda_sum / n) / DT } else { 0.0 };
+
+    // Apply exponential smoothing: blend new estimate with previous
+    // This reduces noise from short 8-second windows
+    let smoothed_sigma_b = PARAM_SMOOTHING_ALPHA * raw_sigma_b 
+        + (1.0 - PARAM_SMOOTHING_ALPHA) * current_params.sigma_b;
+    
+    let smoothed_jump_intensity = PARAM_SMOOTHING_ALPHA * raw_jump_intensity 
+        + (1.0 - PARAM_SMOOTHING_ALPHA) * current_params.jump_intensity;
+
+    // Clamp to reasonable bounds to prevent extreme estimates
+    let sigma_b = smoothed_sigma_b.clamp(0.1, 2.0);
+    let jump_intensity = smoothed_jump_intensity.clamp(0.0, 0.5);
 
     MarketParams {
         sigma_b,

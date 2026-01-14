@@ -281,6 +281,23 @@ impl LadderEngine {
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
 
+        // CRITICAL: If either price cap is None, we have NO EDGE on that side
+        // For paired orders, we need edge on BOTH sides to avoid losing money
+        let up_cap = match overrides.up_price_cap {
+            Some(cap) => cap,
+            None => {
+                trace!("No edge on Up side - skipping paired ladder");
+                return orders;
+            }
+        };
+        let down_cap = match overrides.down_price_cap {
+            Some(cap) => cap,
+            None => {
+                trace!("No edge on Down side - skipping paired ladder");
+                return orders;
+            }
+        };
+
         let mut remaining_room = up_room.min(down_room);
         if remaining_room <= Decimal::ZERO {
             return orders;
@@ -290,14 +307,11 @@ impl LadderEngine {
             (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
         let spacing = self.config.spacing * overrides.spacing_multiplier;
         let top_offset = self.config.top_offset + overrides.extra_offset;
-        let mut top_up = (up_ask - top_offset).max(dec!(0.01));
-        let mut top_down = (down_ask - top_offset).max(dec!(0.01));
-        if let Some(cap) = overrides.up_price_cap {
-            top_up = top_up.min(cap);
-        }
-        if let Some(cap) = overrides.down_price_cap {
-            top_down = top_down.min(cap);
-        }
+        
+        // Apply price caps - these are the MAXIMUM we're willing to pay
+        let top_up = (up_ask - top_offset).max(dec!(0.01)).min(up_cap);
+        let top_down = (down_ask - top_offset).max(dec!(0.01)).min(down_cap);
+        
         let tick = self.config.tick_size.max(dec!(0.01));
         let levels = overrides.max_levels.unwrap_or(self.config.levels);
 
@@ -312,7 +326,15 @@ impl LadderEngine {
                 continue;
             }
 
+            // CRITICAL: Combined cost must be below threshold
             if price_up + price_down > self.config.max_pair_cost {
+                debug!(
+                    up = %price_up,
+                    down = %price_down,
+                    combined = %(price_up + price_down),
+                    max = %self.config.max_pair_cost,
+                    "Combined cost too high - skipping level"
+                );
                 continue;
             }
 
@@ -346,6 +368,21 @@ impl LadderEngine {
         overrides: LadderOverrides,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
+        
+        // Check if we have edge on this side (price cap exists)
+        let price_cap = match side {
+            MarketSide::Up => overrides.up_price_cap,
+            MarketSide::Down => overrides.down_price_cap,
+        };
+        
+        let cap = match price_cap {
+            Some(cap) => cap,
+            None => {
+                trace!(side = ?side, "No edge on side - skipping single ladder");
+                return orders;
+            }
+        };
+        
         let room = match side {
             MarketSide::Up => up_room,
             MarketSide::Down => down_room,
@@ -362,16 +399,10 @@ impl LadderEngine {
         let tick = self.config.tick_size.max(dec!(0.01));
         let levels = overrides.max_levels.unwrap_or(self.config.levels);
 
-        let mut top_price = match side {
-            MarketSide::Up => (up_ask - top_offset).max(dec!(0.01)),
-            MarketSide::Down => (down_ask - top_offset).max(dec!(0.01)),
+        let top_price = match side {
+            MarketSide::Up => (up_ask - top_offset).max(dec!(0.01)).min(cap),
+            MarketSide::Down => (down_ask - top_offset).max(dec!(0.01)).min(cap),
         };
-        if let Some(cap) = match side {
-            MarketSide::Up => overrides.up_price_cap,
-            MarketSide::Down => overrides.down_price_cap,
-        } {
-            top_price = top_price.min(cap);
-        }
 
         let mut remaining_room = room;
         for level in 0..levels {

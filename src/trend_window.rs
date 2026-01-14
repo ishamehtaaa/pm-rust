@@ -106,6 +106,71 @@ impl TrendWindow {
         }
     }
 
+    /// Calculate volatility metrics for adaptive spread sizing.
+    /// This captures "how fast" prices are moving, not just range.
+    pub fn volatility_metrics(&self) -> VolatilityMetrics {
+        if self.samples.len() < 3 {
+            return VolatilityMetrics::default();
+        }
+
+        // Calculate realized volatility from log-odds increments
+        let mut sum_sq = 0.0;
+        let mut sum_change = 0.0;
+        let mut weight_sum = 0.0;
+        let mut weighted_direction = 0.0;
+        
+        let samples: Vec<_> = self.samples.iter().collect();
+        let n = samples.len();
+        
+        for i in 1..n {
+            let dt_ms = (samples[i].ts_ms - samples[i - 1].ts_ms) as f64;
+            if dt_ms <= 0.0 {
+                continue;
+            }
+            
+            let dx = samples[i].logit_mid - samples[i - 1].logit_mid;
+            let dt_sec = dt_ms / 1000.0;
+            
+            // Squared change normalized by time (variance per second)
+            sum_sq += dx * dx / dt_sec;
+            sum_change += 1.0;
+            
+            // Exponential weighting: recent samples matter more
+            // Weight decays with age from the end of the window
+            let recency = (i as f64) / (n as f64); // 0 = oldest, 1 = newest
+            let weight = recency.powi(2); // Quadratic decay toward older samples
+            
+            // Direction: positive dx = price going up
+            let direction = if dx > 0.0 { 1.0 } else if dx < 0.0 { -1.0 } else { 0.0 };
+            weighted_direction += weight * direction;
+            weight_sum += weight;
+        }
+
+        let realized_vol = if sum_change > 0.0 {
+            (sum_sq / sum_change).sqrt()
+        } else {
+            0.0
+        };
+
+        // Momentum: -1 (strong down) to +1 (strong up)
+        let momentum = if weight_sum > 0.0 {
+            (weighted_direction / weight_sum).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Calmness: inverse of realized vol, normalized
+        // A realized_vol of ~0.5 is "normal", below is calm, above is volatile
+        const BASELINE_VOL: f64 = 0.5;
+        let calmness = (BASELINE_VOL / (realized_vol + 0.01)).clamp(0.0, 2.0) / 2.0;
+
+        VolatilityMetrics {
+            realized_vol,
+            momentum,
+            calmness,
+        }
+    }
+
     pub fn ranges(&self) -> TrendRanges {
         TrendRanges {
             up_bid: Self::range_from(&self.min_up_bid, &self.max_up_bid),
@@ -129,10 +194,17 @@ impl TrendWindow {
         self.rn_jd_params = rn_jd::calibrate_step_em(&log_odds_increments, &self.rn_jd_params);
         let current_x = self.samples.back()?.logit_mid;
         let drift = rn_jd::calculate_rn_drift(current_x, &self.rn_jd_params, RNJD_MC_SAMPLES);
+        
+        // Calculate volatility metrics for adaptive spread sizing
+        let vol_metrics = self.volatility_metrics();
+        
+        // Adapt risk aversion based on volatility: more risk averse when volatile
+        let effective_gamma = RNJD_RISK_AVERSION * (1.0 + vol_metrics.realized_vol);
+        
         let rnjd_quotes = rn_jd::quote_with_drift(
             current_x,
             0.0,
-            RNJD_RISK_AVERSION,
+            effective_gamma,
             RNJD_TIME_HORIZON,
             self.rn_jd_params.sigma_b,
             RNJD_K_LIQUIDITY,
@@ -141,7 +213,7 @@ impl TrendWindow {
         let naive_quotes = rn_jd::quote_with_drift(
             current_x,
             0.0,
-            RNJD_RISK_AVERSION,
+            effective_gamma,
             RNJD_TIME_HORIZON,
             self.rn_jd_params.sigma_b,
             RNJD_K_LIQUIDITY,
@@ -158,6 +230,7 @@ impl TrendWindow {
             naive_bid: naive_quotes.bid_prob,
             naive_ask: naive_quotes.ask_prob,
             reservation_log_odds: rnjd_quotes.reservation_log_odds,
+            vol_metrics,
         })
     }
 
@@ -249,6 +322,17 @@ impl TrendWindow {
     }
 }
 
+/// Volatility metrics for adaptive spread sizing
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VolatilityMetrics {
+    /// Realized volatility: sqrt of mean squared log-odds changes per second
+    pub realized_vol: f64,
+    /// Momentum: exponentially-weighted recent price direction (-1 to +1)
+    pub momentum: f64,
+    /// How "calm" the market is (0 = volatile, 1 = very calm)
+    pub calmness: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RnJdSummary {
     pub sigma_b: f64,
@@ -260,6 +344,8 @@ pub struct RnJdSummary {
     pub naive_bid: f64,
     pub naive_ask: f64,
     pub reservation_log_odds: f64,
+    /// Volatility metrics for adaptive spread sizing
+    pub vol_metrics: VolatilityMetrics,
 }
 
 #[derive(Debug, Clone, Copy)]
