@@ -1,4 +1,7 @@
-use crate::arb_finder::{ArbFinder, ArbFinderConfig, ArbPrediction, MarketInfo as ArbMarketInfo};
+use crate::arb_finder::{
+    ArbFinder, ArbFinderConfig, ArbPrediction, MarketInfo as ArbMarketInfo,
+};
+use crate::arb_finder::market_state::PriceLevel;
 use crate::clob_api::fetch_token_balances;
 use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState, SideLadderConfig};
@@ -12,7 +15,7 @@ use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::{Timelike, Utc};
 use futures::stream::{self, StreamExt};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::auth::Normal;
@@ -32,28 +35,33 @@ use tracing::{debug, error, info, instrument, trace, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(10); // Fast loop for arb detection
+const LOOP_DELAY: Duration = Duration::from_millis(10); // Fast loop for ladder maintenance
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 const PREFETCH_CONCURRENCY: usize = 6;
 const SIGN_CONCURRENCY: usize = 4;
 const MIN_VALID_PRICE: Decimal = dec!(0.01);
 const DYNAMIC_MIN_ORDER_SIZE: Decimal = dec!(5);
-const DYNAMIC_MAX_ORDER_SIZE: Decimal = dec!(25);
+const DYNAMIC_MAX_ORDER_SIZE: Decimal = dec!(300);
 const SIZE_STEP: Decimal = dec!(0.5);
 const EXPENSIVE_BUFFER: Decimal = dec!(0.01);
 const HEDGE_MAX_LOSS: Decimal = dec!(0.02);
 const HEDGE_MIN_IMBALANCE_MULT: Decimal = dec!(2.0);
 const HEDGE_TIME_WINDOW: Duration = Duration::from_secs(120);
-const EXTREME_HIGH_PRICE: Decimal = dec!(0.9);
-const EXTREME_LOW_PRICE: Decimal = dec!(0.1);
+const MID_BAND_LOW: Decimal = dec!(0.30);
+const MID_BAND_HIGH: Decimal = dec!(0.70);
+const EXTREME_HIGH_PRICE: Decimal = dec!(0.85);
+const EXTREME_LOW_PRICE: Decimal = dec!(0.15);
 const EXTREME_MOMENTUM_THRESHOLD: Decimal = dec!(0.002);
 const MOMENTUM_FAST_WINDOW: Duration = Duration::from_secs(3);
 const MOMENTUM_SLOW_WINDOW: Duration = Duration::from_secs(12);
 const VOLATILITY_WINDOW: Duration = Duration::from_secs(10);
 const DEPTH_WINDOW: Decimal = dec!(0.02);
-const DEPTH_SIZE_DIVISOR: Decimal = dec!(10);
 const MOMENTUM_SCALE: Decimal = dec!(0.02);
 const VOLATILITY_SCALE: Decimal = dec!(0.03);
+const PNL_LOG_INTERVAL: Duration = Duration::from_secs(20);
+const TAKER_INTERVAL: Duration = Duration::from_secs(2);
+const TAKER_MAX_OFFSET: Decimal = dec!(0.01);
+const TAKER_MAX_LEVELS: usize = 5;
 
 /// Consolidated view of a market we're trading
 #[derive(Clone)]
@@ -94,6 +102,8 @@ pub struct SimpleBot {
     /// Timing state
     last_market_refresh: Instant,
     last_order_by_market: HashMap<String, Instant>,
+    last_pnl_log: Mutex<HashMap<String, Instant>>,
+    last_taker_by_market: Mutex<HashMap<String, Instant>>,
 
     /// Single source of truth for inventory
     ledger: LedgerHandle,
@@ -167,6 +177,8 @@ impl SimpleBot {
             markets: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
+            last_pnl_log: Mutex::new(HashMap::new()),
+            last_taker_by_market: Mutex::new(HashMap::new()),
             ledger,
             price_cache: Arc::new(RwLock::new(PriceCache::default())),
             _order_feed: None,
@@ -408,14 +420,15 @@ impl SimpleBot {
         prediction: Option<&ArbPrediction>,
     ) -> Option<MarketAction> {
         // Get prices (and enforce freshness)
-        let (up_ask, down_ask) = {
+        let (up_bid, up_ask, down_bid, down_ask) = {
             let now_ms_u64 = now_ms().max(0) as u64;
             let max_age_ms = self.config.max_price_age_ms.max(0) as u64;
 
             let cache = self.price_cache.read();
 
-            let (_, up_ask, up_age) = cache.get_with_age(&market.up_token_id, now_ms_u64)?;
-            let (_, down_ask, down_age) = cache.get_with_age(&market.down_token_id, now_ms_u64)?;
+            let (up_bid, up_ask, up_age) = cache.get_with_age(&market.up_token_id, now_ms_u64)?;
+            let (down_bid, down_ask, down_age) =
+                cache.get_with_age(&market.down_token_id, now_ms_u64)?;
 
             if up_age > max_age_ms || down_age > max_age_ms {
                 trace!(
@@ -443,7 +456,7 @@ impl SimpleBot {
                 return None;
             }
 
-            (up_ask, down_ask)
+            (up_bid, up_ask, down_bid, down_ask)
         };
 
         let combined = up_ask + down_ask;
@@ -463,31 +476,9 @@ impl SimpleBot {
             );
         }
 
-        // PRIORITY 1: Check for arbitrage opportunity
-        if combined < self.config.arb_threshold {
-            let profit_per_pair = Decimal::ONE - combined;
-            info!(
-                market_id = %market.market_id,
-                up_ask = %up_ask,
-                down_ask = %down_ask,
-                combined = %combined,
-                profit_per_pair = %profit_per_pair,
-                "🎯 ARB OPPORTUNITY DETECTED"
-            );
+        self.maybe_log_pnl(market, up_bid, down_bid).await;
 
-            // Calculate size - use order_size from config
-            let arb_size = self.config.order_size;
-
-            return Some(MarketAction::Arb {
-                up_ask,
-                down_ask,
-                combined,
-                up_size: arb_size,
-                down_size: arb_size,
-            });
-        }
-
-        // PRIORITY 2: Normal ladder maintenance (only if cooldown elapsed)
+        // PRIORITY 1: Normal ladder maintenance (only if cooldown elapsed)
         let should_reladder = self.ladder_state.should_reladder(
             &market.market_id,
             up_ask,
@@ -504,12 +495,42 @@ impl SimpleBot {
 
         // Compute ladder with dynamic sizing if we have arb-finder state
         let plan = if let Some(state) = self.arb_finder.state_store().get_state(&market.market_id) {
+            if let Some(rest_combined) = state.combined_rest_ask() {
+                if rest_combined < self.config.arb_threshold {
+                    let profit_per_pair = Decimal::ONE - rest_combined;
+                    let up_rest = state.up.rest_ask?;
+                    let down_rest = state.down.rest_ask?;
+                    info!(
+                        market_id = %market.market_id,
+                        up_ask = %up_rest,
+                        down_ask = %down_rest,
+                        combined = %rest_combined,
+                        profit_per_pair = %profit_per_pair,
+                        "REST arb detected, buying immediately"
+                    );
+
+                    let arb_size = self.config.order_size;
+                    return Some(MarketAction::Arb {
+                        up_ask: up_rest,
+                        down_ask: down_rest,
+                        combined: rest_combined,
+                        up_size: arb_size,
+                        down_size: arb_size,
+                    });
+                }
+            }
+
             let cheap_is_up = up_ask <= down_ask;
             let (cheap_ask, expensive_ask) = if cheap_is_up {
                 (up_ask, down_ask)
             } else {
                 (down_ask, up_ask)
             };
+            let up_in_mid = is_mid_band(up_ask);
+            let down_in_mid = is_mid_band(down_ask);
+            let mid_mode = up_in_mid || down_in_mid;
+            let up_extreme = is_extreme_price(up_ask);
+            let down_extreme = is_extreme_price(down_ask);
             let expensive_cap =
                 (self.config.target_total_cost - cheap_ask + EXPENSIVE_BUFFER).max(dec!(0.01));
 
@@ -523,30 +544,37 @@ impl SimpleBot {
                 time_to_end,
                 prediction.map(|p| p.confidence),
             );
+            let allow_expensive = allow_expensive || mid_mode;
 
             let up_metrics = self.compute_side_metrics(
                 &state.up,
                 snapshot.position.up_shares,
                 snapshot.position.down_shares,
+                up_ask,
                 cheap_is_up,
+                up_in_mid,
+                up_extreme,
+                allow_expensive,
             );
             let down_metrics = self.compute_side_metrics(
                 &state.down,
                 snapshot.position.down_shares,
                 snapshot.position.up_shares,
+                down_ask,
                 !cheap_is_up,
+                down_in_mid,
+                down_extreme,
+                allow_expensive,
             );
 
             let up_config = self.build_side_ladder_config(
                 &up_metrics,
                 &down_metrics,
-                cheap_is_up,
                 allow_expensive,
             );
             let down_config = self.build_side_ladder_config(
                 &down_metrics,
                 &up_metrics,
-                !cheap_is_up,
                 allow_expensive,
             );
 
@@ -570,7 +598,30 @@ impl SimpleBot {
                 up_ask,
                 down_ask,
                 allow_expensive,
+                mid_mode,
             );
+
+            let mut taker_orders = Vec::new();
+            if self.should_take_liquidity(&market.market_id, &up_metrics, &down_metrics) {
+                if let Some(pick) = self.pick_taker_side(
+                    &up_metrics,
+                    &down_metrics,
+                    &state.up,
+                    &state.down,
+                    &snapshot.position,
+                    up_ask,
+                    down_ask,
+                ) {
+                    let max_take = self.taker_size_cap(&snapshot.position, pick.side, pick.metrics.size);
+                    let max_price = (pick.ask + TAKER_MAX_OFFSET).min(Decimal::ONE);
+                    taker_orders = build_taker_orders(pick.side, pick.depth, max_price, max_take);
+                }
+            }
+
+            if !taker_orders.is_empty() {
+                plan.orders.extend(taker_orders);
+                self.mark_taker(&market.market_id);
+            }
             plan
         } else {
             self.ladder_engine.compute_ladder(
@@ -595,12 +646,65 @@ impl SimpleBot {
         })
     }
 
+    async fn maybe_log_pnl(
+        &self,
+        market: &ActiveMarket,
+        up_bid: Decimal,
+        down_bid: Decimal,
+    ) {
+        let now = Instant::now();
+        let should_log = {
+            let pnl_log = self.last_pnl_log.lock();
+            match pnl_log.get(&market.market_id) {
+                Some(last) => now.duration_since(*last) >= PNL_LOG_INTERVAL,
+                None => true,
+            }
+        };
+        if !should_log {
+            return;
+        }
+
+        let state = self.ledger.get_pair_state(&market.market_id).await;
+        if state.up_shares <= Decimal::ZERO && state.down_shares <= Decimal::ZERO {
+            return;
+        }
+
+        let paired = state.paired_shares();
+        let unpaired_up = state.unpaired_up();
+        let unpaired_down = state.unpaired_down();
+        let locked_profit = state.locked_profit();
+        let unpaired_cost =
+            (unpaired_up * state.avg_up_price()) + (unpaired_down * state.avg_down_price());
+        let unpaired_value = (unpaired_up * up_bid) + (unpaired_down * down_bid);
+        let unrealized = unpaired_value - unpaired_cost;
+        let total_pnl = locked_profit + unrealized;
+
+        info!(
+            market_id = %market.market_id,
+            paired = %paired,
+            unpaired_up = %unpaired_up,
+            unpaired_down = %unpaired_down,
+            locked_profit = %format!("${:.4}", locked_profit),
+            unrealized = %format!("${:.4}", unrealized),
+            total_pnl = %format!("${:.4}", total_pnl),
+            "PnL update"
+        );
+
+        self.last_pnl_log
+            .lock()
+            .insert(market.market_id.clone(), now);
+    }
+
     fn compute_side_metrics(
         &self,
         state: &crate::arb_finder::market_state::TokenState,
         side_shares: Decimal,
         other_shares: Decimal,
+        ask: Decimal,
         is_cheap: bool,
+        in_mid: bool,
+        is_extreme: bool,
+        allow_expensive: bool,
     ) -> SideMetrics {
         let momentum = state
             .rest_ema_slope(MOMENTUM_FAST_WINDOW, MOMENTUM_SLOW_WINDOW)
@@ -612,11 +716,7 @@ impl SimpleBot {
             .ask_depth_within(DEPTH_WINDOW)
             .unwrap_or(Decimal::ZERO);
 
-        let base_size = clamp_decimal(
-            depth / DEPTH_SIZE_DIVISOR,
-            DYNAMIC_MIN_ORDER_SIZE,
-            DYNAMIC_MAX_ORDER_SIZE,
-        );
+        let base_size = choose_size_tier(depth);
 
         let target = self
             .ladder_engine
@@ -634,9 +734,25 @@ impl SimpleBot {
         let momentum_factor = Decimal::ONE + (dec!(0.4) * momentum_score);
         let volatility_score = (volatility / VOLATILITY_SCALE).min(Decimal::ONE);
         let volatility_factor = Decimal::ONE + (dec!(0.3) * volatility_score);
-        let price_bias = if is_cheap { dec!(1.2) } else { dec!(0.8) };
+        let price_bias = if in_mid {
+            dec!(1.0)
+        } else if is_cheap {
+            dec!(1.15)
+        } else if is_extreme {
+            dec!(1.05)
+        } else {
+            dec!(0.75)
+        };
 
-        let size = base_size * momentum_factor * volatility_factor * imbalance_factor * price_bias;
+        let mut size =
+            base_size * momentum_factor * volatility_factor * imbalance_factor * price_bias;
+        size = clamp_decimal(size, DYNAMIC_MIN_ORDER_SIZE, DYNAMIC_MAX_ORDER_SIZE);
+        if !is_cheap && !in_mid && !is_extreme && !allow_expensive {
+            size = Decimal::ZERO;
+        }
+        if ask < MIN_VALID_PRICE {
+            size = Decimal::ZERO;
+        }
         let size = round_to_step(size, SIZE_STEP);
 
         SideMetrics {
@@ -645,6 +761,9 @@ impl SimpleBot {
             depth,
             size,
             priority: size,
+            in_mid,
+            is_extreme,
+            is_cheap,
         }
     }
 
@@ -652,16 +771,16 @@ impl SimpleBot {
         &self,
         side: &SideMetrics,
         other: &SideMetrics,
-        is_cheap: bool,
         allow_expensive: bool,
     ) -> SideLadderConfig {
-        let mut levels = if is_cheap { 3 } else { 2 };
-        if !is_cheap && !allow_expensive {
+        let is_cheap = side.is_cheap;
+        let mut levels = if side.in_mid { 3 } else if side.is_extreme { 2 } else { 2 };
+        if !is_cheap && !allow_expensive && !side.in_mid && !side.is_extreme {
             levels = 1;
         }
 
-        if side.volatility > dec!(0.02) {
-            levels = levels.max(3);
+        if side.volatility > dec!(0.02) && side.in_mid {
+            levels = levels.max(4);
         }
 
         if side.size < DYNAMIC_MIN_ORDER_SIZE * Decimal::from(levels as u32) {
@@ -670,12 +789,12 @@ impl SimpleBot {
 
         let mut size_per_level =
             (side.size / Decimal::from(levels as u32)).max(DYNAMIC_MIN_ORDER_SIZE);
-        if !is_cheap && !allow_expensive {
+        if !is_cheap && !allow_expensive && !side.in_mid && !side.is_extreme {
             size_per_level = Decimal::ZERO;
         }
 
         let fast_side = side.momentum.abs() >= other.momentum.abs();
-        let top_offset = if fast_side && is_cheap {
+        let top_offset = if fast_side && (is_cheap || side.in_mid) {
             dec!(0.01)
         } else {
             dec!(0.02)
@@ -705,6 +824,7 @@ impl SimpleBot {
         up_ask: Decimal,
         down_ask: Decimal,
         allow_expensive: bool,
+        mid_mode: bool,
     ) {
         let up_orders: Vec<LadderOrder> = plan
             .orders
@@ -773,6 +893,10 @@ impl SimpleBot {
             }
         }
 
+        if mid_mode {
+            return;
+        }
+
         if imbalance < self.config.order_size {
             plan.orders = cheap_orders;
             return;
@@ -812,6 +936,101 @@ impl SimpleBot {
         }
 
         false
+    }
+
+    fn should_take_liquidity(
+        &self,
+        market_id: &str,
+        up: &SideMetrics,
+        down: &SideMetrics,
+    ) -> bool {
+        let has_signal = up.in_mid || down.in_mid || up.is_extreme || down.is_extreme;
+        if !has_signal {
+            return false;
+        }
+
+        let now = Instant::now();
+        let allowed = {
+            let last = self.last_taker_by_market.lock();
+            match last.get(market_id) {
+                Some(ts) => now.duration_since(*ts) >= TAKER_INTERVAL,
+                None => true,
+            }
+        };
+
+        allowed && (up.size >= DYNAMIC_MIN_ORDER_SIZE || down.size >= DYNAMIC_MIN_ORDER_SIZE)
+    }
+
+    fn mark_taker(&self, market_id: &str) {
+        self.last_taker_by_market
+            .lock()
+            .insert(market_id.to_string(), Instant::now());
+    }
+
+    fn taker_size_cap(
+        &self,
+        position: &crate::poller::MarketPosition,
+        side: MarketSide,
+        suggested: Decimal,
+    ) -> Decimal {
+        let (max_add_up, max_add_down) = self.equalize_cap(position.up_shares, position.down_shares);
+        let max_add = match side {
+            MarketSide::Up => max_add_up,
+            MarketSide::Down => max_add_down,
+        };
+
+        if suggested <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let desired = clamp_decimal(suggested.max(DYNAMIC_MIN_ORDER_SIZE), DYNAMIC_MIN_ORDER_SIZE, DYNAMIC_MAX_ORDER_SIZE);
+        desired.min(max_add).max(Decimal::ZERO)
+    }
+
+    fn pick_taker_side<'a>(
+        &self,
+        up: &'a SideMetrics,
+        down: &'a SideMetrics,
+        up_state: &'a crate::arb_finder::market_state::TokenState,
+        down_state: &'a crate::arb_finder::market_state::TokenState,
+        position: &crate::poller::MarketPosition,
+        up_ask: Decimal,
+        down_ask: Decimal,
+    ) -> Option<TakerPick<'a>> {
+        let imbalance = position.up_shares - position.down_shares;
+        if imbalance >= self.config.order_size && (down.in_mid || down.is_extreme || down.is_cheap) {
+            return Some(TakerPick {
+                side: MarketSide::Down,
+                metrics: down,
+                depth: down_state.depth.asks.as_slice(),
+                ask: down_ask,
+            });
+        }
+        if imbalance <= -self.config.order_size && (up.in_mid || up.is_extreme || up.is_cheap) {
+            return Some(TakerPick {
+                side: MarketSide::Up,
+                metrics: up,
+                depth: up_state.depth.asks.as_slice(),
+                ask: up_ask,
+            });
+        }
+
+        if up.priority >= down.priority && (up.in_mid || up.is_extreme || up.is_cheap) {
+            Some(TakerPick {
+                side: MarketSide::Up,
+                metrics: up,
+                depth: up_state.depth.asks.as_slice(),
+                ask: up_ask,
+            })
+        } else if down.in_mid || down.is_extreme || down.is_cheap {
+            Some(TakerPick {
+                side: MarketSide::Down,
+                metrics: down,
+                depth: down_state.depth.asks.as_slice(),
+                ask: down_ask,
+            })
+        } else {
+            None
+        }
     }
     fn equalize_cap(&self, current_up: Decimal, current_down: Decimal) -> (Decimal, Decimal) {
         let max_exposure = self.arb_finder.max_exposure_per_market();
@@ -1403,6 +1622,82 @@ struct SideMetrics {
     depth: Decimal,
     size: Decimal,
     priority: Decimal,
+    in_mid: bool,
+    is_extreme: bool,
+    is_cheap: bool,
+}
+
+struct TakerPick<'a> {
+    side: MarketSide,
+    metrics: &'a SideMetrics,
+    depth: &'a [PriceLevel],
+    ask: Decimal,
+}
+
+fn is_mid_band(price: Decimal) -> bool {
+    price >= MID_BAND_LOW && price <= MID_BAND_HIGH
+}
+
+fn is_extreme_price(price: Decimal) -> bool {
+    price <= EXTREME_LOW_PRICE || price >= EXTREME_HIGH_PRICE
+}
+
+fn choose_size_tier(depth: Decimal) -> Decimal {
+    let tiers = [
+        dec!(300),
+        dec!(250),
+        dec!(150),
+        dec!(100),
+        dec!(50),
+        dec!(25),
+        dec!(20),
+        dec!(10),
+        DYNAMIC_MIN_ORDER_SIZE,
+    ];
+
+    for tier in tiers {
+        if depth >= tier {
+            return tier;
+        }
+    }
+
+    DYNAMIC_MIN_ORDER_SIZE
+}
+
+fn build_taker_orders(
+    side: MarketSide,
+    asks: &[PriceLevel],
+    max_price: Decimal,
+    max_size: Decimal,
+) -> Vec<LadderOrder> {
+    let mut orders = Vec::new();
+    if max_size < DYNAMIC_MIN_ORDER_SIZE {
+        return orders;
+    }
+
+    let mut remaining = max_size;
+    for (idx, level) in asks.iter().enumerate() {
+        if idx >= TAKER_MAX_LEVELS {
+            break;
+        }
+        if level.price > max_price {
+            break;
+        }
+        let size = round_to_step(level.size.min(remaining), SIZE_STEP);
+        if size < DYNAMIC_MIN_ORDER_SIZE {
+            continue;
+        }
+        orders.push(LadderOrder {
+            side,
+            price: level.price,
+            size,
+        });
+        remaining -= size;
+        if remaining < DYNAMIC_MIN_ORDER_SIZE {
+            break;
+        }
+    }
+    orders
 }
 
 fn convert_order_params(price: Decimal, size: Decimal) -> Option<(PolyDecimal, PolyDecimal)> {

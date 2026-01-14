@@ -169,6 +169,9 @@ impl SignalDetector {
     /// Detect order book imbalance
     fn detect_imbalance(&self, state: &MarketState) -> Option<Signal> {
         let ratio = state.depth_imbalance_ratio()?;
+        if ratio <= Decimal::ZERO {
+            return None;
+        }
         let thin_side = state.thin_side()?;
 
         // Check if imbalance exceeds threshold
@@ -326,7 +329,10 @@ impl SignalDetector {
             .unwrap_or(Decimal::ZERO);
         let volatility = (vol_up + vol_down) / dec!(2.0);
 
-        let imbalance_ratio = state.depth_imbalance_ratio().unwrap_or(Decimal::ONE);
+        let imbalance_ratio = match state.depth_imbalance_ratio() {
+            Some(ratio) if ratio > Decimal::ZERO => ratio,
+            _ => Decimal::ONE,
+        };
         let imbalance = if imbalance_ratio >= Decimal::ONE {
             imbalance_ratio - Decimal::ONE
         } else {

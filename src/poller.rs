@@ -52,6 +52,11 @@ pub enum LedgerCommand {
         market_id: String,
         reply: tokio::sync::oneshot::Sender<LedgerSnapshot>,
     },
+    /// Request pair tracker state for PnL
+    GetPairState {
+        market_id: String,
+        reply: tokio::sync::oneshot::Sender<crate::pair_tracker::PairState>,
+    },
     /// HTTP reconciliation data
     Reconcile(HashMap<String, OpenOrderResponse>),
     /// Request orders that were assumed complete
@@ -220,6 +225,14 @@ impl LedgerActor {
             LedgerCommand::GetState { market_id, reply } => {
                 let snapshot = self.get_snapshot(&market_id);
                 let _ = reply.send(snapshot);
+            }
+            LedgerCommand::GetPairState { market_id, reply } => {
+                let state = self
+                    .pair_tracker
+                    .get_state(&market_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let _ = reply.send(state);
             }
 
             LedgerCommand::Reconcile(remote_orders) => {
@@ -509,6 +522,19 @@ impl LedgerHandle {
         let _ = self
             .tx
             .send(LedgerCommand::GetState {
+                market_id: market_id.to_string(),
+                reply: reply_tx,
+            })
+            .await;
+
+        reply_rx.await.unwrap_or_default()
+    }
+
+    pub async fn get_pair_state(&self, market_id: &str) -> crate::pair_tracker::PairState {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .tx
+            .send(LedgerCommand::GetPairState {
                 market_id: market_id.to_string(),
                 reply: reply_tx,
             })
