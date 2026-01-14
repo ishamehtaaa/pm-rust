@@ -2,12 +2,13 @@ use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderOverrides, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketInfo, MarketState, TradingPair};
-use crate::poller::{InventoryLedger, MarketSide, spawn_order_poller};
+use crate::poller::{InventoryLedger, MarketSide, spawn_order_feed};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use crate::trend_window::TrendWindow;
 use crate::config::ASSETS_BY_NAME;
 use chrono::Timelike;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk::auth::Credentials;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
@@ -18,9 +19,12 @@ use parking_lot::RwLock;
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{AssetType, Side as ClobSide, SignatureType, SignedOrder};
+use polymarket_client_sdk::clob::types::{
+    AssetType, OrderStatusType, Side as ClobSide, SignatureType, SignedOrder,
+};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
-use polymarket_client_sdk::types::{Address, Decimal as PolyDecimal};
+use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk::types::{Address, B256, Decimal as PolyDecimal};
 use rust_decimal_macros::dec;
 use alloy::primitives::U256;
 use std::collections::HashMap;
@@ -30,10 +34,21 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
+type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
 const LOOP_DELAY: Duration = Duration::from_millis(200);
+const BALANCE_REFRESH_SECS: u64 = 30;
 
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
+
+#[derive(Debug, Clone)]
+struct PositionSnapshot {
+    last_log: Instant,
+    up_shares: Decimal,
+    down_shares: Decimal,
+    pending_up: Decimal,
+    pending_down: Decimal,
+}
 
 pub struct SimpleBot {
     config: Config,
@@ -44,13 +59,17 @@ pub struct SimpleBot {
     trading_pairs: HashMap<String, Arc<RwLock<TradingPair>>>,
     last_market_refresh: Instant,
     last_order_by_market: HashMap<String, Instant>,
+    last_order_status_check: HashMap<String, Instant>,
+    last_model_cancel: HashMap<String, Instant>,
+    last_balance_refresh: HashMap<String, Instant>,
+    last_position_log: HashMap<String, PositionSnapshot>,
 
     ledger: Arc<RwLock<InventoryLedger>>,
     price_cache: Arc<RwLock<PriceCache>>,
-    _order_poller: tokio::task::JoinHandle<()>,
+    _order_feed: Option<tokio::task::JoinHandle<()>>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
     active_market_ids: Arc<RwLock<Vec<String>>>,
-    active_token_pairs: Arc<RwLock<Vec<(String, String)>>>,
+    ws_client: Arc<AuthenticatedWsClient>,
 
     ladder_engine: LadderEngine,
     ladder_state: LadderState,
@@ -65,7 +84,7 @@ impl SimpleBot {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         info!("Initializing SimpleBot");
 
-        let market_cache = MarketCache::new(config.target_assets.clone());
+        let market_cache = MarketCache::new(config.target_assets.clone(), config.target_duration);
         let price_cache = Arc::new(RwLock::new(PriceCache::default()));
 
         let mut ladder_config = LadderConfig::default();
@@ -84,25 +103,27 @@ impl SimpleBot {
         let addr = Address::from_str(config.polymarket_proxy_address.trim())
             .map_err(|e| anyhow::anyhow!("Invalid POLYMARKET_PROXY_ADDRESS: {}", e))?;
 
-        let client = Client::new(crate::config::POLYMARKET_CLOB_HOST, ClobConfig::default())?
-            .authentication_builder(&signer_with_chain)
-            .funder(addr)
-            .signature_type(SignatureType::Proxy)
-            .authenticate()
+        let rest_client = Client::new(crate::config::POLYMARKET_CLOB_HOST, ClobConfig::default())?;
+        let credentials: Credentials = rest_client
+            .create_or_derive_api_key(&signer_with_chain, None)
             .await?;
 
-        let client = Arc::new(client);
+        let client = Arc::new(
+            rest_client
+                .authentication_builder(&signer_with_chain)
+                .credentials(credentials.clone())
+                .funder(addr)
+                .signature_type(SignatureType::Proxy)
+                .authenticate()
+                .await?,
+        );
+
+        let ws_client = Arc::new(
+            WsClient::new(WS_SUB_URL, Default::default())?.authenticate(credentials, addr)?,
+        );
 
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
         let active_market_ids = Arc::new(RwLock::new(Vec::new()));
-        let active_token_pairs = Arc::new(RwLock::new(Vec::new()));
-
-        let poller = spawn_order_poller(
-            client.clone(),
-            ledger.clone(),
-            active_token_pairs.clone(),
-            Duration::from_millis(3000),
-        );
 
         Ok(Self {
             config,
@@ -113,10 +134,14 @@ impl SimpleBot {
             trading_pairs: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
-            active_token_pairs,
+            last_order_status_check: HashMap::new(),
+            last_model_cancel: HashMap::new(),
+            last_balance_refresh: HashMap::new(),
+            last_position_log: HashMap::new(),
             active_market_ids,
             ledger,
-            _order_poller: poller,
+            _order_feed: None,
+            ws_client,
             price_cache,
             _price_feed: None,
             ladder_engine,
@@ -151,6 +176,48 @@ impl SimpleBot {
             tokio::time::sleep(LOOP_DELAY).await;
         }
 
+    }
+
+    async fn refresh_positions(
+        &mut self,
+        market_id: &str,
+        up_token_id: &str,
+        down_token_id: &str,
+        market_symbol: &str,
+    ) {
+        let now = Instant::now();
+        let should_refresh = match self.last_balance_refresh.get(market_id) {
+            Some(last) => now.duration_since(*last) >= Duration::from_secs(BALANCE_REFRESH_SECS),
+            None => true,
+        };
+
+        if !should_refresh {
+            return;
+        }
+
+        self.last_balance_refresh
+            .insert(market_id.to_string(), now);
+
+        match self.fetch_token_balances(up_token_id, down_token_id).await {
+            Ok((up_bal, down_bal)) => {
+                self.ledger
+                    .write()
+                    .set_initial_position(market_id.to_string(), up_bal, down_bal);
+                debug!(
+                    market = %market_symbol,
+                    up_shares = %up_bal,
+                    down_shares = %down_bal,
+                    "Position refreshed"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    market = %market_symbol,
+                    error = %e,
+                    "Failed to refresh position"
+                );
+            }
+        }
     }
     async fn fetch_token_balances(
         &self,
@@ -262,12 +329,9 @@ impl SimpleBot {
 
             self.markets.insert(market_id.clone(), state);
             self.trading_pairs.insert(market_id, pair);
-            self.ledger.write().register_market(
-                market_id_for_ledger,
-                info.up_token_id.clone(),
-                info.down_token_id.clone(),
-                market_symbol,
-            );
+            self.ledger
+                .write()
+                .register_market(market_id_for_ledger, market_symbol);
         }
         let mut removed_markets: Vec<(String, String, String)> = Vec::new();
         for (market_id, up_token_id, down_token_id) in previous_markets.iter() {
@@ -311,8 +375,8 @@ impl SimpleBot {
                 }
             }
             let mut ledger = self.ledger.write();
-            for (market_id, up_token_id, down_token_id) in removed_markets {
-                ledger.unregister_market(&market_id, &up_token_id, &down_token_id);
+            for (market_id, _, _) in removed_markets {
+                ledger.unregister_market(&market_id);
             }
         }
 
@@ -322,20 +386,6 @@ impl SimpleBot {
             *ids = self.markets.keys().cloned().collect();
         }
 
-        {
-            let mut pairs = self.active_token_pairs.write();
-            *pairs = self
-                .markets
-                .values()
-                .map(|state| {
-                    (
-                        state.info.up_token_id.clone(),
-                        state.info.down_token_id.clone(),
-                    )
-                })
-                .collect();
-        }
-
         let token_ids: Vec<String> = self
             .markets
             .values()
@@ -343,6 +393,10 @@ impl SimpleBot {
             .collect();
 
         if let Some(handle) = self._price_feed.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self._order_feed.take() {
             handle.abort();
         }
 
@@ -368,6 +422,22 @@ impl SimpleBot {
                 }
             }
         }
+
+        let order_market_ids: Vec<B256> = self
+            .markets
+            .values()
+            .filter_map(|state| state.info.condition_id)
+            .collect();
+        if order_market_ids.is_empty() {
+            warn!("No condition ids available for order WebSocket subscription");
+        } else {
+            self._order_feed = Some(spawn_order_feed(
+                self.ws_client.clone(),
+                self.ledger.clone(),
+                order_market_ids,
+            ));
+        }
+
         match spawn_price_feed(WS_SUB_URL, token_ids, self.price_cache.clone()) {
             Ok(handle) => {
                 self._price_feed = Some(handle);
@@ -434,6 +504,14 @@ impl SimpleBot {
             let (up_token_id, down_token_id) =
                 (state.info.up_token_id.clone(), state.info.down_token_id.clone());
 
+            self.refresh_positions(
+                &market_id,
+                &up_token_id,
+                &down_token_id,
+                &market_symbol,
+            )
+            .await;
+
             let price_snapshot = {
                 let cache = self.price_cache.read();
                 let now_ms = Utc::now().timestamp_millis() as u64;
@@ -448,7 +526,8 @@ impl SimpleBot {
                 }
             };
 
-            let (up_ask, down_ask, effective_target, overrides) = match price_snapshot {
+            let (up_ask, down_ask, effective_target, mut overrides, summary, up_bid, down_bid) =
+                match price_snapshot {
                 Some((up_bid, up_ask, down_bid, down_ask, up_age, down_age)) => {
                     let now_ms = Utc::now().timestamp_millis();
                     let mut status = TrendStatus::Ready;
@@ -575,10 +654,14 @@ impl SimpleBot {
                             self.config.pinned_high,
                             self.config.drift_flicker_threshold,
                             extra.high_vol_widen,
+                            self.ladder_engine.config().levels,
                         );
                         extra.size_multiplier = overrides.size_multiplier;
                         extra.spacing_multiplier = overrides.spacing_multiplier;
                         extra.extra_offset = overrides.extra_offset;
+                        extra.up_price_cap = overrides.up_price_cap;
+                        extra.down_price_cap = overrides.down_price_cap;
+                        extra.max_levels = overrides.max_levels;
                         (ranges, span_ms, sample_count, effective_target, overrides)
                     };
 
@@ -649,10 +732,33 @@ impl SimpleBot {
                     }
 
                     if status != TrendStatus::Ready {
+                        let open_orders = self.ledger.read().open_orders_for_market(&market_id);
+                        if !open_orders.is_empty() && self.should_model_cancel(&market_id) {
+                            let cancel_ids: Vec<String> =
+                                open_orders.into_iter().map(|o| o.order_id).collect();
+                            info!(
+                                market = %market_symbol,
+                                reason = %reason,
+                                count = cancel_ids.len(),
+                                "Model pause: cancelling open orders"
+                            );
+                            match self.cancel_orders(&cancel_ids).await {
+                                Ok(cancelled) => {
+                                    self.ledger.write().mark_orders_cancelled(&cancelled);
+                                }
+                                Err(e) => {
+                                    error!(
+                                        market = %market_symbol,
+                                        error = %e,
+                                        "Failed to cancel orders on model pause"
+                                    );
+                                }
+                            }
+                        }
                         continue;
                     }
 
-                    (up_ask, down_ask, effective_target, overrides)
+                    (up_ask, down_ask, effective_target, overrides, summary, up_bid, down_bid)
                 }
                 None => {
                     let should_log = self.should_log_missing_price(&market_id);
@@ -683,6 +789,60 @@ impl SimpleBot {
                 )
             };
 
+            let pending_up: Decimal = open_orders
+                .iter()
+                .filter(|o| o.side == MarketSide::Up)
+                .map(|o| o.remaining_size)
+                .sum();
+            let pending_down: Decimal = open_orders
+                .iter()
+                .filter(|o| o.side == MarketSide::Down)
+                .map(|o| o.remaining_size)
+                .sum();
+            let total_up = pos.up_shares + pending_up;
+            let total_down = pos.down_shares + pending_down;
+            let imbalance = total_up - total_down;
+
+            apply_imbalance_override(
+                &mut overrides,
+                summary,
+                up_bid,
+                down_bid,
+                imbalance,
+                self.ladder_engine.config().max_imbalance,
+                self.config.edge_threshold,
+            );
+
+            if self.should_log_position(
+                &market_id,
+                PositionSnapshot {
+                    last_log: Instant::now(),
+                    up_shares: pos.up_shares,
+                    down_shares: pos.down_shares,
+                    pending_up,
+                    pending_down,
+                },
+            ) {
+                let imbalance_abs = imbalance.abs();
+                let imbalance_str = if imbalance_abs >= self.ladder_engine.config().max_imbalance {
+                    format!(" imbalance={:.4}", imbalance)
+                } else {
+                    String::new()
+                };
+                debug!(
+                    market = %market_symbol,
+                    "position up={:.4} down={:.4} pending(up={:.4} down={:.4}) total(up={:.4} down={:.4}){} target={:.2}",
+                    pos.up_shares,
+                    pos.down_shares,
+                    pending_up,
+                    pending_down,
+                    total_up,
+                    total_down,
+                    imbalance_str,
+                    effective_target
+                );
+            }
+
             let plan = self
                 .ladder_engine
                 .compute_ladder_with_target(
@@ -702,7 +862,15 @@ impl SimpleBot {
             if !plan.cancellations.is_empty() {
                 match self.cancel_orders(&plan.cancellations).await {
                     Ok(cancelled) => {
-                        info!(market = %market_symbol, count = cancelled.len(), "Cancelled stale orders");
+                        if cancelled.is_empty() {
+                            debug!(market = %market_symbol, "No stale orders cancelled");
+                        } else {
+                            info!(
+                                market = %market_symbol,
+                                count = cancelled.len(),
+                                "Cancelled stale orders"
+                            );
+                        }
                         self.ledger.write().mark_orders_cancelled(&cancelled);
                     }
                     Err(e) => {
@@ -712,15 +880,6 @@ impl SimpleBot {
             }
 
             if !plan.orders.is_empty() {
-                info!(
-                    market = %market_symbol,
-                    count = plan.orders.len(),
-                    size_mult = %format_decimal(overrides.size_multiplier),
-                    spacing_mult = %format_decimal(overrides.spacing_multiplier),
-                    extra_offset = %format_decimal(overrides.extra_offset),
-                    effective_target = %format_decimal(effective_target),
-                    "Decision: place orders (trend ready)"
-                );
                 if self.config.dry_run {
                     let should_log = self.should_log_dry_run(&market_id);
                     if should_log {
@@ -756,14 +915,9 @@ impl SimpleBot {
                                     .map(|s| s.is_empty())
                                     .unwrap_or(true)
                                 {
-                                    let token_id = match order.side {
-                                        MarketSide::Up => &up_token_id,
-                                        MarketSide::Down => &down_token_id,
-                                    };
                                     self.ledger.write().record_order_placed(
                                         resp.order_id.clone(),
                                         market_id.clone(),
-                                        token_id.clone(),
                                         order.side,
                                         order.size,
                                         order.price,
@@ -850,6 +1004,41 @@ impl SimpleBot {
         }
     }
 
+    fn should_log_position(&mut self, market_id: &str, snapshot: PositionSnapshot) -> bool {
+        let min_interval = Duration::from_secs(5);
+        let Some(prev) = self.last_position_log.get(market_id) else {
+            self.last_position_log
+                .insert(market_id.to_string(), snapshot);
+            return true;
+        };
+
+        let changed = prev.up_shares != snapshot.up_shares
+            || prev.down_shares != snapshot.down_shares
+            || prev.pending_up != snapshot.pending_up
+            || prev.pending_down != snapshot.pending_down;
+
+        if changed || snapshot.last_log.duration_since(prev.last_log) >= min_interval {
+            self.last_position_log
+                .insert(market_id.to_string(), snapshot);
+            return true;
+        }
+
+        false
+    }
+
+    fn should_model_cancel(&mut self, market_id: &str) -> bool {
+        let now = Instant::now();
+        let min_interval = Duration::from_secs(5);
+        match self.last_model_cancel.get(market_id) {
+            Some(last) if now.duration_since(*last) < min_interval => false,
+            _ => {
+                self.last_model_cancel
+                    .insert(market_id.to_string(), now);
+                true
+            }
+        }
+    }
+
     async fn build_signed_orders(
         &self,
         orders: &[LadderOrder],
@@ -924,7 +1113,7 @@ impl SimpleBot {
         signed
     }
 
-    async fn cancel_orders(&self, order_ids: &[String]) -> anyhow::Result<Vec<String>> {
+    async fn cancel_orders(&mut self, order_ids: &[String]) -> anyhow::Result<Vec<String>> {
         if order_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -939,12 +1128,76 @@ impl SimpleBot {
 
         match self.client.cancel_orders(&order_id_refs).await {
             Ok(response) => {
-                info!(
-                    requested = order_ids.len(),
-                    cancelled = response.canceled.len(),
-                    not_cancelled = response.not_canceled.len(),
-                    "Batch cancel complete"
-                );
+                if response.canceled.is_empty() && !response.not_canceled.is_empty() {
+                    debug!(
+                        requested = order_ids.len(),
+                        cancelled = response.canceled.len(),
+                        not_cancelled = response.not_canceled.len(),
+                        "Batch cancel complete"
+                    );
+                } else {
+                    info!(
+                        requested = order_ids.len(),
+                        cancelled = response.canceled.len(),
+                        not_cancelled = response.not_canceled.len(),
+                        "Batch cancel complete"
+                    );
+                }
+
+                if !response.not_canceled.is_empty() {
+                    let now = Instant::now();
+                    let mut confirmed_closed = Vec::new();
+                    let check_cooldown = Duration::from_secs(10);
+
+                    for (order_id, reason) in response.not_canceled.iter() {
+                        let should_check = match self.last_order_status_check.get(order_id) {
+                            Some(last) => now.duration_since(*last) >= check_cooldown,
+                            None => true,
+                        };
+
+                        if !should_check {
+                            continue;
+                        }
+
+                        self.last_order_status_check
+                            .insert(order_id.clone(), now);
+
+                        match self.client.order(order_id).await {
+                            Ok(order) => {
+                                let is_live =
+                                    matches!(order.status, OrderStatusType::Live);
+                                self.ledger.write().apply_order_status(
+                                    order_id,
+                                    order.size_matched,
+                                    is_live,
+                                );
+                                if !is_live {
+                                    confirmed_closed.push(order_id.clone());
+                                }
+                                debug!(
+                                    order_id = %order_id,
+                                    status = ?order.status,
+                                    reason = %reason,
+                                    "Cancel rejected; order status checked"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    order_id = %order_id,
+                                    reason = %reason,
+                                    error = %e,
+                                    "Cancel rejected; order status lookup failed"
+                                );
+                            }
+                        }
+                    }
+
+                    if !confirmed_closed.is_empty() {
+                        self.ledger
+                            .write()
+                            .mark_orders_cancelled(&confirmed_closed);
+                    }
+                }
 
                 Ok(response.canceled)
             }
@@ -989,8 +1242,10 @@ fn format_trend_log(
         .unwrap_or_else(|| "-".to_string());
     let start_mid = extra.start_mid.unwrap_or_default();
     let end_mid = extra.end_mid.unwrap_or_default();
+    let up_cap = extra.up_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
+    let down_cap = extra.down_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
     format!(
-        "trend={} prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} max={} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] size_mult={} spacing_mult={} extra_offset={}",
+        "trend={} prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} max={} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] size_mult={} spacing_mult={} extra_offset={} caps[up={} down={}] levels={}",
         status,
         format_decimal(up_bid),
         format_decimal(up_ask),
@@ -1012,7 +1267,10 @@ fn format_trend_log(
         sample_count,
         format_decimal(extra.size_multiplier),
         format_decimal(extra.spacing_multiplier),
-        format_decimal(extra.extra_offset)
+        format_decimal(extra.extra_offset),
+        up_cap,
+        down_cap,
+        extra.max_levels.unwrap_or(0)
     )
 }
 
@@ -1040,8 +1298,10 @@ fn format_trend_ready_log(
         .unwrap_or_else(|| "-".to_string());
     let start_mid = extra.start_mid.unwrap_or_default();
     let end_mid = extra.end_mid.unwrap_or_default();
+    let up_cap = extra.up_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
+    let down_cap = extra.down_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
     format!(
-        "trend=ready prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] rn[sigma={:.5} lambda={:.5} drift={:.5} up={:.5}/{:.5} down={:.5}/{:.5}] naive[up={:.5}/{:.5} down={:.5}/{:.5}] size_mult={} spacing_mult={} extra_offset={} widen={}",
+        "trend=ready prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] rn[sigma={:.5} lambda={:.5} drift={:.5} up={:.5}/{:.5} down={:.5}/{:.5}] naive[up={:.5}/{:.5} down={:.5}/{:.5}] size_mult={} spacing_mult={} extra_offset={} caps[up={} down={}] levels={} widen={}",
         format_decimal(up_bid),
         format_decimal(up_ask),
         format_decimal(down_bid),
@@ -1073,6 +1333,9 @@ fn format_trend_ready_log(
         format_decimal(extra.size_multiplier),
         format_decimal(extra.spacing_multiplier),
         format_decimal(extra.extra_offset),
+        up_cap,
+        down_cap,
+        extra.max_levels.unwrap_or(0),
         extra.high_vol_widen
     )
 }
@@ -1094,6 +1357,9 @@ struct TrendLogExtra {
     size_multiplier: Decimal,
     spacing_multiplier: Decimal,
     extra_offset: Decimal,
+    up_price_cap: Option<Decimal>,
+    down_price_cap: Option<Decimal>,
+    max_levels: Option<usize>,
 }
 
 impl Default for TrendLogExtra {
@@ -1110,6 +1376,9 @@ impl Default for TrendLogExtra {
             size_multiplier: Decimal::ONE,
             spacing_multiplier: Decimal::ONE,
             extra_offset: Decimal::ZERO,
+            up_price_cap: None,
+            down_price_cap: None,
+            max_levels: None,
         }
     }
 }
@@ -1118,7 +1387,7 @@ fn build_ladder_overrides(
     summary: Option<crate::trend_window::RnJdSummary>,
     up_bid: Decimal,
     up_ask: Decimal,
-    _down_bid: Decimal,
+    down_bid: Decimal,
     _down_ask: Decimal,
     mid_start_end: Option<(f64, f64)>,
     edge_threshold: Decimal,
@@ -1130,6 +1399,7 @@ fn build_ladder_overrides(
     pinned_high: Decimal,
     drift_flicker_threshold: f64,
     high_vol_widen: bool,
+    max_levels_default: usize,
 ) -> LadderOverrides {
     let mut overrides = LadderOverrides::default();
     overrides.size_multiplier = Decimal::ONE;
@@ -1180,7 +1450,76 @@ fn build_ladder_overrides(
         overrides.size_multiplier = size_scale_max;
     }
 
+    let rn_spread = (summary.rn_ask - summary.rn_bid).max(0.0);
+    let raw_levels = (rn_spread / tick_size_f).ceil();
+    let max_levels = if raw_levels.is_finite() && raw_levels > 0.0 {
+        raw_levels as usize
+    } else {
+        1
+    };
+    overrides.max_levels = Some(max_levels.clamp(1, max_levels_default));
+
+    let target_up = target_bid_price(
+        rn_mid,
+        up_bid_f,
+        edge_threshold_f,
+        tick_size_f,
+    );
+    let target_down_mid = 1.0 - rn_mid;
+    let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
+    let target_down = target_bid_price(
+        target_down_mid,
+        down_bid_f,
+        edge_threshold_f,
+        tick_size_f,
+    );
+    overrides.up_price_cap = Decimal::from_f64(target_up);
+    overrides.down_price_cap = Decimal::from_f64(target_down);
+
     overrides
+}
+
+fn apply_imbalance_override(
+    overrides: &mut LadderOverrides,
+    summary: Option<crate::trend_window::RnJdSummary>,
+    up_bid: Decimal,
+    down_bid: Decimal,
+    imbalance: Decimal,
+    max_imbalance: Decimal,
+    edge_threshold: Decimal,
+) {
+    let Some(summary) = summary else {
+        return;
+    };
+    let imbalance_abs = imbalance.abs();
+    if imbalance_abs < max_imbalance {
+        return;
+    }
+
+    let rn_mid = (summary.rn_bid + summary.rn_ask) / 2.0;
+    let up_bid_f = up_bid.to_f64().unwrap_or(0.0);
+    let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
+    let edge_threshold_f = edge_threshold.to_f64().unwrap_or(0.0025);
+
+    let up_edge = rn_mid - up_bid_f;
+    let down_edge = (1.0 - rn_mid) - down_bid_f;
+
+    if imbalance > Decimal::ZERO && down_edge >= edge_threshold_f {
+        overrides.allow_imbalance_side = Some(MarketSide::Down);
+    } else if imbalance < Decimal::ZERO && up_edge >= edge_threshold_f {
+        overrides.allow_imbalance_side = Some(MarketSide::Up);
+    }
+}
+
+fn target_bid_price(rn_mid: f64, bid: f64, edge_threshold: f64, tick: f64) -> f64 {
+    let back_off = (bid - tick).max(tick);
+    if rn_mid >= bid + edge_threshold {
+        bid
+    } else if rn_mid <= bid - edge_threshold {
+        back_off
+    } else {
+        bid
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -39,7 +39,7 @@ impl Default for LadderConfig {
             max_pending_per_side: dec!(20),
             reladder_threshold: dec!(0.02),
             stale_order_distance: dec!(0.05),
-            max_imbalance: dec!(10), // Don't let one side get more than 10 shares ahead
+            max_imbalance: dec!(5), // Don't let one side get more than 10 shares ahead
         }
     }
 }
@@ -145,21 +145,9 @@ impl LadderEngine {
 
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
-        
+
         // CRITICAL FIX: Calculate imbalance here
         let imbalance = total_up - total_down;
-
-        debug!(
-            up_shares = %position.up_shares,
-            down_shares = %position.down_shares,
-            pending_up = %pending_up,
-            pending_down = %pending_down,
-            total_up = %total_up,
-            total_down = %total_down,
-            imbalance = %imbalance,
-            target = %self.config.target_per_side,
-            "Position check"
-        );
 
         // Cancel ALL orders on sides that are already at or over target
         if position.up_shares >= target_per_side {
@@ -187,7 +175,13 @@ impl LadderEngine {
         }
 
         // CRITICAL FIX: Pass the calculated imbalance, not config.max_imbalance
-        let stale = self.find_stale_orders(up_ask, down_ask, open_orders, imbalance);
+        let stale = self.find_stale_orders(
+            up_ask,
+            down_ask,
+            open_orders,
+            imbalance,
+            overrides.allow_imbalance_side,
+        );
         for order_id in stale {
             if !plan.cancellations.contains(&order_id) {
                 plan.cancellations.push(order_id);
@@ -214,14 +208,13 @@ impl LadderEngine {
 
         // Generate paired ladders only when both sides have room
         if up_room >= MIN_ORDER_SIZE && down_room >= MIN_ORDER_SIZE {
-            let pair_orders = self.generate_paired_ladder(
-                up_ask,
-                down_ask,
-                up_room,
-                down_room,
-                overrides,
-            );
+            let pair_orders =
+                self.generate_paired_ladder(up_ask, down_ask, up_room, down_room, overrides);
             plan.orders.extend(pair_orders);
+        } else if let Some(side) = overrides.allow_imbalance_side {
+            let single_orders =
+                self.generate_single_ladder(side, up_ask, down_ask, up_room, down_room, overrides);
+            plan.orders.extend(single_orders);
         }
 
         plan
@@ -232,7 +225,8 @@ impl LadderEngine {
         up_ask: Decimal,
         down_ask: Decimal,
         open_orders: &[OpenOrderInfo],
-        imbalance: Decimal,  // FIXED: This is now the actual imbalance value
+        imbalance: Decimal, // FIXED: This is now the actual imbalance value
+        allow_imbalance_side: Option<MarketSide>,
     ) -> Vec<String> {
         let mut to_cancel = Vec::new();
 
@@ -245,7 +239,7 @@ impl LadderEngine {
             // Cancel if too far from market
             let distance = current_ask - order.price;
             if distance > self.config.stale_order_distance {
-                info!(
+                debug!(
                     order_id = %order.order_id,
                     price = %order.price,
                     current_ask = %current_ask,
@@ -262,8 +256,8 @@ impl LadderEngine {
                 MarketSide::Down => imbalance < -self.config.max_imbalance,
             };
 
-            if should_cancel_for_balance {
-                info!(
+            if should_cancel_for_balance && allow_imbalance_side != Some(order.side) {
+                debug!(
                     order_id = %order.order_id,
                     side = ?order.side,
                     imbalance = %imbalance,
@@ -292,19 +286,24 @@ impl LadderEngine {
             return orders;
         }
 
-        let size_per_level = (self.config.size_per_level * overrides.size_multiplier)
-            .max(MIN_ORDER_SIZE);
+        let size_per_level =
+            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
         let spacing = self.config.spacing * overrides.spacing_multiplier;
         let top_offset = self.config.top_offset + overrides.extra_offset;
-        let top_up = (up_ask - top_offset).max(dec!(0.01));
-        let top_down = (down_ask - top_offset).max(dec!(0.01));
+        let mut top_up = (up_ask - top_offset).max(dec!(0.01));
+        let mut top_down = (down_ask - top_offset).max(dec!(0.01));
+        if let Some(cap) = overrides.up_price_cap {
+            top_up = top_up.min(cap);
+        }
+        if let Some(cap) = overrides.down_price_cap {
+            top_down = top_down.min(cap);
+        }
         let tick = self.config.tick_size.max(dec!(0.01));
+        let levels = overrides.max_levels.unwrap_or(self.config.levels);
 
-        for level in 0..self.config.levels {
-            let price_up =
-                (top_up - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-            let price_down =
-                (top_down - spacing * Decimal::from(level as u32)).max(dec!(0.01));
+        for level in 0..levels {
+            let price_up = (top_up - spacing * Decimal::from(level as u32)).max(dec!(0.01));
+            let price_down = (top_down - spacing * Decimal::from(level as u32)).max(dec!(0.01));
 
             let price_up = floor_to_tick(price_up, tick);
             let price_down = floor_to_tick(price_down, tick);
@@ -336,6 +335,69 @@ impl LadderEngine {
         }
         orders
     }
+
+    fn generate_single_ladder(
+        &self,
+        side: MarketSide,
+        up_ask: Decimal,
+        down_ask: Decimal,
+        up_room: Decimal,
+        down_room: Decimal,
+        overrides: LadderOverrides,
+    ) -> Vec<LadderOrder> {
+        let mut orders = Vec::new();
+        let room = match side {
+            MarketSide::Up => up_room,
+            MarketSide::Down => down_room,
+        };
+
+        if room <= Decimal::ZERO {
+            return orders;
+        }
+
+        let size_per_level =
+            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
+        let spacing = self.config.spacing * overrides.spacing_multiplier;
+        let top_offset = self.config.top_offset + overrides.extra_offset;
+        let tick = self.config.tick_size.max(dec!(0.01));
+        let levels = overrides.max_levels.unwrap_or(self.config.levels);
+
+        let mut top_price = match side {
+            MarketSide::Up => (up_ask - top_offset).max(dec!(0.01)),
+            MarketSide::Down => (down_ask - top_offset).max(dec!(0.01)),
+        };
+        if let Some(cap) = match side {
+            MarketSide::Up => overrides.up_price_cap,
+            MarketSide::Down => overrides.down_price_cap,
+        } {
+            top_price = top_price.min(cap);
+        }
+
+        let mut remaining_room = room;
+        for level in 0..levels {
+            let price = (top_price - spacing * Decimal::from(level as u32)).max(dec!(0.01));
+            let price = floor_to_tick(price, tick);
+
+            let current_ask = match side {
+                MarketSide::Up => up_ask,
+                MarketSide::Down => down_ask,
+            };
+
+            if price >= current_ask {
+                continue;
+            }
+
+            let size = round_size(size_per_level.min(remaining_room));
+            if size < MIN_ORDER_SIZE {
+                break;
+            }
+
+            orders.push(LadderOrder { side, price, size });
+            remaining_room -= size;
+        }
+
+        orders
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -343,6 +405,10 @@ pub struct LadderOverrides {
     pub size_multiplier: Decimal,
     pub spacing_multiplier: Decimal,
     pub extra_offset: Decimal,
+    pub up_price_cap: Option<Decimal>,
+    pub down_price_cap: Option<Decimal>,
+    pub max_levels: Option<usize>,
+    pub allow_imbalance_side: Option<MarketSide>,
 }
 
 impl Default for LadderOverrides {
@@ -351,6 +417,10 @@ impl Default for LadderOverrides {
             size_multiplier: Decimal::ONE,
             spacing_multiplier: Decimal::ONE,
             extra_offset: Decimal::ZERO,
+            up_price_cap: None,
+            down_price_cap: None,
+            max_levels: None,
+            allow_imbalance_side: None,
         }
     }
 }

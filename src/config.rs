@@ -30,6 +30,22 @@ const DEFAULT_WIDEN_FACTOR: Decimal = dec!(2.0);
 const DEFAULT_DRIFT_FLICKER_THRESHOLD: f64 = 0.0005;
 const DEFAULT_PINNED_LOW: Decimal = dec!(0.05);
 const DEFAULT_PINNED_HIGH: Decimal = dec!(0.95);
+const DEFAULT_DURATION: MarketDuration = MarketDuration::FifteenMin;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDuration {
+    FifteenMin,
+    OneHour,
+}
+
+impl MarketDuration {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MarketDuration::FifteenMin => "15m",
+            MarketDuration::OneHour => "1h",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AssetInfo {
@@ -106,6 +122,7 @@ pub struct Config {
     pub drift_flicker_threshold: f64,
     pub pinned_low: Decimal,
     pub pinned_high: Decimal,
+    pub target_duration: MarketDuration,
 }
 
 impl Config {
@@ -153,6 +170,7 @@ impl Config {
             drift_flicker_threshold: DEFAULT_DRIFT_FLICKER_THRESHOLD,
             pinned_low: DEFAULT_PINNED_LOW,
             pinned_high: DEFAULT_PINNED_HIGH,
+            target_duration: DEFAULT_DURATION,
             dry_run: false,
         })
     }

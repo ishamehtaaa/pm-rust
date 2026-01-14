@@ -1,11 +1,13 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::RwLock;
+use polymarket_client_sdk::types::B256;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     pub id: String,
+    pub condition_id: Option<B256>,
     pub slug: String,
     pub asset: String,
     pub duration: String,

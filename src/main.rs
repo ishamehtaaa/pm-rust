@@ -1,6 +1,6 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::{Config, ASSETS_BY_NAME, ASSETS_BY_PREFIX};
+use polymarket::config::{Config, MarketDuration, ASSETS_BY_NAME, ASSETS_BY_PREFIX};
 use rust_decimal::Decimal;
 use std::collections::HashSet;
 use tracing_subscriber::{
@@ -17,11 +17,20 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    #[arg(long, default_value = "20", value_parser = clap::value_parser!(Decimal))]
+    #[arg(
+        long = "shares",
+        short = 's',
+        default_value = "20",
+        value_parser = clap::value_parser!(Decimal),
+        aliases = ["shares-target-per-side"]
+    )]
     shares_target_per_side: Decimal,
 
     #[arg(long, value_delimiter = ',', default_value = "bitcoin")]
     assets: Vec<String>,
+
+    #[arg(long, default_value = "15m")]
+    duration: String,
 }
 
 fn init_tracing(log_level: &str) {
@@ -65,6 +74,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     config.shares_target_per_side = args.shares_target_per_side;
+    let duration = match args.duration.as_str() {
+        "15m" => MarketDuration::FifteenMin,
+        "1h" | "1hr" => MarketDuration::OneHour,
+        other => anyhow::bail!("Unsupported duration: {}", other),
+    };
+    config.target_duration = duration;
     let mut target_assets = HashSet::new();
     for raw in args.assets {
         let key = raw.trim().to_lowercase();
@@ -87,9 +102,10 @@ async fn main() -> anyhow::Result<()> {
     config.target_assets = target_assets;
 
     tracing::info!(
-        "Starting Polymarket bot (dry_run={}, targets={:?})",
+        "Starting Polymarket bot (dry_run={}, targets={:?}, duration={})",
         config.dry_run,
-        config.target_assets
+        config.target_assets,
+        config.target_duration.as_str()
     );
 
     let mut bot = SimpleBot::new(config).await?;

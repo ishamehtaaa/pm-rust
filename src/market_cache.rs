@@ -1,4 +1,5 @@
 use crate::config::ASSETS_BY_PREFIX;
+use crate::config::MarketDuration;
 use crate::models::{duration_label, MarketInfo};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
@@ -19,13 +20,15 @@ pub enum MarketCacheError {
 pub struct MarketCache {
     client: GammaClient,
     target_assets: HashSet<String>,
+    target_duration: MarketDuration,
 }
 
 impl MarketCache {
-    pub fn new(target_assets: HashSet<String>) -> Self {
+    pub fn new(target_assets: HashSet<String>, target_duration: MarketDuration) -> Self {
         Self {
             client: GammaClient::default(),
             target_assets,
+            target_duration,
         }
     }
 
@@ -43,8 +46,12 @@ impl MarketCache {
     }
 
     async fn fetch_raw_markets(&self) -> Result<Vec<GammaMarket>, MarketCacheError> {
+        let tag_id = match self.target_duration {
+            MarketDuration::FifteenMin => "102467",
+            MarketDuration::OneHour => "102175",
+        };
         let request = MarketsRequest::builder()
-            .tag_id("102467")
+            .tag_id(tag_id)
             .limit(1200)
             .closed(false)
             .ascending(false)
@@ -59,7 +66,11 @@ impl MarketCache {
     fn convert_market(&self, m: GammaMarket) -> Option<MarketInfo> {
         let slug = m.slug.as_deref()?;
          
-        if !is_15m_market(slug) {
+        let duration_match = match self.target_duration {
+            MarketDuration::FifteenMin => is_15m_market(slug),
+            MarketDuration::OneHour => is_1h_market(slug),
+        };
+        if !duration_match {
             return None;
         }
 
@@ -92,6 +103,7 @@ impl MarketCache {
 
         Some(MarketInfo {
             id: m.id,
+            condition_id: m.condition_id,
             slug: slug.to_string(),
             asset: asset_info.asset.clone(),
             duration,
@@ -112,6 +124,11 @@ fn is_15m_market(slug: &str) -> bool {
     }
     parts.get(1) == Some(&"updown") && parts.get(2) == Some(&"15m")
 }
+
+fn is_1h_market(slug: &str) -> bool {
+    // Example: ethereum-up-or-down-january-13-6pm-et
+    slug.contains("-up-or-down-")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +140,13 @@ mod tests {
         assert!(!is_15m_market("btc-up-or-down-1hr"));
         assert!(!is_15m_market("btc-updown-1hr-123"));
         assert!(!is_15m_market("random-slug"));
+    }
+
+    #[test]
+    fn test_is_1h_market() {
+        assert!(is_1h_market("ethereum-up-or-down-january-13-6pm-et"));
+        assert!(!is_1h_market("btc-updown-15m-123"));
+        assert!(!is_1h_market("btc-updown-1hr-123"));
+        assert!(!is_1h_market("random-slug"));
     }
 }
