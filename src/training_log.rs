@@ -62,6 +62,19 @@ pub enum TradeAction {
     Skip,  /* Decided not to trade */
 }
 
+/* A completed trade pair record for the jsonl log */
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedTradeRecord {
+    pub timestamp_ms: i64,
+    pub market_id: String,
+    pub action: String,  /* "CompletedPair" */
+    pub conviction_at_trade: f64,
+    pub momentum_at_trade: f64,
+    pub calmness_at_trade: f64,
+    pub combined_cost: f64,
+    pub profit_cents: f64,
+}
+
 /* Logger that appends to a JSONL file */
 pub struct TrainingLogger {
     writer: Mutex<Option<BufWriter<File>>>,
@@ -89,6 +102,29 @@ impl TrainingLogger {
         if let Ok(mut guard) = self.writer.lock() {
             if let Some(ref mut writer) = *guard {
                 if let Ok(json) = serde_json::to_string(record) {
+                    let _ = writeln!(writer, "{}", json);
+                    let _ = writer.flush();
+                }
+            }
+        }
+    }
+    
+    /* Log a completed trade pair with profit info */
+    pub fn log_completed(&self, trade: &CompletedTrade, market_id: &str) {
+        let record = CompletedTradeRecord {
+            timestamp_ms: trade.timestamp_ms,
+            market_id: market_id.to_string(),
+            action: "CompletedPair".to_string(),
+            conviction_at_trade: trade.conviction_at_trade,
+            momentum_at_trade: trade.momentum_at_trade,
+            calmness_at_trade: trade.calmness_at_trade,
+            combined_cost: trade.combined_cost,
+            profit_cents: trade.profit_cents,
+        };
+        
+        if let Ok(mut guard) = self.writer.lock() {
+            if let Some(ref mut writer) = *guard {
+                if let Ok(json) = serde_json::to_string(&record) {
                     let _ = writeln!(writer, "{}", json);
                     let _ = writer.flush();
                 }

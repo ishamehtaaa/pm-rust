@@ -37,7 +37,7 @@ use tracing::{debug, error, info, instrument, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(200);
+const LOOP_DELAY: Duration = Duration::from_millis(50);  /* Reduced from 200ms for faster reaction */
 const BALANCE_REFRESH_SECS: u64 = 30;
 
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
@@ -83,6 +83,7 @@ pub struct SimpleBot {
     training_logger: TrainingLogger,
     adaptive_params: AdaptiveParams,
     pending_orders: HashMap<String, TradeRecord>,  /* order_id -> record */
+    last_recorded_pairs: HashMap<String, Decimal>,  /* market_id -> last recorded min_pair_size */
 }
 
 impl SimpleBot {
@@ -161,6 +162,7 @@ impl SimpleBot {
             training_logger: TrainingLogger::default(),
             adaptive_params: AdaptiveParams::default(),
             pending_orders: HashMap::new(),
+            last_recorded_pairs: HashMap::new(),
         })
     }
 
@@ -250,8 +252,13 @@ impl SimpleBot {
             .token_id(down_token)
             .build();
 
-        let up_resp = self.client.balance_allowance(up_req).await?;
-        let down_resp = self.client.balance_allowance(down_req).await?;
+        /* Fetch both balances in parallel for speed */
+        let (up_resp, down_resp) = tokio::join!(
+            self.client.balance_allowance(up_req),
+            self.client.balance_allowance(down_req)
+        );
+        let up_resp = up_resp?;
+        let down_resp = down_resp?;
 
         let up_raw: Decimal = up_resp.balance;
         let down_raw: Decimal = down_resp.balance;
@@ -418,9 +425,17 @@ impl SimpleBot {
                 .await
             {
                 Ok((up_bal, down_bal)) => {
+                    /* Try to get current prices to estimate cost for pre-existing positions */
+                    let price_cache = self.price_cache.read();
+                    let up_mid = price_cache.get(&state.info.up_token_id)
+                        .map(|(bid, ask)| (bid + ask) / dec!(2));
+                    let down_mid = price_cache.get(&state.info.down_token_id)
+                        .map(|(bid, ask)| (bid + ask) / dec!(2));
+                    drop(price_cache);
+                    
                     self.ledger
                         .write()
-                        .sync_position(market_id.clone(), up_bal, down_bal);
+                        .sync_position_with_prices(market_id.clone(), up_bal, down_bal, up_mid, down_mid);
                     info!(
                         market = %market_symbol,
                         up = %up_bal,
@@ -703,40 +718,50 @@ impl SimpleBot {
                     }
 
                     if status != TrendStatus::Ready {
+                        /*
+                         * CONSERVATIVE APPROACH: On OutOfRange, just pause new orders.
+                         * Only cancel if orders are on the EXPENSIVE side (price rising away from us).
+                         * This lets cheap-side orders stay and potentially fill.
+                         * 
+                         * Logic is SYMMETRIC - we just compare which side costs more.
+                         */
+                        
+                        /* Still check for completed pairs during pauses (learning continues) */
+                        self.check_completed_pairs(&market_id);
+                        
                         let open_orders = self.ledger.read().open_orders_for_market(&market_id);
+                        
                         if !open_orders.is_empty() && self.should_model_cancel(&market_id) {
-                            /*
-                             * SMART CANCELLATION: Only cancel orders on the side losing edge.
-                             * - momentum > 0: Up getting expensive → cancel Up orders (keep Down)
-                             * - momentum < 0: Down getting expensive → cancel Down orders (keep Up)
-                             * - momentum ~0: cancel all (no clear direction)
-                             */
-                            let momentum = summary.map(|s| s.vol_metrics.momentum).unwrap_or(0.0);
+                            /* Determine which side is "expensive" based on current prices, not labels */
+                            let up_price = up_ask.to_f64().unwrap_or(0.5);
+                            let down_price = down_ask.to_f64().unwrap_or(0.5);
+                            
+                            /* The expensive side is whichever is closer to $1 */
+                            let expensive_side = if up_price > down_price {
+                                Some(MarketSide::Up)
+                            } else if down_price > up_price {
+                                Some(MarketSide::Down)
+                            } else {
+                                None  /* Equal - don't cancel either */
+                            };
+                            
+                            /* Only cancel orders on the expensive side */
                             let cancel_ids: Vec<String> = open_orders
                                 .into_iter()
-                                .filter(|o| {
-                                    if momentum > 0.2 {
-                                        /* Up expensive → only cancel Up orders */
-                                        o.side == MarketSide::Up
-                                    } else if momentum < -0.2 {
-                                        /* Down expensive → only cancel Down orders */
-                                        o.side == MarketSide::Down
-                                    } else {
-                                        /* Unclear → cancel all */
-                                        true
-                                    }
-                                })
+                                .filter(|o| expensive_side == Some(o.side))
                                 .map(|o| o.order_id)
                                 .collect();
                             
                             if !cancel_ids.is_empty() {
-                                let side_str = if momentum > 0.2 { "Up" } else if momentum < -0.2 { "Down" } else { "all" };
-                                info!(
+                                let side_str = expensive_side
+                                    .map(|s| format!("{:?}", s))
+                                    .unwrap_or_else(|| "none".to_string());
+                                debug!(
                                     market = %market_symbol,
                                     reason = %reason,
-                                    side = %side_str,
+                                    expensive_side = %side_str,
                                     count = cancel_ids.len(),
-                                    "Model pause: cancelling orders on expensive side"
+                                    "Pausing: cancelling expensive side only"
                                 );
                                 match self.cancel_orders(&cancel_ids).await {
                                     Ok(cancelled) => {
@@ -746,7 +771,7 @@ impl SimpleBot {
                                         error!(
                                             market = %market_symbol,
                                             error = %e,
-                                            "Failed to cancel orders on model pause"
+                                            "Failed to cancel orders"
                                         );
                                     }
                                 }
@@ -809,6 +834,24 @@ impl SimpleBot {
                 self.ladder_engine.config().max_imbalance,
                 self.config.edge_threshold,
             );
+            
+            /*
+             * PASS FILL PRICES AND CONVICTION TO OVERRIDES
+             * 
+             * This enables:
+             * - Single-side rebalancing with combined cost validation
+             * - Conviction-based aggressive pricing (high conviction → bid closer to ask)
+             */
+            {
+                let ledger = self.ledger.read();
+                let (avg_up, avg_down) = ledger.average_fill_prices(&market_id);
+                overrides.avg_up_cost = avg_up;
+                overrides.avg_down_cost = avg_down;
+                /* Conviction was already set in build_ladder_overrides from vol_metrics */
+                overrides.conviction = summary
+                    .map(|s| s.vol_metrics.conviction)
+                    .unwrap_or(0.5);
+            }
 
             if self.should_log_position(
                 &market_id,
@@ -826,9 +869,27 @@ impl SimpleBot {
                 } else {
                     String::new()
                 };
+                
+                /* Get average fill prices for logging */
+                let ledger = self.ledger.read();
+                let (avg_up, avg_down) = ledger.average_fill_prices(&market_id);
+                drop(ledger);
+                
+                let avg_str = match (avg_up, avg_down) {
+                    (Some(u), Some(d)) => {
+                        let combined = u + d;
+                        let profit = (Decimal::ONE - combined) * dec!(100);
+                        format!(" avg[up={:.2}¢ down={:.2}¢ combined={:.2}¢ profit={:.1}¢]", 
+                            u * dec!(100), d * dec!(100), combined * dec!(100), profit)
+                    }
+                    (Some(u), None) => format!(" avg[up={:.2}¢ down=?]", u * dec!(100)),
+                    (None, Some(d)) => format!(" avg[up=? down={:.2}¢]", d * dec!(100)),
+                    (None, None) => String::new(),
+                };
+                
                 debug!(
                     market = %market_symbol,
-                    "position up={:.4} down={:.4} pending(up={:.4} down={:.4}) total(up={:.4} down={:.4}){} target={:.2}",
+                    "position up={:.4} down={:.4} pending(up={:.4} down={:.4}) total(up={:.4} down={:.4}){}{} target={:.2}",
                     pos.up_shares,
                     pos.down_shares,
                     pending_up,
@@ -836,6 +897,7 @@ impl SimpleBot {
                     total_up,
                     total_down,
                     imbalance_str,
+                    avg_str,
                     effective_target
                 );
             }
@@ -978,74 +1040,102 @@ impl SimpleBot {
      * Check for completed trade pairs and update adaptive parameters.
      * A "completed pair" is when we've bought both Up and Down shares.
      * 
-     * Uses pending_orders to track what prices we placed at.
-     * Limit orders fill at their price or better, so the placed price is 
-     * the maximum we paid (actual could be lower = more profit).
+     * Only records profit for NEW pairs (not already recorded).
+     * 
+     * Profit calculation:
+     *   total_cost = up_cost + down_cost (what we paid)
+     *   payout = min_shares * $1 (what we get when market resolves)
+     *   profit = payout - total_cost
+     * 
+     * Example: 10 Up @ 90¢ + 10 Down @ 5¢
+     *   cost = $9.00 + $0.50 = $9.50
+     *   payout = 10 * $1 = $10.00
+     *   profit = $10.00 - $9.50 = $0.50 = 50¢
      */
     fn check_completed_pairs(&mut self, market_id: &str) {
         let ledger = self.ledger.read();
-        let (up_shares, down_shares) = ledger.confirmed_position(market_id);
+        let position = ledger.effective_position(market_id);
         drop(ledger);
         
-        /* Calculate average fill prices from our placed orders */
-        let mut up_fill_value = 0.0;
-        let mut down_fill_value = 0.0;
-        let mut up_fill_size = 0.0;
-        let mut down_fill_size = 0.0;
+        let up_shares = position.up_shares;
+        let down_shares = position.down_shares;
+        let up_cost = position.up_cost;
+        let down_cost = position.down_cost;
         
-        for record in self.pending_orders.values() {
-            if record.market_id != market_id {
-                continue;
-            }
-            let price = record.order_price.unwrap_or(0.5);
-            let size = record.order_size.unwrap_or(0.0);
-            
-            match record.order_side.as_deref() {
-                Some("Up") => {
-                    up_fill_value += price * size;
-                    up_fill_size += size;
-                }
-                Some("Down") => {
-                    down_fill_value += price * size;
-                    down_fill_size += size;
-                }
-                _ => {}
-            }
-        }
-        
-        /* Check if we have a complete pair (at least 1 share of each side) */
+        /* Check if we have complete pairs with tracked costs */
         let min_pair_size = up_shares.min(down_shares);
-        if min_pair_size >= dec!(1) && up_fill_size > 0.0 && down_fill_size > 0.0 {
-            /* Calculate profit: 1 share pair = $1 payout, cost = what we paid */
-            let avg_up_cost = up_fill_value / up_fill_size;
-            let avg_down_cost = down_fill_value / down_fill_size;
-            
-            let combined_cost = avg_up_cost + avg_down_cost;
-            let profit_per_share = 1.0 - combined_cost;
-            let profit_cents = profit_per_share * 100.0;
-            
-            /* Get current model state for learning */
-            let (conviction, momentum, calmness) = self.trend_windows
-                .get_mut(market_id)
-                .and_then(|w| w.rn_jd_summary())
-                .map(|s| (s.vol_metrics.conviction, s.vol_metrics.momentum, s.vol_metrics.calmness))
-                .unwrap_or((0.5, 0.0, 0.5));
-            
-            /* Record completed trade for adaptive learning */
-            let trade = CompletedTrade {
-                conviction_at_trade: conviction,
-                momentum_at_trade: momentum,
-                calmness_at_trade: calmness,
-                combined_cost,
-                profit_cents,
-                timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            };
-            
-            self.adaptive_params.record_trade(trade);
-            
-            /* Clear pending orders for this market to avoid double-counting */
-            self.pending_orders.retain(|_, r| r.market_id != market_id);
+        if min_pair_size < dec!(1) || up_cost <= Decimal::ZERO || down_cost <= Decimal::ZERO {
+            return;
         }
+        
+        /* Only record NEW pairs (not already counted) */
+        let last_recorded = self.last_recorded_pairs
+            .get(market_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        
+        let new_pairs = min_pair_size - last_recorded;
+        if new_pairs < dec!(1) {
+            return;  /* No new complete pairs */
+        }
+        
+        /* Calculate profit for the NEW pairs only */
+        /* 
+         * For the new pairs, we use the proportional cost:
+         * new_up_cost = up_cost * (new_pairs / up_shares)
+         * new_down_cost = down_cost * (new_pairs / down_shares)
+         * 
+         * But since we want avg prices, it's simpler:
+         * avg_up = up_cost / up_shares
+         * avg_down = down_cost / down_shares
+         * profit_per_share = 1 - (avg_up + avg_down)
+         * total_profit = profit_per_share * new_pairs
+         */
+        let avg_up_price = up_cost / up_shares;
+        let avg_down_price = down_cost / down_shares;
+        let combined_cost = avg_up_price + avg_down_price;
+        let profit_per_share = Decimal::ONE - combined_cost;
+        
+        /* TOTAL profit in cents for the new pairs */
+        let total_profit_cents = (profit_per_share * new_pairs * dec!(100)).to_f64().unwrap_or(0.0);
+        
+        /* Get current model state for learning */
+        let (conviction, momentum, calmness) = self.trend_windows
+            .get_mut(market_id)
+            .and_then(|w| w.rn_jd_summary())
+            .map(|s| (s.vol_metrics.conviction, s.vol_metrics.momentum, s.vol_metrics.calmness))
+            .unwrap_or((0.5, 0.0, 0.5));
+        
+        /* Record completed trade for adaptive learning */
+        let trade = CompletedTrade {
+            conviction_at_trade: conviction,
+            momentum_at_trade: momentum,
+            calmness_at_trade: calmness,
+            combined_cost: combined_cost.to_f64().unwrap_or(1.0),
+            profit_cents: total_profit_cents,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        
+        info!(
+            market = %market_id,
+            new_pairs = %new_pairs,
+            avg_up = %format!("{:.2}¢", avg_up_price * dec!(100)),
+            avg_down = %format!("{:.2}¢", avg_down_price * dec!(100)),
+            combined = %format!("{:.2}¢", combined_cost * dec!(100)),
+            profit = %format!("{:.2}¢", total_profit_cents),
+            "Completed pairs recorded"
+        );
+        
+        /* Log to jsonl for training data */
+        self.training_logger.log_completed(&trade, market_id);
+        
+        self.adaptive_params.record_trade(trade);
+        
+        /* Update last recorded pairs */
+        self.last_recorded_pairs.insert(market_id.to_string(), min_pair_size);
+        
+        /* Clear pending orders for this market */
+        self.pending_orders.retain(|_, r| r.market_id != market_id);
     }
 
     fn should_log_missing_price(&mut self, market_id: &str) -> bool {
@@ -1717,6 +1807,7 @@ fn apply_imbalance_override(
         return;
     };
     let imbalance_abs = imbalance.abs();
+    /* Rebalance when imbalance exceeds threshold (> not >=) */
     if imbalance_abs < max_imbalance {
         return;
     }

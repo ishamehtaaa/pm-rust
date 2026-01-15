@@ -51,6 +51,9 @@ pub struct MarketPosition {
     pub down_shares: Decimal,
     pub pending_up: Decimal,
     pub pending_down: Decimal,
+    /* Track actual cost paid for accurate profit calculation */
+    pub up_cost: Decimal,
+    pub down_cost: Decimal,
 }
 
 impl InventoryLedger {
@@ -117,21 +120,78 @@ impl InventoryLedger {
 
     /// Update the position for a market from API data.
     /// Called both on initial discovery and periodic refreshes.
+    /// 
+    /// For pre-existing positions (shares > 0 but cost = 0), estimates cost
+    /// using provided mid prices if available.
     pub fn sync_position(
         &mut self,
         market_id: String,
         up_shares: Decimal,
         down_shares: Decimal,
     ) {
-        let pos = self.positions.entry(market_id.clone()).or_default();
+        self.sync_position_with_prices(market_id, up_shares, down_shares, None, None);
+    }
+    
+    /// Sync position with optional mid prices for estimating pre-existing costs.
+    pub fn sync_position_with_prices(
+        &mut self,
+        market_id: String,
+        up_shares: Decimal,
+        down_shares: Decimal,
+        up_mid: Option<Decimal>,
+        down_mid: Option<Decimal>,
+    ) {
+        /* Get label before mutable borrow */
+        let market_label = self.market_label(&market_id);
+        
+        let pos = self.positions.entry(market_id).or_default();
         let changed = pos.up_shares != up_shares || pos.down_shares != down_shares;
+        
+        /* 
+         * For pre-existing shares (cost not yet tracked), estimate cost.
+         * 
+         * IMPORTANT: Only estimate on FIRST sync when pos.up_shares == 0.
+         * This means the shares existed BEFORE the bot started.
+         * 
+         * We do NOT estimate for new fills during operation - the WebSocket
+         * handler tracks actual fill prices. Estimating here would cause
+         * double-counting (estimate + WS fill = too high).
+         */
+        let is_initial_sync = pos.up_shares == Decimal::ZERO && pos.down_shares == Decimal::ZERO;
+        
+        if is_initial_sync && up_shares > Decimal::ZERO && pos.up_cost == Decimal::ZERO {
+            if let Some(mid) = up_mid {
+                pos.up_cost = up_shares * mid;
+                debug!(
+                    market = %market_label,
+                    shares = %up_shares,
+                    est_cost = %pos.up_cost,
+                    mid = %mid,
+                    "Estimated Up cost for pre-existing position"
+                );
+            }
+        }
+        
+        if is_initial_sync && down_shares > Decimal::ZERO && pos.down_cost == Decimal::ZERO {
+            if let Some(mid) = down_mid {
+                pos.down_cost = down_shares * mid;
+                debug!(
+                    market = %market_label,
+                    shares = %down_shares,
+                    est_cost = %pos.down_cost,
+                    mid = %mid,
+                    "Estimated Down cost for pre-existing position"
+                );
+            }
+        }
+        
         pos.up_shares = up_shares;
         pos.down_shares = down_shares;
 
-        // Only log if position actually changed
+        /* Only log if position actually changed */
         if changed {
             debug!(
-                market = %self.market_label(&market_id),
+                market = %market_label,
                 up_shares = %up_shares,
                 down_shares = %down_shares,
                 "Position synced"
@@ -166,15 +226,27 @@ impl InventoryLedger {
             let fill_delta = size_matched - tracked.filled_size;
             if fill_delta > Decimal::ZERO {
                 let pos = self.positions.entry(tracked.market_id.clone()).or_default();
+                
+                /* Track fill value for accurate profit calculation */
+                let fill_price = msg.price;
+                let fill_value = fill_price * fill_delta;
+                
                 match tracked.side {
-                    MarketSide::Up => pos.up_shares += fill_delta,
-                    MarketSide::Down => pos.down_shares += fill_delta,
+                    MarketSide::Up => {
+                        pos.up_shares += fill_delta;
+                        pos.up_cost += fill_value;
+                    }
+                    MarketSide::Down => {
+                        pos.down_shares += fill_delta;
+                        pos.down_cost += fill_value;
+                    }
                 }
 
                 let market_id = tracked.market_id.clone();
                 info!(
                     order_id = %short_id(&order_id, 8),
                     side = ?tracked.side,
+                    fill_price = %fill_price,
                     fill_delta = %fill_delta,
                     total_filled = %size_matched,
                     market = %market_id,
@@ -279,6 +351,51 @@ impl InventoryLedger {
             .map(|p| (p.up_shares, p.down_shares))
             .unwrap_or_default()
     }
+    
+    /*
+     * Get average fill prices for each side.
+     * Returns (avg_up_price, avg_down_price) or None if no fills on that side.
+     */
+    pub fn average_fill_prices(&self, market_id: &str) -> (Option<Decimal>, Option<Decimal>) {
+        let Some(pos) = self.positions.get(market_id) else {
+            return (None, None);
+        };
+        
+        let avg_up = if pos.up_shares > Decimal::ZERO && pos.up_cost > Decimal::ZERO {
+            Some(pos.up_cost / pos.up_shares)
+        } else {
+            None
+        };
+        
+        let avg_down = if pos.down_shares > Decimal::ZERO && pos.down_cost > Decimal::ZERO {
+            Some(pos.down_cost / pos.down_shares)
+        } else {
+            None
+        };
+        
+        (avg_up, avg_down)
+    }
+    
+    /*
+     * Calculate maximum price we can pay for incomplete side and still profit.
+     * If we have Up at 30¢ average, we can pay up to (100¢ - 30¢ - margin) = ~68¢ for Down.
+     * Returns (max_up_price, max_down_price) - None means no position on that side yet.
+     */
+    pub fn max_completion_prices(&self, market_id: &str, profit_margin: Decimal) -> (Option<Decimal>, Option<Decimal>) {
+        let (avg_up, avg_down) = self.average_fill_prices(market_id);
+        
+        /* If we have Up, calculate max Down price */
+        let max_down = avg_up.map(|up_avg| {
+            (Decimal::ONE - up_avg - profit_margin).max(Decimal::ZERO)
+        });
+        
+        /* If we have Down, calculate max Up price */
+        let max_up = avg_down.map(|down_avg| {
+            (Decimal::ONE - down_avg - profit_margin).max(Decimal::ZERO)
+        });
+        
+        (max_up, max_down)
+    }
 }
 
 /// Spawn WebSocket order feed that updates the ledger.
@@ -320,7 +437,7 @@ pub fn spawn_order_feed(
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;  /* Reduced from 5s for faster reconnect */
         }
     })
 }
