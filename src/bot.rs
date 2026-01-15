@@ -5,6 +5,7 @@ use crate::models::{MarketInfo, MarketState, TradingPair};
 use crate::poller::{InventoryLedger, MarketSide, spawn_order_feed};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use crate::trend_window::TrendWindow;
+use crate::training_log::{TrainingLogger, TradeRecord, TradeAction, AdaptiveParams, CompletedTrade};
 use crate::config::ASSETS_BY_NAME;
 use chrono::Timelike;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
@@ -77,6 +78,11 @@ pub struct SimpleBot {
     trend_log_state: HashMap<String, TrendLogState>,
     last_missing_price_log: HashMap<String, Instant>,
     last_dry_run_log: HashMap<String, Instant>,
+    
+    /* Training and adaptive learning */
+    training_logger: TrainingLogger,
+    adaptive_params: AdaptiveParams,
+    pending_orders: HashMap<String, TradeRecord>,  /* order_id -> record */
 }
 
 impl SimpleBot {
@@ -87,11 +93,13 @@ impl SimpleBot {
         let market_cache = MarketCache::new(config.target_assets.clone(), config.target_duration);
         let price_cache = Arc::new(RwLock::new(PriceCache::default()));
 
-        let mut ladder_config = LadderConfig::default();
-        ladder_config.size_per_level = config.order_size;
-        ladder_config.target_per_side = config.shares_target_per_side;
-        ladder_config.max_pair_cost = config.target_total_cost;
-        ladder_config.top_offset = config.maker_price_offset;
+        let ladder_config = LadderConfig {
+            size_per_level: config.order_size,
+            target_per_side: config.shares_target_per_side,
+            max_pair_cost: config.target_total_cost,
+            top_offset: config.maker_price_offset,
+            ..Default::default()
+        };
         let ladder_engine = LadderEngine::new(ladder_config);
         let ladder_state = LadderState::default();
 
@@ -150,6 +158,9 @@ impl SimpleBot {
             trend_log_state: HashMap::new(),
             last_missing_price_log: HashMap::new(),
             last_dry_run_log: HashMap::new(),
+            training_logger: TrainingLogger::default(),
+            adaptive_params: AdaptiveParams::default(),
+            pending_orders: HashMap::new(),
         })
     }
 
@@ -202,7 +213,7 @@ impl SimpleBot {
             Ok((up_bal, down_bal)) => {
                 self.ledger
                     .write()
-                    .set_initial_position(market_id.to_string(), up_bal, down_bal);
+                    .sync_position(market_id.to_string(), up_bal, down_bal);
                 debug!(
                     market = %market_symbol,
                     up_shares = %up_bal,
@@ -380,7 +391,7 @@ impl SimpleBot {
             }
         }
 
-        // Update active market IDs after processing all markets
+        /* Update active market IDs after processing all markets */
         {
             let mut ids = self.active_market_ids.write();
             *ids = self.markets.keys().cloned().collect();
@@ -409,16 +420,16 @@ impl SimpleBot {
                 Ok((up_bal, down_bal)) => {
                     self.ledger
                         .write()
-                        .set_initial_position(market_id.clone(), up_bal, down_bal);
+                        .sync_position(market_id.clone(), up_bal, down_bal);
                     info!(
                         market = %market_symbol,
-                        up_shares = %up_bal,
-                        down_shares = %down_bal,
-                        "Position initialized"
+                        up = %up_bal,
+                        down = %down_bal,
+                        "Position loaded"
                     );
                 }
                 Err(e) => {
-                    warn!(market = %market_symbol, error = %e, "Failed to fetch initial position");
+                    warn!(market = %market_symbol, error = %e, "Failed to fetch position");
                 }
             }
         }
@@ -441,10 +452,10 @@ impl SimpleBot {
         match spawn_price_feed(WS_SUB_URL, token_ids, self.price_cache.clone()) {
             Ok(handle) => {
                 self._price_feed = Some(handle);
-                info!("Price feed started!!");
+                info!("Price feed connected");
             }
             Err(e) => {
-                error!(error = %e, "Failed to start price feed :(");
+                error!(error = %e, "Failed to start price feed");
             }
         }
     }
@@ -459,8 +470,7 @@ impl SimpleBot {
         }
         let total_seconds = now.minute() * 60 + now.second();
 
-        // Seconds into each 15-minute window where we should refresh
-        // 15 min = 900 seconds, refresh at 840-870 seconds (14:00-14:30)
+        /* Refresh in the last 30 seconds of each 15-minute window (14:00-14:30) */
         let position_in_window = total_seconds % 900;
 
         (840..870).contains(&position_in_window)
@@ -655,6 +665,8 @@ impl SimpleBot {
                             self.config.drift_flicker_threshold,
                             extra.high_vol_widen,
                             self.ladder_engine.config().levels,
+                            self.config.target_total_cost,
+                            self.adaptive_params.min_conviction,  /* Learned threshold */
                         );
                         extra.size_multiplier = overrides.size_multiplier;
                         extra.spacing_multiplier = overrides.spacing_multiplier;
@@ -662,96 +674,81 @@ impl SimpleBot {
                         extra.up_price_cap = overrides.up_price_cap;
                         extra.down_price_cap = overrides.down_price_cap;
                         extra.max_levels = overrides.max_levels;
+                        extra.conviction = summary.map(|s| s.vol_metrics.conviction).unwrap_or(0.0);
                         (ranges, span_ms, sample_count, effective_target, overrides)
                     };
 
                     if self.should_log_trend(&market_id, status) {
-                        match status {
-                            TrendStatus::NotReady => {
-                                debug!(
-                                    market = %market_symbol,
-                                    "{}",
-                                    format_trend_log(
-                                        reason,
-                                        up_bid,
-                                        up_ask,
-                                        down_bid,
-                                        down_ask,
-                                        ranges,
-                                        span_ms,
-                                        sample_count,
-                                        None,
-                                        extra,
-                                    )
-                                );
-                            }
-                            TrendStatus::OutOfRange => {
-                                debug!(
-                                    market = %market_symbol,
-                                    "{}",
-                                    format_trend_log(
-                                        reason,
-                                        up_bid,
-                                        up_ask,
-                                        down_bid,
-                                        down_ask,
-                                        ranges,
-                                        span_ms,
-                                        sample_count,
-                                        Some(self.config.trend_max_range),
-                                        extra,
-                                    )
-                                );
-                            }
-                            TrendStatus::Ready => {
-                                let rn_up_bid = summary.map(|s| s.rn_bid).unwrap_or_default();
-                                let rn_up_ask = summary.map(|s| s.rn_ask).unwrap_or_default();
-                                let naive_up_bid = summary.map(|s| s.naive_bid).unwrap_or_default();
-                                let naive_up_ask = summary.map(|s| s.naive_ask).unwrap_or_default();
-                                debug!(
-                                    market = %market_symbol,
-                                    "{}",
-                                    format_trend_ready_log(
-                                        up_bid,
-                                        up_ask,
-                                        down_bid,
-                                        down_ask,
-                                        ranges,
-                                        span_ms,
-                                        sample_count,
-                                        summary,
-                                        rn_up_bid,
-                                        rn_up_ask,
-                                        naive_up_bid,
-                                        naive_up_ask,
-                                        extra,
-                                    )
-                                );
-                            }
-                        }
+                        let max_range = match status {
+                            TrendStatus::OutOfRange => Some(self.config.trend_max_range),
+                            _ => None,
+                        };
+                        debug!(
+                            market = %market_symbol,
+                            "{}",
+                            format_trend_log(
+                                reason,
+                                up_bid,
+                                up_ask,
+                                down_bid,
+                                down_ask,
+                                ranges,
+                                span_ms,
+                                sample_count,
+                                max_range,
+                                extra,
+                                summary,
+                            )
+                        );
                     }
 
                     if status != TrendStatus::Ready {
                         let open_orders = self.ledger.read().open_orders_for_market(&market_id);
                         if !open_orders.is_empty() && self.should_model_cancel(&market_id) {
-                            let cancel_ids: Vec<String> =
-                                open_orders.into_iter().map(|o| o.order_id).collect();
-                            info!(
-                                market = %market_symbol,
-                                reason = %reason,
-                                count = cancel_ids.len(),
-                                "Model pause: cancelling open orders"
-                            );
-                            match self.cancel_orders(&cancel_ids).await {
-                                Ok(cancelled) => {
-                                    self.ledger.write().mark_orders_cancelled(&cancelled);
-                                }
-                                Err(e) => {
-                                    error!(
-                                        market = %market_symbol,
-                                        error = %e,
-                                        "Failed to cancel orders on model pause"
-                                    );
+                            /*
+                             * SMART CANCELLATION: Only cancel orders on the side losing edge.
+                             * - momentum > 0: Up getting expensive → cancel Up orders (keep Down)
+                             * - momentum < 0: Down getting expensive → cancel Down orders (keep Up)
+                             * - momentum ~0: cancel all (no clear direction)
+                             */
+                            let momentum = summary.map(|s| s.vol_metrics.momentum).unwrap_or(0.0);
+                            let cancel_ids: Vec<String> = open_orders
+                                .into_iter()
+                                .filter(|o| {
+                                    if momentum > 0.2 {
+                                        /* Up expensive → only cancel Up orders */
+                                        o.side == MarketSide::Up
+                                    } else if momentum < -0.2 {
+                                        /* Down expensive → only cancel Down orders */
+                                        o.side == MarketSide::Down
+                                    } else {
+                                        /* Unclear → cancel all */
+                                        true
+                                    }
+                                })
+                                .map(|o| o.order_id)
+                                .collect();
+                            
+                            if !cancel_ids.is_empty() {
+                                let side_str = if momentum > 0.2 { "Up" } else if momentum < -0.2 { "Down" } else { "all" };
+                                info!(
+                                    market = %market_symbol,
+                                    reason = %reason,
+                                    side = %side_str,
+                                    count = cancel_ids.len(),
+                                    "Model pause: cancelling orders on expensive side"
+                                );
+                                match self.cancel_orders(&cancel_ids).await {
+                                    Ok(cancelled) => {
+                                        self.ledger.write().mark_orders_cancelled(&cancelled);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            market = %market_symbol,
+                                            error = %e,
+                                            "Failed to cancel orders on model pause"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -780,7 +777,7 @@ impl SimpleBot {
                 continue;
             }
 
-            // Get position and open orders
+            /* Get position and open orders */
             let (pos, open_orders) = {
                 let ledger = self.ledger.read();
                 (
@@ -858,7 +855,7 @@ impl SimpleBot {
                 continue;
             }
 
-            // Cancel stale orders first
+            /* Cancel stale orders first */
             if !plan.cancellations.is_empty() {
                 match self.cancel_orders(&plan.cancellations).await {
                     Ok(cancelled) => {
@@ -922,6 +919,23 @@ impl SimpleBot {
                                         order.size,
                                         order.price,
                                     );
+                                    
+                                    /* Log for training */
+                                    let mut record = TrainingLogger::create_record(
+                                        &market_id,
+                                        up_bid,
+                                        up_ask,
+                                        down_bid,
+                                        down_ask,
+                                        summary.as_ref(),
+                                    );
+                                    record.action = TradeAction::PlaceOrder;
+                                    record.order_side = Some(format!("{:?}", order.side));
+                                    record.order_price = order.price.to_f64();
+                                    record.order_size = order.size.to_f64();
+                                    self.training_logger.log(&record);
+                                    self.pending_orders.insert(resp.order_id.clone(), record);
+                                    
                                     placed += 1;
                                 } else {
                                     warn!(
@@ -954,6 +968,83 @@ impl SimpleBot {
 
             self.last_order_by_market
                 .insert(market_id.clone(), Instant::now());
+                
+            /* Check for completed pairs and update adaptive params */
+            self.check_completed_pairs(&market_id);
+        }
+    }
+    
+    /*
+     * Check for completed trade pairs and update adaptive parameters.
+     * A "completed pair" is when we've bought both Up and Down shares.
+     * 
+     * Uses pending_orders to track what prices we placed at.
+     * Limit orders fill at their price or better, so the placed price is 
+     * the maximum we paid (actual could be lower = more profit).
+     */
+    fn check_completed_pairs(&mut self, market_id: &str) {
+        let ledger = self.ledger.read();
+        let (up_shares, down_shares) = ledger.confirmed_position(market_id);
+        drop(ledger);
+        
+        /* Calculate average fill prices from our placed orders */
+        let mut up_fill_value = 0.0;
+        let mut down_fill_value = 0.0;
+        let mut up_fill_size = 0.0;
+        let mut down_fill_size = 0.0;
+        
+        for record in self.pending_orders.values() {
+            if record.market_id != market_id {
+                continue;
+            }
+            let price = record.order_price.unwrap_or(0.5);
+            let size = record.order_size.unwrap_or(0.0);
+            
+            match record.order_side.as_deref() {
+                Some("Up") => {
+                    up_fill_value += price * size;
+                    up_fill_size += size;
+                }
+                Some("Down") => {
+                    down_fill_value += price * size;
+                    down_fill_size += size;
+                }
+                _ => {}
+            }
+        }
+        
+        /* Check if we have a complete pair (at least 1 share of each side) */
+        let min_pair_size = up_shares.min(down_shares);
+        if min_pair_size >= dec!(1) && up_fill_size > 0.0 && down_fill_size > 0.0 {
+            /* Calculate profit: 1 share pair = $1 payout, cost = what we paid */
+            let avg_up_cost = up_fill_value / up_fill_size;
+            let avg_down_cost = down_fill_value / down_fill_size;
+            
+            let combined_cost = avg_up_cost + avg_down_cost;
+            let profit_per_share = 1.0 - combined_cost;
+            let profit_cents = profit_per_share * 100.0;
+            
+            /* Get current model state for learning */
+            let (conviction, momentum, calmness) = self.trend_windows
+                .get_mut(market_id)
+                .and_then(|w| w.rn_jd_summary())
+                .map(|s| (s.vol_metrics.conviction, s.vol_metrics.momentum, s.vol_metrics.calmness))
+                .unwrap_or((0.5, 0.0, 0.5));
+            
+            /* Record completed trade for adaptive learning */
+            let trade = CompletedTrade {
+                conviction_at_trade: conviction,
+                momentum_at_trade: momentum,
+                calmness_at_trade: calmness,
+                combined_cost,
+                profit_cents,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            
+            self.adaptive_params.record_trade(trade);
+            
+            /* Clear pending orders for this market to avoid double-counting */
+            self.pending_orders.retain(|_, r| r.market_id != market_id);
         }
     }
 
@@ -1076,9 +1167,11 @@ impl SimpleBot {
                 }
             };
 
-            info!(
-                "Placing order for {} shares @ {} for side {:?}",
-                poly_size, poly_price, order.side
+            debug!(
+                side = ?order.side,
+                price = %poly_price,
+                size = %poly_size,
+                "Placing order"
             );
 
             let signable = match self
@@ -1221,6 +1314,8 @@ fn market_symbol(info: &MarketInfo) -> String {
         .unwrap_or_else(|| info.asset.clone())
 }
 
+/* Format trend status for logging. Includes RN-JD model info when summary is provided. */
+#[allow(clippy::too_many_arguments)]
 fn format_trend_log(
     status: &str,
     up_bid: Decimal,
@@ -1232,9 +1327,10 @@ fn format_trend_log(
     sample_count: usize,
     max_range: Option<Decimal>,
     extra: TrendLogExtra,
+    summary: Option<crate::trend_window::RnJdSummary>,
 ) -> String {
     let max_range_str = max_range
-        .map(|v| format_decimal(v))
+        .map(format_decimal)
         .unwrap_or_else(|| "-".to_string());
     let effective_max_range_str = extra
         .effective_max_range
@@ -1244,8 +1340,9 @@ fn format_trend_log(
     let end_mid = extra.end_mid.unwrap_or_default();
     let up_cap = extra.up_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
     let down_cap = extra.down_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
-    format!(
-        "trend={} prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} max={} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] size_mult={} spacing_mult={} extra_offset={} caps[up={} down={}] levels={}",
+    
+    let base = format!(
+        "trend={} prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} max={} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}]",
         status,
         format_decimal(up_bid),
         format_decimal(up_ask),
@@ -1265,79 +1362,36 @@ fn format_trend_log(
         end_mid,
         span_ms,
         sample_count,
+    );
+    
+    /* Include RN-JD model details when available */
+    let rn_info = if let Some(s) = summary {
+        format!(
+            " rn[sigma={:.4} lambda={:.4} drift={:.4} up={:.4}/{:.4} down={:.4}/{:.4}]",
+            s.sigma_b,
+            s.jump_intensity,
+            s.drift,
+            s.rn_bid,
+            s.rn_ask,
+            1.0 - s.rn_ask,
+            1.0 - s.rn_bid,
+        )
+    } else {
+        String::new()
+    };
+    
+    let overrides = format!(
+        " CONVICTION={:.2} size_mult={} spacing_mult={} caps[up={} down={}] levels={} widen={}",
+        extra.conviction,
         format_decimal(extra.size_multiplier),
         format_decimal(extra.spacing_multiplier),
-        format_decimal(extra.extra_offset),
-        up_cap,
-        down_cap,
-        extra.max_levels.unwrap_or(0)
-    )
-}
-
-fn format_trend_ready_log(
-    up_bid: Decimal,
-    up_ask: Decimal,
-    down_bid: Decimal,
-    down_ask: Decimal,
-    ranges: crate::trend_window::TrendRanges,
-    span_ms: i64,
-    sample_count: usize,
-    summary: Option<crate::trend_window::RnJdSummary>,
-    rn_up_bid: f64,
-    rn_up_ask: f64,
-    naive_up_bid: f64,
-    naive_up_ask: f64,
-    extra: TrendLogExtra,
-) -> String {
-    let (rn_sigma, rn_lambda, rn_drift) = summary
-        .map(|s| (s.sigma_b, s.jump_intensity, s.drift))
-        .unwrap_or_default();
-    let effective_max_range_str = extra
-        .effective_max_range
-        .map(format_decimal)
-        .unwrap_or_else(|| "-".to_string());
-    let start_mid = extra.start_mid.unwrap_or_default();
-    let end_mid = extra.end_mid.unwrap_or_default();
-    let up_cap = extra.up_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
-    let down_cap = extra.down_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
-    format!(
-        "trend=ready prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}] rn[sigma={:.5} lambda={:.5} drift={:.5} up={:.5}/{:.5} down={:.5}/{:.5}] naive[up={:.5}/{:.5} down={:.5}/{:.5}] size_mult={} spacing_mult={} extra_offset={} caps[up={} down={}] levels={} widen={}",
-        format_decimal(up_bid),
-        format_decimal(up_ask),
-        format_decimal(down_bid),
-        format_decimal(down_ask),
-        format_decimal(ranges.up_bid),
-        format_decimal(ranges.up_ask),
-        format_decimal(ranges.down_bid),
-        format_decimal(ranges.down_ask),
-        effective_max_range_str,
-        format_decimal(extra.up_spread),
-        format_decimal(extra.down_spread),
-        extra.max_age_ms.unwrap_or(-1),
-        extra.swing_zone,
-        start_mid,
-        end_mid,
-        span_ms,
-        sample_count,
-        rn_sigma,
-        rn_lambda,
-        rn_drift,
-        rn_up_bid,
-        rn_up_ask,
-        1.0 - rn_up_ask,
-        1.0 - rn_up_bid,
-        naive_up_bid,
-        naive_up_ask,
-        1.0 - naive_up_ask,
-        1.0 - naive_up_bid,
-        format_decimal(extra.size_multiplier),
-        format_decimal(extra.spacing_multiplier),
-        format_decimal(extra.extra_offset),
         up_cap,
         down_cap,
         extra.max_levels.unwrap_or(0),
-        extra.high_vol_widen
-    )
+        extra.high_vol_widen,
+    );
+    
+    format!("{}{}{}", base, rn_info, overrides)
 }
 
 fn format_decimal(value: Decimal) -> String {
@@ -1360,6 +1414,7 @@ struct TrendLogExtra {
     up_price_cap: Option<Decimal>,
     down_price_cap: Option<Decimal>,
     max_levels: Option<usize>,
+    conviction: f64,
 }
 
 impl Default for TrendLogExtra {
@@ -1379,17 +1434,19 @@ impl Default for TrendLogExtra {
             up_price_cap: None,
             down_price_cap: None,
             max_levels: None,
+            conviction: 0.0,
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ladder_overrides(
     summary: Option<crate::trend_window::RnJdSummary>,
     up_bid: Decimal,
     up_ask: Decimal,
     down_bid: Decimal,
     down_ask: Decimal,
-    mid_start_end: Option<(f64, f64)>,
+    _mid_start_end: Option<(f64, f64)>,
     edge_threshold: Decimal,
     size_scale_min: Decimal,
     size_scale_max: Decimal,
@@ -1400,6 +1457,8 @@ fn build_ladder_overrides(
     drift_flicker_threshold: f64,
     high_vol_widen: bool,
     max_levels_default: usize,
+    max_pair_cost: Decimal,
+    min_conviction: f64,  /* Adaptive: learned from performance */
 ) -> LadderOverrides {
     let mut overrides = LadderOverrides::default();
     overrides.size_multiplier = Decimal::ONE;
@@ -1407,7 +1466,7 @@ fn build_ladder_overrides(
     overrides.extra_offset = Decimal::ZERO;
 
     let Some(summary) = summary else {
-        // No summary yet - use conservative defaults
+        /* No summary yet - use conservative defaults */
         if high_vol_widen {
             overrides.spacing_multiplier = widen_factor;
             if widen_factor > Decimal::ONE {
@@ -1417,16 +1476,17 @@ fn build_ladder_overrides(
         return overrides;
     };
 
-    // === VOLATILITY-ADAPTIVE SPREAD SIZING ===
-    // Key insight: tighter spreads in calm markets (more fills), wider when volatile
+    /* 
+     * Volatility-adaptive spread sizing:
+     * - Tighter spreads in calm markets (more fills)
+     * - Wider spreads when volatile (protection)
+     * - Calmness ~1.0 → multiplier ~0.8
+     * - Calmness ~0.0 → multiplier ~1.5
+     */
     let vol_metrics = summary.vol_metrics;
-    
-    // Base spread multiplier on calmness (0 = volatile, 1 = calm)
-    // When calm (calmness ~1.0): multiplier ~0.8 (tighter spreads)
-    // When volatile (calmness ~0.0): multiplier ~1.5 (wider spreads)
     let vol_spread_mult = 1.5 - (0.7 * vol_metrics.calmness);
     
-    // If high_vol_widen flag is set (from range checks), apply additional widening
+    /* If high_vol_widen flag is set (from range checks), apply additional widening */
     let base_mult = if high_vol_widen {
         vol_spread_mult * widen_factor.to_f64().unwrap_or(2.0)
     } else {
@@ -1447,37 +1507,46 @@ fn build_ladder_overrides(
     let edge_threshold_f = edge_threshold.to_f64().unwrap_or(0.0025);
     let tick_size_f = tick_size.to_f64().unwrap_or(0.01);
 
-    let dist_to_bid = (rn_mid - up_bid_f).max(0.0);
-    let dist_to_ask = (up_ask_f - rn_mid).max(0.0);
-
-    // Size scaling based on edge (where fair value is vs market)
-    if dist_to_ask <= edge_threshold_f {
-        overrides.size_multiplier = size_scale_max;
-    } else if dist_to_bid <= edge_threshold_f {
+    /*
+     * CONVICTION-BASED SIZING
+     * The conviction score (0-1) directly controls how much we trade:
+     * - High conviction (>0.7) → trade at full size
+     * - Medium conviction (0.4-0.7) → trade at reduced size  
+     * - Low conviction (<0.4) → minimal size or skip
+     * 
+     * This replaces the complex edge/flicker heuristics with one clear number.
+     */
+    let conviction = vol_metrics.conviction;
+    
+    /* Minimum conviction to trade at all (adaptive, starts at 0.25) */
+    let min_conviction_threshold = min_conviction;
+    
+    if conviction < min_conviction_threshold {
+        /* Very low conviction: set caps to None (skip trading) */
+        overrides.up_price_cap = None;
+        overrides.down_price_cap = None;
         overrides.size_multiplier = size_scale_min;
+        debug!(conviction = %format!("{:.2}", conviction), "Low conviction, skipping orders");
+        return overrides;
     }
-
-    // Reduce size when market is flickering with no clear direction
-    if let Some((start, end)) = mid_start_end {
-        let move_abs = (end - start).abs();
-        if move_abs < tick_size_f && summary.drift.abs() < drift_flicker_threshold {
-            overrides.size_multiplier = size_scale_min;
-        }
-    }
-
-    let mid_up = ((up_bid + up_ask) / dec!(2))
-        .to_f64()
-        .unwrap_or(0.5);
+    
+    /* Size scales with conviction: conviction 0.4 → 40% size, conviction 1.0 → 100% size */
+    let size_scale = conviction.clamp(0.3, 1.0);
+    let size_range = size_scale_max - size_scale_min;
+    overrides.size_multiplier = size_scale_min + size_range * Decimal::from_f64(size_scale).unwrap_or(Decimal::ONE);
+    
+    /* Additional boost for pinned markets (near 0 or 100) with clear drift */
+    let mid_up = ((up_bid + up_ask) / dec!(2)).to_f64().unwrap_or(0.5);
     let pinned_low_f = pinned_low.to_f64().unwrap_or(0.05);
     let pinned_high_f = pinned_high.to_f64().unwrap_or(0.95);
     if (mid_up <= pinned_low_f || mid_up >= pinned_high_f)
         && summary.drift.abs() >= drift_flicker_threshold
+        && conviction > 0.5
     {
         overrides.size_multiplier = size_scale_max;
     }
 
-    // === IMPROVED PRICE LEVEL CALCULATION ===
-    // Use fair value from RN-JD model, but validate against market
+    /* Price level calculation: use RN-JD fair value, validate against market */
     let rn_spread = (summary.rn_ask - summary.rn_bid).max(0.0);
     let raw_levels = (rn_spread / tick_size_f).ceil();
     let max_levels = if raw_levels.is_finite() && raw_levels > 0.0 {
@@ -1487,10 +1556,11 @@ fn build_ladder_overrides(
     };
     overrides.max_levels = Some(max_levels.clamp(1, max_levels_default));
 
-    // Target bid price: use RN fair value but don't be too aggressive
-    // The key fix: place orders AT or BELOW the current market bid,
-    // never crossing the spread unless we have strong edge
-    // Returns None if we shouldn't buy that side (no edge)
+    /* 
+     * Target bid price: use RN fair value but don't be too aggressive.
+     * Place orders AT or BELOW the current market bid.
+     * Returns None if we shouldn't buy that side (no edge).
+     */
     let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
     let down_ask_f = down_ask.to_f64().unwrap_or(1.0);
     
@@ -1513,33 +1583,87 @@ fn build_ladder_overrides(
         vol_metrics.calmness,
     );
     
-    // Log edge calculations for debugging
+    /* Log edge calculations for debugging */
     let up_edge = rn_mid - up_bid_f;
     let down_edge = target_down_mid - down_bid_f;
+    let momentum_dir = if vol_metrics.momentum > 0.3 {
+        "Up↑"
+    } else if vol_metrics.momentum < -0.3 {
+        "Down↑"
+    } else {
+        "stable"
+    };
     debug!(
+        conviction = %format!("{:.2}", vol_metrics.conviction),
+        momentum = %format!("{:.2} ({})", vol_metrics.momentum, momentum_dir),
+        calmness = %format!("{:.2}", vol_metrics.calmness),
         up_fair = %format!("{:.4}", rn_mid),
-        up_bid = %format!("{:.4}", up_bid_f),
         up_edge = %format!("{:.4}", up_edge),
         up_cap = ?target_up.map(|v| format!("{:.4}", v)),
         down_fair = %format!("{:.4}", target_down_mid),
-        down_bid = %format!("{:.4}", down_bid_f),
         down_edge = %format!("{:.4}", down_edge),
         down_cap = ?target_down.map(|v| format!("{:.4}", v)),
-        combined_fair = %format!("{:.4}", rn_mid + target_down_mid),
-        combined_bid = %format!("{:.4}", up_bid_f + down_bid_f),
-        "Edge calculation"
+        "Model output"
     );
     
-    // If conservative_bid_price returns None, we have no edge on that side
-    overrides.up_price_cap = target_up.and_then(Decimal::from_f64);
-    overrides.down_price_cap = target_down.and_then(Decimal::from_f64);
+    /* 
+     * COMBINED COST VALIDATION
+     * Even if each side looks profitable independently, the pair must sum to < max_pair_cost.
+     * If combined is too high, scale both caps down proportionally.
+     */
+    let max_pair_cost_f = max_pair_cost.to_f64().unwrap_or(0.98);
+    
+    match (target_up, target_down) {
+        (Some(up), Some(down)) => {
+            let combined = up + down;
+            if combined > max_pair_cost_f {
+                /* Combined too high - scale down proportionally */
+                let scale = max_pair_cost_f / combined;
+                let scaled_up = (up * scale).max(tick_size_f);
+                let scaled_down = (down * scale).max(tick_size_f);
+                
+                debug!(
+                    original_up = %format!("{:.4}", up),
+                    original_down = %format!("{:.4}", down),
+                    combined = %format!("{:.4}", combined),
+                    scaled_up = %format!("{:.4}", scaled_up),
+                    scaled_down = %format!("{:.4}", scaled_down),
+                    max = %format!("{:.4}", max_pair_cost_f),
+                    "Combined cost too high, scaling caps down"
+                );
+                
+                overrides.up_price_cap = Decimal::from_f64(scaled_up);
+                overrides.down_price_cap = Decimal::from_f64(scaled_down);
+            } else {
+                overrides.up_price_cap = Decimal::from_f64(up);
+                overrides.down_price_cap = Decimal::from_f64(down);
+            }
+        }
+        (Some(up), None) => {
+            overrides.up_price_cap = Decimal::from_f64(up);
+            overrides.down_price_cap = None;
+        }
+        (None, Some(down)) => {
+            overrides.up_price_cap = None;
+            overrides.down_price_cap = Decimal::from_f64(down);
+        }
+        (None, None) => {
+            overrides.up_price_cap = None;
+            overrides.down_price_cap = None;
+        }
+    }
+    
+    /* Pass momentum for asymmetric pricing (chase elusive side) */
+    overrides.momentum = vol_metrics.momentum;
 
     overrides
 }
 
-/// Calculate a conservative bid price that will actually get filled.
-/// Key principle: we want CONSISTENT fills, not aggressive pricing.
-/// Returns None if we shouldn't be buying at current prices (no edge).
+/*
+ * Calculate a conservative bid price that will actually get filled.
+ * Key principle: we want CONSISTENT fills, not aggressive pricing.
+ * Returns None if we shouldn't be buying at current prices (no edge).
+ */
 fn conservative_bid_price(
     fair_value: f64,
     market_bid: f64,
@@ -1548,33 +1672,31 @@ fn conservative_bid_price(
     tick: f64,
     calmness: f64,
 ) -> Option<f64> {
-    // CRITICAL: Only buy if fair value is ABOVE market bid
-    // This prevents buying overpriced sides
+    /* Only buy if fair value is ABOVE market bid - prevents buying overpriced sides */
     let edge_above_bid = fair_value - market_bid;
     
     if edge_above_bid < edge_threshold {
-        // Fair value is at or below market bid - NO EDGE, don't buy
-        return None;
+        return None; /* No edge */
     }
     
     let spread = market_ask - market_bid;
     
-    // How much can we improve on the market bid?
-    // When calm: can be more aggressive (up to 30% into spread)
-    // When volatile: stay at or below market bid
+    /* 
+     * Improvement into spread depends on calmness:
+     * - Calm: up to 30% into spread
+     * - Volatile: stay at or below market bid
+     */
     let max_improvement_pct = 0.3 * calmness;
     let max_improvement = spread * max_improvement_pct;
     
-    // If fair value suggests we have edge (fair > ask), be more aggressive
     let edge_above_ask = (fair_value - market_ask).max(0.0);
     
     let price = if edge_above_ask >= edge_threshold {
-        // Strong edge: can bid up to market_bid + max_improvement
+        /* Strong edge: bid up to market_bid + max_improvement, but never above fair_value - tick */
         let aggressive_bid = market_bid + max_improvement;
-        // But never above fair value minus a tick
         aggressive_bid.min(fair_value - tick).max(tick)
     } else {
-        // Moderate edge: bid at market_bid or slightly above
+        /* Moderate edge: bid at market_bid or slightly above */
         let slight_improvement = (max_improvement * 0.5).min(tick);
         (market_bid + slight_improvement).min(fair_value - tick).max(tick)
     };

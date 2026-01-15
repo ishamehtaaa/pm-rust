@@ -115,22 +115,28 @@ impl InventoryLedger {
         );
     }
 
-    pub fn set_initial_position(
+    /// Update the position for a market from API data.
+    /// Called both on initial discovery and periodic refreshes.
+    pub fn sync_position(
         &mut self,
         market_id: String,
         up_shares: Decimal,
         down_shares: Decimal,
     ) {
         let pos = self.positions.entry(market_id.clone()).or_default();
+        let changed = pos.up_shares != up_shares || pos.down_shares != down_shares;
         pos.up_shares = up_shares;
         pos.down_shares = down_shares;
 
-        info!(
-            market = %self.market_label(&market_id),
-            up_shares = %up_shares,
-            down_shares = %down_shares,
-            "Initial position set"
-        );
+        // Only log if position actually changed
+        if changed {
+            debug!(
+                market = %self.market_label(&market_id),
+                up_shares = %up_shares,
+                down_shares = %down_shares,
+                "Position synced"
+            );
+        }
     }
 
     /// Process an order update from WebSocket.
@@ -148,10 +154,10 @@ impl InventoryLedger {
 
         if !tracked.first_update_logged {
             let elapsed_ms = tracked.placed_at.elapsed().as_millis();
-            info!(
+            debug!(
                 order_id = %short_id(&order_id, 8),
-                elapsed_ms,
-                "Order update latency"
+                latency_ms = elapsed_ms,
+                "First order update received"
             );
             tracked.first_update_logged = true;
         }

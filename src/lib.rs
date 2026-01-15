@@ -8,3 +8,4 @@ pub mod ladder;
 pub mod constants;
 pub mod trend_window;
 pub mod rn_jd;
+pub mod training_log;

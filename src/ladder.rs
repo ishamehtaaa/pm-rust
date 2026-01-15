@@ -1,8 +1,11 @@
-// ladder.rs - FIXED VERSION
+/* ladder.rs - Order ladder generation and management */
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tracing::{debug, info, trace};
+
+/* Patience multiplier for momentum-aware pricing */
+const PATIENCE_MULT: Decimal = dec!(2.0);
 
 use crate::{
     constants::round_size,
@@ -38,7 +41,7 @@ impl Default for LadderConfig {
             max_position_per_side: dec!(50),
             max_pending_per_side: dec!(20),
             reladder_threshold: dec!(0.02),
-            stale_order_distance: dec!(0.05),
+            stale_order_distance: dec!(0.10),  /* Relaxed: keep orders longer in wide-spread markets */
             max_imbalance: dec!(5), // Don't let one side get more than 10 shares ahead
         }
     }
@@ -57,10 +60,10 @@ pub struct LadderPlan {
     pub cancellations: Vec<String>, // Order IDs to cancel
 }
 
-/// Tracks the last price we laddered at for each market
+/* Tracks the last price we laddered at for each market */
 #[derive(Debug, Default)]
 pub struct LadderState {
-    /// market_id -> (last_up_ask, last_down_ask)
+    /* market_id -> (last_up_ask, last_down_ask) */
     last_ladder_prices: HashMap<String, (Decimal, Decimal)>,
 }
 
@@ -129,8 +132,7 @@ impl LadderEngine {
         let target_per_side = target_per_side.unwrap_or(self.config.target_per_side);
         let overrides = overrides.unwrap_or_default();
 
-        // Calculate actual pending from open orders (not from position.pending_*)
-        // This is the source of truth since it's based on actual remote order state
+        /* Calculate pending from open orders (source of truth from remote state) */
         let pending_up: Decimal = open_orders
             .iter()
             .filter(|o| o.side == MarketSide::Up)
@@ -146,10 +148,9 @@ impl LadderEngine {
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
 
-        // CRITICAL FIX: Calculate imbalance here
         let imbalance = total_up - total_down;
 
-        // Cancel ALL orders on sides that are already at or over target
+        /* Cancel ALL orders on sides that are already at or over target */
         if position.up_shares >= target_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 info!(
@@ -174,7 +175,6 @@ impl LadderEngine {
             }
         }
 
-        // CRITICAL FIX: Pass the calculated imbalance, not config.max_imbalance
         let stale = self.find_stale_orders(
             up_ask,
             down_ask,
@@ -188,7 +188,7 @@ impl LadderEngine {
             }
         }
 
-        // Calculate room for new orders (only if position is below target)
+        /* Calculate room for new orders (only if position is below target) */
         let up_room = if position.up_shares >= target_per_side {
             Decimal::ZERO
         } else {
@@ -206,7 +206,7 @@ impl LadderEngine {
             return plan;
         }
 
-        // Generate paired ladders only when both sides have room
+        /* Generate paired ladders only when both sides have room */
         if up_room >= MIN_ORDER_SIZE && down_room >= MIN_ORDER_SIZE {
             let pair_orders =
                 self.generate_paired_ladder(up_ask, down_ask, up_room, down_room, overrides);
@@ -236,7 +236,7 @@ impl LadderEngine {
                 MarketSide::Down => down_ask,
             };
 
-            // Cancel if too far from market
+            /* Cancel if too far from market */
             let distance = current_ask - order.price;
             if distance > self.config.stale_order_distance {
                 debug!(
@@ -250,7 +250,7 @@ impl LadderEngine {
                 continue;
             }
 
-            // Cancel orders on the heavy side to rebalance
+            /* Cancel orders on the heavy side to rebalance */
             let should_cancel_for_balance = match order.side {
                 MarketSide::Up => imbalance > self.config.max_imbalance,
                 MarketSide::Down => imbalance < -self.config.max_imbalance,
@@ -281,8 +281,8 @@ impl LadderEngine {
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
 
-        // CRITICAL: If either price cap is None, we have NO EDGE on that side
-        // For paired orders, we need edge on BOTH sides to avoid losing money
+        /* If either price cap is None, we have no edge on that side.
+         * For paired orders, we need edge on BOTH sides. */
         let up_cap = match overrides.up_price_cap {
             Some(cap) => cap,
             None => {
@@ -306,11 +306,30 @@ impl LadderEngine {
         let size_per_level =
             (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
         let spacing = self.config.spacing * overrides.spacing_multiplier;
-        let top_offset = self.config.top_offset + overrides.extra_offset;
+        let base_offset = self.config.top_offset + overrides.extra_offset;
         
-        // Apply price caps - these are the MAXIMUM we're willing to pay
-        let top_up = (up_ask - top_offset).max(dec!(0.01)).min(up_cap);
-        let top_down = (down_ask - top_offset).max(dec!(0.01)).min(down_cap);
+        /*
+         * Momentum-aware asymmetric pricing:
+         * - When Up trending up (momentum > 0): bid tight on Up (elusive), wide on Down (cheap)
+         * - When Up trending down (momentum < 0): bid tight on Down (elusive), wide on Up (cheap)
+         * - The "elusive" side is chased aggressively, the "cheap" side we wait for
+         */
+        const MOMENTUM_THRESHOLD: f64 = 0.3;
+        
+        let (up_offset, down_offset) = if overrides.momentum > MOMENTUM_THRESHOLD {
+            /* Up is elusive (trending up), Down is cheap (will get cheaper) */
+            (base_offset, base_offset * PATIENCE_MULT)
+        } else if overrides.momentum < -MOMENTUM_THRESHOLD {
+            /* Down is elusive (trending up), Up is cheap */
+            (base_offset * PATIENCE_MULT, base_offset)
+        } else {
+            /* Stable market - bid normally on both */
+            (base_offset, base_offset)
+        };
+        
+        /* Apply price caps - the MAXIMUM we're willing to pay */
+        let top_up = (up_ask - up_offset).max(dec!(0.01)).min(up_cap);
+        let top_down = (down_ask - down_offset).max(dec!(0.01)).min(down_cap);
         
         let tick = self.config.tick_size.max(dec!(0.01));
         let levels = overrides.max_levels.unwrap_or(self.config.levels);
@@ -326,7 +345,7 @@ impl LadderEngine {
                 continue;
             }
 
-            // CRITICAL: Combined cost must be below threshold
+            /* Combined cost must be below threshold */
             if price_up + price_down > self.config.max_pair_cost {
                 debug!(
                     up = %price_up,
@@ -343,16 +362,38 @@ impl LadderEngine {
                 break;
             }
 
-            orders.push(LadderOrder {
-                side: MarketSide::Up,
-                price: price_up,
-                size,
-            });
-            orders.push(LadderOrder {
-                side: MarketSide::Down,
-                price: price_down,
-                size,
-            });
+            /* 
+             * MOMENTUM-AWARE ORDER PRIORITY
+             * Buy the "elusive" side first (the one getting more expensive).
+             * - momentum > 0: Up is rising → buy Up first
+             * - momentum < 0: Down is rising → buy Down first
+             * This ensures we catch the side that's moving away from us.
+             */
+            if overrides.momentum < -0.1 {
+                /* Down is trending up (getting expensive) → buy Down first */
+                orders.push(LadderOrder {
+                    side: MarketSide::Down,
+                    price: price_down,
+                    size,
+                });
+                orders.push(LadderOrder {
+                    side: MarketSide::Up,
+                    price: price_up,
+                    size,
+                });
+            } else {
+                /* Up is trending up or stable → buy Up first (default) */
+                orders.push(LadderOrder {
+                    side: MarketSide::Up,
+                    price: price_up,
+                    size,
+                });
+                orders.push(LadderOrder {
+                    side: MarketSide::Down,
+                    price: price_down,
+                    size,
+                });
+            }
             remaining_room -= size;
         }
         orders
@@ -369,7 +410,7 @@ impl LadderEngine {
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
         
-        // Check if we have edge on this side (price cap exists)
+        /* Check if we have edge on this side (price cap exists) */
         let price_cap = match side {
             MarketSide::Up => overrides.up_price_cap,
             MarketSide::Down => overrides.down_price_cap,
@@ -440,6 +481,8 @@ pub struct LadderOverrides {
     pub down_price_cap: Option<Decimal>,
     pub max_levels: Option<usize>,
     pub allow_imbalance_side: Option<MarketSide>,
+    /* Momentum: positive = Up trending up, negative = Up trending down */
+    pub momentum: f64,
 }
 
 impl Default for LadderOverrides {
@@ -450,6 +493,7 @@ impl Default for LadderOverrides {
             extra_offset: Decimal::ZERO,
             up_price_cap: None,
             down_price_cap: None,
+            momentum: 0.0,
             max_levels: None,
             allow_imbalance_side: None,
         }
@@ -464,7 +508,7 @@ fn floor_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     (ticks * tick).max(dec!(0.01))
 }
 
-/// Info about an open order, used for stale detection
+/* Info about an open order, used for stale detection */
 #[derive(Debug, Clone)]
 pub struct OpenOrderInfo {
     pub order_id: String,

@@ -152,22 +152,54 @@ impl TrendWindow {
             0.0
         };
 
-        // Momentum: -1 (strong down) to +1 (strong up)
-        let momentum = if weight_sum > 0.0 {
+        /* Momentum: -1 (strong down) to +1 (strong up) */
+        let slow_momentum = if weight_sum > 0.0 {
             (weighted_direction / weight_sum).clamp(-1.0, 1.0)
         } else {
             0.0
         };
+        
+        /* 
+         * FAST MOMENTUM: React to the last 3 samples specifically.
+         * This catches sudden moves before they show up in the slow average.
+         */
+        let fast_momentum: f64 = if n >= 3 {
+            let mut recent_dir: f64 = 0.0;
+            for i in (n - 2)..n {
+                let dx = samples[i].logit_mid - samples[i - 1].logit_mid;
+                recent_dir += if dx > 0.0 { 1.0 } else if dx < 0.0 { -1.0 } else { 0.0 };
+            }
+            (recent_dir / 2.0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        
+        /* Use the STRONGER signal of slow vs fast momentum.
+           If fast momentum spikes, we react immediately even if slow is still flat. */
+        let momentum = if fast_momentum.abs() > slow_momentum.abs() {
+            fast_momentum
+        } else {
+            slow_momentum
+        };
 
-        // Calmness: inverse of realized vol, normalized
-        // A realized_vol of ~0.5 is "normal", below is calm, above is volatile
+        /* Calmness: inverse of realized vol, normalized
+           A realized_vol of ~0.5 is "normal", below is calm, above is volatile */
         const BASELINE_VOL: f64 = 0.5;
         let calmness = (BASELINE_VOL / (realized_vol + 0.01)).clamp(0.0, 2.0) / 2.0;
+
+        /* Conviction score: 0-1 indicating trading confidence
+           - High when market is calm (low volatility)
+           - High when momentum is low (not trending strongly)
+           Formula: calmness * (1 - momentum^2) 
+           This means: calm + stable = confident, volatile + trending = stay out */
+        let trend_penalty = momentum.powi(2);  /* 0 = no trend, 1 = strong trend */
+        let conviction = (calmness * (1.0 - trend_penalty * 0.7)).clamp(0.0, 1.0);
 
         VolatilityMetrics {
             realized_vol,
             momentum,
             calmness,
+            conviction,
         }
     }
 
@@ -331,6 +363,9 @@ pub struct VolatilityMetrics {
     pub momentum: f64,
     /// How "calm" the market is (0 = volatile, 1 = very calm)
     pub calmness: f64,
+    /// Conviction: 0-1 score for trading confidence. Higher = trade more aggressively.
+    /// Combines calmness (want calm) and momentum (want low |momentum|).
+    pub conviction: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
