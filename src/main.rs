@@ -31,6 +31,9 @@ struct Args {
 
     #[arg(long, default_value = "15m")]
     duration: String,
+
+    #[arg(long, default_value_t = false)]
+    allow_extreme_skew: bool,
 }
 
 fn init_tracing(log_level: &str) {
@@ -80,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("Unsupported duration: {}", other),
     };
     config.target_duration = duration;
+    config.allow_extreme_skew = args.allow_extreme_skew;
     let mut target_assets = HashSet::new();
     for raw in args.assets {
         let key = raw.trim().to_lowercase();

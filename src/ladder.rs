@@ -6,6 +6,8 @@ use tracing::{debug, info, trace};
 
 /* Patience multiplier for momentum-aware pricing */
 const PATIENCE_MULT: Decimal = dec!(2.0);
+/* Chase multiplier for elusive side (place tighter to ask) */
+const CHASE_MULT: Decimal = dec!(0.5);
 
 use crate::{
     constants::round_size,
@@ -314,14 +316,14 @@ impl LadderEngine {
          * - When Up trending down (momentum < 0): bid tight on Down (elusive), wide on Up (cheap)
          * - The "elusive" side is chased aggressively, the "cheap" side we wait for
          */
-        const MOMENTUM_THRESHOLD: f64 = 0.3;
+        const MOMENTUM_THRESHOLD: f64 = 0.15;
         
         let (up_offset, down_offset) = if overrides.momentum > MOMENTUM_THRESHOLD {
             /* Up is elusive (trending up), Down is cheap (will get cheaper) */
-            (base_offset, base_offset * PATIENCE_MULT)
+            (base_offset * CHASE_MULT, base_offset * PATIENCE_MULT)
         } else if overrides.momentum < -MOMENTUM_THRESHOLD {
             /* Down is elusive (trending up), Up is cheap */
-            (base_offset * PATIENCE_MULT, base_offset)
+            (base_offset * PATIENCE_MULT, base_offset * CHASE_MULT)
         } else {
             /* Stable market - bid normally on both */
             (base_offset, base_offset)

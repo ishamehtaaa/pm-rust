@@ -31,6 +31,7 @@ const DEFAULT_DRIFT_FLICKER_THRESHOLD: f64 = 0.0005;
 const DEFAULT_PINNED_LOW: Decimal = dec!(0.05);
 const DEFAULT_PINNED_HIGH: Decimal = dec!(0.95);
 const DEFAULT_DURATION: MarketDuration = MarketDuration::FifteenMin;
+const DEFAULT_ALLOW_EXTREME_SKEW: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketDuration {
@@ -123,6 +124,7 @@ pub struct Config {
     pub pinned_low: Decimal,
     pub pinned_high: Decimal,
     pub target_duration: MarketDuration,
+    pub allow_extreme_skew: bool,
 }
 
 impl Config {
@@ -171,6 +173,7 @@ impl Config {
             pinned_low: DEFAULT_PINNED_LOW,
             pinned_high: DEFAULT_PINNED_HIGH,
             target_duration: DEFAULT_DURATION,
+            allow_extreme_skew: DEFAULT_ALLOW_EXTREME_SKEW,
             dry_run: false,
         })
     }

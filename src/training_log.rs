@@ -16,7 +16,10 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
+
+const DEFAULT_ADAPTIVE_PARAMS_PATH: &str = "adaptive_params.json";
+const DEFAULT_COMPLETED_TRADES_PATH: &str = "training_trades.jsonl";
 
 
 /* 
@@ -65,8 +68,11 @@ pub enum TradeAction {
 /* Logger that appends to a JSONL file */
 pub struct TrainingLogger {
     writer: Mutex<Option<BufWriter<File>>>,
+    completed_writer: Mutex<Option<BufWriter<File>>>,
     #[allow(dead_code)]
     path: String,
+    #[allow(dead_code)]
+    completed_path: String,
 }
 
 impl TrainingLogger {
@@ -78,10 +84,18 @@ impl TrainingLogger {
             .ok();
         
         let writer = file.map(BufWriter::new);
+        let completed_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(DEFAULT_COMPLETED_TRADES_PATH)
+            .ok();
+        let completed_writer = completed_file.map(BufWriter::new);
         
         Self {
             writer: Mutex::new(writer),
+            completed_writer: Mutex::new(completed_writer),
             path: path.to_string(),
+            completed_path: DEFAULT_COMPLETED_TRADES_PATH.to_string(),
         }
     }
     
@@ -89,6 +103,17 @@ impl TrainingLogger {
         if let Ok(mut guard) = self.writer.lock() {
             if let Some(ref mut writer) = *guard {
                 if let Ok(json) = serde_json::to_string(record) {
+                    let _ = writeln!(writer, "{}", json);
+                    let _ = writer.flush();
+                }
+            }
+        }
+    }
+
+    pub fn log_completed_trade(&self, trade: &CompletedTrade) {
+        if let Ok(mut guard) = self.completed_writer.lock() {
+            if let Some(ref mut writer) = *guard {
+                if let Ok(json) = serde_json::to_string(trade) {
                     let _ = writeln!(writer, "{}", json);
                     let _ = writer.flush();
                 }
@@ -153,7 +178,7 @@ impl Default for TrainingLogger {
  */
 
 /* A completed trade pair for learning */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedTrade {
     pub conviction_at_trade: f64,
     pub momentum_at_trade: f64,
@@ -161,9 +186,28 @@ pub struct CompletedTrade {
     pub combined_cost: f64,
     pub profit_cents: f64,
     pub timestamp_ms: i64,
+    #[serde(default)]
+    pub score_up: f64,
+    #[serde(default)]
+    pub score_down: f64,
+    #[serde(default)]
+    pub edge_up: f64,
+    #[serde(default)]
+    pub edge_down: f64,
+    #[serde(default)]
+    pub velocity: f64,
+    #[serde(default)]
+    pub drift: f64,
+    #[serde(default)]
+    pub vol_penalty: f64,
+    #[serde(default)]
+    pub imbalance_bias: f64,
+    #[serde(default)]
+    pub conviction_scale: f64,
 }
 
 /* Tracks recent trades and learns optimal parameters */
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveParams {
     /* Recent trade history (last N trades) */
     recent_trades: VecDeque<CompletedTrade>,
@@ -200,6 +244,36 @@ impl AdaptiveParams {
             total_trades: 0,
             profitable_trades: 0,
             total_profit_cents: 0.0,
+        }
+    }
+
+    pub fn default_path() -> &'static str {
+        DEFAULT_ADAPTIVE_PARAMS_PATH
+    }
+
+    pub fn load_or_default(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match serde_json::from_str::<AdaptiveParams>(&contents) {
+                Ok(params) => params,
+                Err(e) => {
+                    warn!(path, error = %e, "Failed to parse adaptive params; using defaults");
+                    Self::new()
+                }
+            },
+            Err(_) => Self::new(),
+        }
+    }
+
+    pub fn save(&self, path: &str) {
+        match serde_json::to_string(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    warn!(path, error = %e, "Failed to persist adaptive params");
+                }
+            }
+            Err(e) => {
+                warn!(path, error = %e, "Failed to serialize adaptive params");
+            }
         }
     }
     

@@ -187,13 +187,23 @@ impl TrendWindow {
         const BASELINE_VOL: f64 = 0.5;
         let calmness = (BASELINE_VOL / (realized_vol + 0.01)).clamp(0.0, 2.0) / 2.0;
 
+        /* Range stability: high when mid price stays within a tight band */
+        const STABLE_RANGE: f64 = 0.05;
+        let (min_mid, max_mid) = samples.iter().fold((1.0_f64, 0.0_f64), |(min_v, max_v), s| {
+            let mid = rn_jd::sigmoid(s.logit_mid);
+            (min_v.min(mid), max_v.max(mid))
+        });
+        let mid_range = (max_mid - min_mid).max(0.0);
+        let range_stability = (1.0 - (mid_range / STABLE_RANGE).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
         /* Conviction score: 0-1 indicating trading confidence
            - High when market is calm (low volatility)
            - High when momentum is low (not trending strongly)
-           Formula: calmness * (1 - momentum^2) 
-           This means: calm + stable = confident, volatile + trending = stay out */
+           - High when price range stays tight
+           Formula: calmness * (1 - momentum^2) * range_stability
+           This means: calm + stable range = confident, volatile + trending + wide range = stay out */
         let trend_penalty = momentum.powi(2);  /* 0 = no trend, 1 = strong trend */
-        let conviction = (calmness * (1.0 - trend_penalty * 0.7)).clamp(0.0, 1.0);
+        let conviction = (calmness * (1.0 - trend_penalty * 0.7) * range_stability).clamp(0.0, 1.0);
 
         VolatilityMetrics {
             realized_vol,

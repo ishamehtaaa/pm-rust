@@ -1,18 +1,21 @@
+use crate::config::ASSETS_BY_NAME;
 use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderOverrides, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketInfo, MarketState, TradingPair};
 use crate::poller::{InventoryLedger, MarketSide, spawn_order_feed};
 use crate::price_feed::{PriceCache, spawn_price_feed};
+use crate::training_log::{
+    AdaptiveParams, CompletedTrade, TradeAction, TradeRecord, TrainingLogger,
+};
 use crate::trend_window::TrendWindow;
-use crate::training_log::{TrainingLogger, TradeRecord, TradeAction, AdaptiveParams, CompletedTrade};
-use crate::config::ASSETS_BY_NAME;
 use chrono::Timelike;
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk::auth::Credentials;
+use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
+use alloy::primitives::U256;
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
@@ -23,11 +26,10 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{
     AssetType, OrderStatusType, Side as ClobSide, SignatureType, SignedOrder,
 };
-use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, B256, Decimal as PolyDecimal};
 use rust_decimal_macros::dec;
-use alloy::primitives::U256;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -41,6 +43,22 @@ const LOOP_DELAY: Duration = Duration::from_millis(200);
 const BALANCE_REFRESH_SECS: u64 = 30;
 
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
+/* Max fair-value haircut (in ticks) applied to the momentum-expensive side. */
+const MOMENTUM_FAIR_VALUE_HAIRCUT_TICKS: f64 = 3.0;
+/* Side score weights/tuning (all in this file). */
+const SCORE_EDGE_WEIGHT: f64 = 1.3;
+const SCORE_MOMENTUM_WEIGHT: f64 = 0.5;
+const SCORE_VELOCITY_WEIGHT: f64 = 0.6;
+const SCORE_VOL_WEIGHT: f64 = 0.7;
+const SCORE_IMBALANCE_WEIGHT: f64 = 0.2;
+const SCORE_DRIFT_WEIGHT: f64 = 0.3;
+const SCORE_EDGE_DENOM: f64 = 0.02;
+const SCORE_VELOCITY_DENOM: f64 = 0.01;
+const SCORE_DRIFT_DENOM: f64 = 0.01;
+const SCORE_VOL_DENOM: f64 = 0.8;
+const SCORE_MIN: f64 = 0.0;
+const EXTREME_SKEW_LOW: f64 = 0.05;
+const EXTREME_SKEW_HIGH: f64 = 0.95;
 
 #[derive(Debug, Clone)]
 struct PositionSnapshot {
@@ -78,11 +96,13 @@ pub struct SimpleBot {
     trend_log_state: HashMap<String, TrendLogState>,
     last_missing_price_log: HashMap<String, Instant>,
     last_dry_run_log: HashMap<String, Instant>,
-    
+    out_of_range_streak: HashMap<String, usize>,
+
     /* Training and adaptive learning */
     training_logger: TrainingLogger,
     adaptive_params: AdaptiveParams,
-    pending_orders: HashMap<String, TradeRecord>,  /* order_id -> record */
+    adaptive_params_path: String,
+    pending_orders: HashMap<String, TradeRecord>, /* order_id -> record */
 }
 
 impl SimpleBot {
@@ -133,6 +153,9 @@ impl SimpleBot {
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
         let active_market_ids = Arc::new(RwLock::new(Vec::new()));
 
+        let adaptive_params_path = AdaptiveParams::default_path().to_string();
+        let adaptive_params = AdaptiveParams::load_or_default(&adaptive_params_path);
+
         Ok(Self {
             config,
             client,
@@ -158,8 +181,10 @@ impl SimpleBot {
             trend_log_state: HashMap::new(),
             last_missing_price_log: HashMap::new(),
             last_dry_run_log: HashMap::new(),
+            out_of_range_streak: HashMap::new(),
             training_logger: TrainingLogger::default(),
-            adaptive_params: AdaptiveParams::default(),
+            adaptive_params,
+            adaptive_params_path,
             pending_orders: HashMap::new(),
         })
     }
@@ -176,7 +201,6 @@ impl SimpleBot {
         }
         info!("Entering main loop...");
 
-
         loop {
             if self.should_refresh_markets() {
                 self.discover_markets().await;
@@ -186,7 +210,6 @@ impl SimpleBot {
             self.scan().await;
             tokio::time::sleep(LOOP_DELAY).await;
         }
-
     }
 
     async fn refresh_positions(
@@ -206,8 +229,7 @@ impl SimpleBot {
             return;
         }
 
-        self.last_balance_refresh
-            .insert(market_id.to_string(), now);
+        self.last_balance_refresh.insert(market_id.to_string(), now);
 
         match self.fetch_token_balances(up_token_id, down_token_id).await {
             Ok((up_bal, down_bal)) => {
@@ -377,7 +399,10 @@ impl SimpleBot {
             if !cancel_ids.is_empty() {
                 match self.cancel_orders(&cancel_ids).await {
                     Ok(cancelled) => {
-                        info!(count = cancelled.len(), "Cancelled orders for rolled-over markets");
+                        info!(
+                            count = cancelled.len(),
+                            "Cancelled orders for rolled-over markets"
+                        );
                         self.ledger.write().mark_orders_cancelled(&cancelled);
                     }
                     Err(e) => {
@@ -493,13 +518,10 @@ impl SimpleBot {
 
     fn news_guard_active(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
         let window = chrono::Duration::seconds(self.config.news_guard_window_secs as i64);
-        self.config
-            .news_event_times
-            .iter()
-            .any(|event| {
-                let delta = *event - now;
-                delta.num_seconds().abs() <= window.num_seconds()
-            })
+        self.config.news_event_times.iter().any(|event| {
+            let delta = *event - now;
+            delta.num_seconds().abs() <= window.num_seconds()
+        })
     }
 
     async fn scan(&mut self) {
@@ -511,16 +533,13 @@ impl SimpleBot {
                 None => continue,
             };
             let market_symbol = market_symbol(&state.info);
-            let (up_token_id, down_token_id) =
-                (state.info.up_token_id.clone(), state.info.down_token_id.clone());
+            let (up_token_id, down_token_id) = (
+                state.info.up_token_id.clone(),
+                state.info.down_token_id.clone(),
+            );
 
-            self.refresh_positions(
-                &market_id,
-                &up_token_id,
-                &down_token_id,
-                &market_symbol,
-            )
-            .await;
+            self.refresh_positions(&market_id, &up_token_id, &down_token_id, &market_symbol)
+                .await;
 
             let price_snapshot = {
                 let cache = self.price_cache.read();
@@ -536,8 +555,16 @@ impl SimpleBot {
                 }
             };
 
-            let (up_ask, down_ask, effective_target, mut overrides, summary, up_bid, down_bid) =
-                match price_snapshot {
+            let (
+                up_ask,
+                down_ask,
+                effective_target,
+                mut overrides,
+                summary,
+                up_bid,
+                down_bid,
+                mid_start_end,
+            ) = match price_snapshot {
                 Some((up_bid, up_ask, down_bid, down_ask, up_age, down_age)) => {
                     let now_ms = Utc::now().timestamp_millis();
                     let mut status = TrendStatus::Ready;
@@ -547,11 +574,9 @@ impl SimpleBot {
                     extra.max_age_ms = Some(up_age.max(down_age) as i64);
                     let news_guard_active = self.news_guard_active(Utc::now());
 
+                    let mut mid_start_end = None;
                     let (ranges, span_ms, sample_count, effective_target, overrides) = {
-                        let window = self
-                            .trend_windows
-                            .entry(market_id.clone())
-                            .or_default();
+                        let window = self.trend_windows.entry(market_id.clone()).or_default();
                         window.record(
                             now_ms,
                             up_bid,
@@ -562,7 +587,7 @@ impl SimpleBot {
                         );
 
                         let ranges = window.ranges();
-                        let mid_start_end = window.mid_start_end();
+                        mid_start_end = window.mid_start_end();
                         if let Some((start, end)) = mid_start_end {
                             extra.start_mid = Some(start);
                             extra.end_mid = Some(end);
@@ -620,10 +645,13 @@ impl SimpleBot {
                                     let directional_move = (end - start).abs();
                                     let directional_move_dec =
                                         Decimal::from_f64(directional_move).unwrap_or_default();
-                                    if directional_move_dec > self.config.directional_move_threshold {
+                                    if directional_move_dec > self.config.directional_move_threshold
+                                    {
                                         status = TrendStatus::OutOfRange;
                                         reason = "jump";
-                                    } else if directional_move_dec <= self.config.high_vol_reversion_threshold {
+                                    } else if directional_move_dec
+                                        <= self.config.high_vol_reversion_threshold
+                                    {
                                         extra.high_vol_widen = true;
                                         reason = "high_vol";
                                     } else {
@@ -642,7 +670,8 @@ impl SimpleBot {
                             && mid_up <= self.config.swing_zone_high;
                         extra.swing_zone = swing_zone;
                         let effective_target = if swing_zone {
-                            self.config.shares_target_per_side * self.config.swing_zone_target_factor
+                            self.config.shares_target_per_side
+                                * self.config.swing_zone_target_factor
                         } else {
                             self.config.shares_target_per_side
                         };
@@ -665,8 +694,8 @@ impl SimpleBot {
                             self.config.drift_flicker_threshold,
                             extra.high_vol_widen,
                             self.ladder_engine.config().levels,
-                            self.config.target_total_cost,
-                            self.adaptive_params.min_conviction,  /* Learned threshold */
+                            self.adaptive_params.target_combined_cost_decimal(),
+                            self.adaptive_params.min_conviction, /* Learned threshold */
                         );
                         extra.size_multiplier = overrides.size_multiplier;
                         extra.spacing_multiplier = overrides.spacing_multiplier;
@@ -702,9 +731,30 @@ impl SimpleBot {
                         );
                     }
 
+                    if status == TrendStatus::OutOfRange {
+                        let streak = self
+                            .out_of_range_streak
+                            .entry(market_id.clone())
+                            .or_insert(0);
+                        *streak += 1;
+                    } else {
+                        self.out_of_range_streak.insert(market_id.clone(), 0);
+                    }
+
+                    let allow_model_cancel = matches!(status, TrendStatus::OutOfRange)
+                        && self
+                            .out_of_range_streak
+                            .get(&market_id)
+                            .copied()
+                            .unwrap_or(0)
+                            >= 2;
+
                     if status != TrendStatus::Ready {
                         let open_orders = self.ledger.read().open_orders_for_market(&market_id);
-                        if !open_orders.is_empty() && self.should_model_cancel(&market_id) {
+                        if !open_orders.is_empty()
+                            && allow_model_cancel
+                            && self.should_model_cancel(&market_id)
+                        {
                             /*
                              * SMART CANCELLATION: Only cancel orders on the side losing edge.
                              * - momentum > 0: Up getting expensive → cancel Up orders (keep Down)
@@ -728,9 +778,15 @@ impl SimpleBot {
                                 })
                                 .map(|o| o.order_id)
                                 .collect();
-                            
+
                             if !cancel_ids.is_empty() {
-                                let side_str = if momentum > 0.2 { "Up" } else if momentum < -0.2 { "Down" } else { "all" };
+                                let side_str = if momentum > 0.2 {
+                                    "Up"
+                                } else if momentum < -0.2 {
+                                    "Down"
+                                } else {
+                                    "all"
+                                };
                                 info!(
                                     market = %market_symbol,
                                     reason = %reason,
@@ -755,7 +811,16 @@ impl SimpleBot {
                         continue;
                     }
 
-                    (up_ask, down_ask, effective_target, overrides, summary, up_bid, down_bid)
+                    (
+                        up_ask,
+                        down_ask,
+                        effective_target,
+                        overrides,
+                        summary,
+                        up_bid,
+                        down_bid,
+                        mid_start_end,
+                    )
                 }
                 None => {
                     let should_log = self.should_log_missing_price(&market_id);
@@ -774,6 +839,19 @@ impl SimpleBot {
             );
 
             if !should_reladder && !self.cooldown_elapsed(&market_id) {
+                continue;
+            }
+
+            let mid_up = (up_bid + up_ask) / dec!(2);
+            let mid_up_f64 = mid_up.to_f64().unwrap_or(0.5);
+            if !self.config.allow_extreme_skew
+                && (mid_up_f64 <= EXTREME_SKEW_LOW || mid_up_f64 >= EXTREME_SKEW_HIGH)
+            {
+                info!(
+                    market = %market_symbol,
+                    mid = %format!("{:.4}", mid_up_f64),
+                    "Extreme skew; skipping bids (enable --allow-extreme-skew to override)"
+                );
                 continue;
             }
 
@@ -840,16 +918,14 @@ impl SimpleBot {
                 );
             }
 
-            let plan = self
-                .ladder_engine
-                .compute_ladder_with_target(
-                    up_ask,
-                    down_ask,
-                    &pos,
-                    &open_orders,
-                    Some(effective_target),
-                    Some(overrides),
-                );
+            let plan = self.ladder_engine.compute_ladder_with_target(
+                up_ask,
+                down_ask,
+                &pos,
+                &open_orders,
+                Some(effective_target),
+                Some(overrides),
+            );
 
             if plan.cancellations.is_empty() && plan.orders.is_empty() {
                 continue;
@@ -877,15 +953,79 @@ impl SimpleBot {
             }
 
             if !plan.orders.is_empty() {
+                let scores = compute_side_scores(
+                    summary,
+                    up_bid,
+                    down_bid,
+                    imbalance,
+                    self.ladder_engine.config().max_imbalance,
+                    mid_start_end,
+                    self.config.trend_window_secs,
+                );
+                let allow_up = scores.up >= SCORE_MIN;
+                let allow_down = scores.down >= SCORE_MIN;
+                let mut orders = plan.orders;
+                orders.retain(|order| match order.side {
+                    MarketSide::Up => allow_up,
+                    MarketSide::Down => allow_down,
+                });
+                if orders.is_empty() {
+                    continue;
+                }
+
+                for order in &orders {
+                    let (side_cap, rn_bid, rn_ask, momentum, conviction) = match summary {
+                        Some(s) => (
+                            match order.side {
+                                MarketSide::Up => overrides.up_price_cap,
+                                MarketSide::Down => overrides.down_price_cap,
+                            },
+                            s.rn_bid,
+                            s.rn_ask,
+                            s.vol_metrics.momentum,
+                            s.vol_metrics.conviction,
+                        ),
+                        None => (None, 0.0, 0.0, 0.0, 0.0),
+                    };
+                    let (side_bid, side_ask) = match order.side {
+                        MarketSide::Up => (up_bid, up_ask),
+                        MarketSide::Down => (down_bid, down_ask),
+                    };
+                    info!(
+                        market = %market_symbol,
+                        side = ?order.side,
+                        price = %order.price,
+                        size = %order.size,
+                        market_bid = %side_bid,
+                        market_ask = %side_ask,
+                        cap = ?side_cap.map(format_decimal),
+                        rn_bid = %format!("{:.4}", rn_bid),
+                        rn_ask = %format!("{:.4}", rn_ask),
+                        momentum = %format!("{:.2}", momentum),
+                        conviction = %format!("{:.2}", conviction),
+                        score_up = %format!("{:.2}", scores.up),
+                        score_down = %format!("{:.2}", scores.down),
+                        edge_up = %format!("{:.4}", scores.edge_up),
+                        edge_down = %format!("{:.4}", scores.edge_down),
+                        edge_up_score = %format!("{:.2}", scores.edge_up_score),
+                        edge_down_score = %format!("{:.2}", scores.edge_down_score),
+                        velocity = %format!("{:.4}", scores.velocity),
+                        drift = %format!("{:.4}", scores.drift),
+                        vol_penalty = %format!("{:.2}", scores.vol_penalty),
+                        imbalance_bias = %format!("{:.2}", scores.imbalance_bias),
+                        conviction_scale = %format!("{:.2}", scores.conviction_scale),
+                        "Buy decision"
+                    );
+                }
                 if self.config.dry_run {
                     let should_log = self.should_log_dry_run(&market_id);
                     if should_log {
                         info!(
                             market = %market_symbol,
-                            count = plan.orders.len(),
+                            count = orders.len(),
                             "Dry run: skipping order placement"
                         );
-                        for order in &plan.orders {
+                        for order in &orders {
                             info!(
                                 market = %market_symbol,
                                 side = ?order.side,
@@ -898,14 +1038,14 @@ impl SimpleBot {
                     continue;
                 }
                 let signed_orders = self
-                    .build_signed_orders(&plan.orders, &up_token_id, &down_token_id)
+                    .build_signed_orders(&orders, &up_token_id, &down_token_id)
                     .await;
 
                 if !signed_orders.is_empty() {
                     match self.client.post_orders(signed_orders).await {
                         Ok(responses) => {
                             let mut placed = 0;
-                            for (resp, order) in responses.iter().zip(plan.orders.iter()) {
+                            for (resp, order) in responses.iter().zip(orders.iter()) {
                                 if resp
                                     .error_msg
                                     .as_ref()
@@ -919,7 +1059,7 @@ impl SimpleBot {
                                         order.size,
                                         order.price,
                                     );
-                                    
+
                                     /* Log for training */
                                     let mut record = TrainingLogger::create_record(
                                         &market_id,
@@ -935,7 +1075,7 @@ impl SimpleBot {
                                     record.order_size = order.size.to_f64();
                                     self.training_logger.log(&record);
                                     self.pending_orders.insert(resp.order_id.clone(), record);
-                                    
+
                                     placed += 1;
                                 } else {
                                     warn!(
@@ -968,38 +1108,38 @@ impl SimpleBot {
 
             self.last_order_by_market
                 .insert(market_id.clone(), Instant::now());
-                
+
             /* Check for completed pairs and update adaptive params */
             self.check_completed_pairs(&market_id);
         }
     }
-    
+
     /*
      * Check for completed trade pairs and update adaptive parameters.
      * A "completed pair" is when we've bought both Up and Down shares.
-     * 
+     *
      * Uses pending_orders to track what prices we placed at.
-     * Limit orders fill at their price or better, so the placed price is 
+     * Limit orders fill at their price or better, so the placed price is
      * the maximum we paid (actual could be lower = more profit).
      */
     fn check_completed_pairs(&mut self, market_id: &str) {
         let ledger = self.ledger.read();
         let (up_shares, down_shares) = ledger.confirmed_position(market_id);
         drop(ledger);
-        
+
         /* Calculate average fill prices from our placed orders */
         let mut up_fill_value = 0.0;
         let mut down_fill_value = 0.0;
         let mut up_fill_size = 0.0;
         let mut down_fill_size = 0.0;
-        
+
         for record in self.pending_orders.values() {
             if record.market_id != market_id {
                 continue;
             }
             let price = record.order_price.unwrap_or(0.5);
             let size = record.order_size.unwrap_or(0.0);
-            
+
             match record.order_side.as_deref() {
                 Some("Up") => {
                     up_fill_value += price * size;
@@ -1012,25 +1152,47 @@ impl SimpleBot {
                 _ => {}
             }
         }
-        
+
         /* Check if we have a complete pair (at least 1 share of each side) */
         let min_pair_size = up_shares.min(down_shares);
         if min_pair_size >= dec!(1) && up_fill_size > 0.0 && down_fill_size > 0.0 {
             /* Calculate profit: 1 share pair = $1 payout, cost = what we paid */
             let avg_up_cost = up_fill_value / up_fill_size;
             let avg_down_cost = down_fill_value / down_fill_size;
-            
+
             let combined_cost = avg_up_cost + avg_down_cost;
             let profit_per_share = 1.0 - combined_cost;
             let profit_cents = profit_per_share * 100.0;
-            
+
             /* Get current model state for learning */
-            let (conviction, momentum, calmness) = self.trend_windows
+            let summary = self
+                .trend_windows
                 .get_mut(market_id)
-                .and_then(|w| w.rn_jd_summary())
-                .map(|s| (s.vol_metrics.conviction, s.vol_metrics.momentum, s.vol_metrics.calmness))
+                .and_then(|w| w.rn_jd_summary());
+            let (conviction, momentum, calmness) = summary
+                .map(|s| {
+                    (
+                        s.vol_metrics.conviction,
+                        s.vol_metrics.momentum,
+                        s.vol_metrics.calmness,
+                    )
+                })
                 .unwrap_or((0.5, 0.0, 0.5));
-            
+            let mid_start_end = self
+                .trend_windows
+                .get(market_id)
+                .and_then(|w| w.mid_start_end());
+            let imbalance = up_shares - down_shares;
+            let scores = compute_side_scores(
+                summary,
+                Decimal::from_f64(avg_up_cost).unwrap_or_default(),
+                Decimal::from_f64(avg_down_cost).unwrap_or_default(),
+                imbalance,
+                self.ladder_engine.config().max_imbalance,
+                mid_start_end,
+                self.config.trend_window_secs,
+            );
+
             /* Record completed trade for adaptive learning */
             let trade = CompletedTrade {
                 conviction_at_trade: conviction,
@@ -1039,10 +1201,21 @@ impl SimpleBot {
                 combined_cost,
                 profit_cents,
                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                score_up: scores.up,
+                score_down: scores.down,
+                edge_up: scores.edge_up,
+                edge_down: scores.edge_down,
+                velocity: scores.velocity,
+                drift: scores.drift,
+                vol_penalty: scores.vol_penalty,
+                imbalance_bias: scores.imbalance_bias,
+                conviction_scale: scores.conviction_scale,
             };
-            
+
+            self.training_logger.log_completed_trade(&trade);
             self.adaptive_params.record_trade(trade);
-            
+            self.adaptive_params.save(&self.adaptive_params_path);
+
             /* Clear pending orders for this market to avoid double-counting */
             self.pending_orders.retain(|_, r| r.market_id != market_id);
         }
@@ -1088,8 +1261,7 @@ impl SimpleBot {
         match self.last_dry_run_log.get(market_id) {
             Some(last) if now.duration_since(*last) < min_interval => false,
             _ => {
-                self.last_dry_run_log
-                    .insert(market_id.to_string(), now);
+                self.last_dry_run_log.insert(market_id.to_string(), now);
                 true
             }
         }
@@ -1123,8 +1295,7 @@ impl SimpleBot {
         match self.last_model_cancel.get(market_id) {
             Some(last) if now.duration_since(*last) < min_interval => false,
             _ => {
-                self.last_model_cancel
-                    .insert(market_id.to_string(), now);
+                self.last_model_cancel.insert(market_id.to_string(), now);
                 true
             }
         }
@@ -1252,13 +1423,11 @@ impl SimpleBot {
                             continue;
                         }
 
-                        self.last_order_status_check
-                            .insert(order_id.clone(), now);
+                        self.last_order_status_check.insert(order_id.clone(), now);
 
                         match self.client.order(order_id).await {
                             Ok(order) => {
-                                let is_live =
-                                    matches!(order.status, OrderStatusType::Live);
+                                let is_live = matches!(order.status, OrderStatusType::Live);
                                 self.ledger.write().apply_order_status(
                                     order_id,
                                     order.size_matched,
@@ -1286,9 +1455,7 @@ impl SimpleBot {
                     }
 
                     if !confirmed_closed.is_empty() {
-                        self.ledger
-                            .write()
-                            .mark_orders_cancelled(&confirmed_closed);
+                        self.ledger.write().mark_orders_cancelled(&confirmed_closed);
                     }
                 }
 
@@ -1297,10 +1464,9 @@ impl SimpleBot {
             Err(e) => {
                 error!(error = %e, "Batch cancel failed");
                 Err(e.into())
+            }
         }
     }
-}
-
 }
 
 fn market_symbol(info: &MarketInfo) -> String {
@@ -1338,9 +1504,15 @@ fn format_trend_log(
         .unwrap_or_else(|| "-".to_string());
     let start_mid = extra.start_mid.unwrap_or_default();
     let end_mid = extra.end_mid.unwrap_or_default();
-    let up_cap = extra.up_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
-    let down_cap = extra.down_price_cap.map(format_decimal).unwrap_or_else(|| "-".to_string());
-    
+    let up_cap = extra
+        .up_price_cap
+        .map(format_decimal)
+        .unwrap_or_else(|| "-".to_string());
+    let down_cap = extra
+        .down_price_cap
+        .map(format_decimal)
+        .unwrap_or_else(|| "-".to_string());
+
     let base = format!(
         "trend={} prices[up={}/{} down={}/{}] ranges[up={}/{} down={}/{} max={} eff_max={}] spreads[up={} down={}] age_ms={} swing_zone={} mid[start={:.5} end={:.5}] window[ms={} n={}]",
         status,
@@ -1363,7 +1535,7 @@ fn format_trend_log(
         span_ms,
         sample_count,
     );
-    
+
     /* Include RN-JD model details when available */
     let rn_info = if let Some(s) = summary {
         format!(
@@ -1379,7 +1551,7 @@ fn format_trend_log(
     } else {
         String::new()
     };
-    
+
     let overrides = format!(
         " CONVICTION={:.2} size_mult={} spacing_mult={} caps[up={} down={}] levels={} widen={}",
         extra.conviction,
@@ -1390,7 +1562,7 @@ fn format_trend_log(
         extra.max_levels.unwrap_or(0),
         extra.high_vol_widen,
     );
-    
+
     format!("{}{}{}", base, rn_info, overrides)
 }
 
@@ -1458,7 +1630,7 @@ fn build_ladder_overrides(
     high_vol_widen: bool,
     max_levels_default: usize,
     max_pair_cost: Decimal,
-    min_conviction: f64,  /* Adaptive: learned from performance */
+    min_conviction: f64, /* Adaptive: learned from performance */
 ) -> LadderOverrides {
     let mut overrides = LadderOverrides::default();
     overrides.size_multiplier = Decimal::ONE;
@@ -1476,7 +1648,7 @@ fn build_ladder_overrides(
         return overrides;
     };
 
-    /* 
+    /*
      * Volatility-adaptive spread sizing:
      * - Tighter spreads in calm markets (more fills)
      * - Wider spreads when volatile (protection)
@@ -1485,42 +1657,52 @@ fn build_ladder_overrides(
      */
     let vol_metrics = summary.vol_metrics;
     let vol_spread_mult = 1.5 - (0.7 * vol_metrics.calmness);
-    
+
     /* If high_vol_widen flag is set (from range checks), apply additional widening */
     let base_mult = if high_vol_widen {
         vol_spread_mult * widen_factor.to_f64().unwrap_or(2.0)
     } else {
         vol_spread_mult
     };
-    
-    overrides.spacing_multiplier = Decimal::from_f64(base_mult.clamp(0.8, 2.5))
-        .unwrap_or(Decimal::ONE);
-    
+
+    overrides.spacing_multiplier =
+        Decimal::from_f64(base_mult.clamp(0.8, 2.5)).unwrap_or(Decimal::ONE);
+
     if overrides.spacing_multiplier > Decimal::ONE {
         let extra = tick_size * (overrides.spacing_multiplier - Decimal::ONE);
         overrides.extra_offset = extra;
     }
 
     let rn_mid = (summary.rn_bid + summary.rn_ask) / 2.0;
+    let rn_bid = summary.rn_bid;
+    let rn_ask = summary.rn_ask;
     let up_bid_f = up_bid.to_f64().unwrap_or(0.0);
     let up_ask_f = up_ask.to_f64().unwrap_or(1.0);
     let edge_threshold_f = edge_threshold.to_f64().unwrap_or(0.0025);
     let tick_size_f = tick_size.to_f64().unwrap_or(0.01);
+    let momentum = vol_metrics.momentum.clamp(-1.0, 1.0);
+    let fair_value_haircut = tick_size_f * MOMENTUM_FAIR_VALUE_HAIRCUT_TICKS;
+    let up_fair_base = rn_bid;
+    let down_fair_base = 1.0 - rn_ask;
+    let up_fair = (up_fair_base - fair_value_haircut * momentum.max(0.0))
+        .clamp(tick_size_f, 1.0 - tick_size_f);
+    let down_fair = (down_fair_base - fair_value_haircut * (-momentum).max(0.0))
+        .clamp(tick_size_f, 1.0 - tick_size_f);
 
     /*
      * CONVICTION-BASED SIZING
      * The conviction score (0-1) directly controls how much we trade:
      * - High conviction (>0.7) → trade at full size
-     * - Medium conviction (0.4-0.7) → trade at reduced size  
+     * - Medium conviction (0.4-0.7) → trade at reduced size
      * - Low conviction (<0.4) → minimal size or skip
-     * 
+     *
      * This replaces the complex edge/flicker heuristics with one clear number.
      */
     let conviction = vol_metrics.conviction;
-    
+
     /* Minimum conviction to trade at all (adaptive, starts at 0.25) */
     let min_conviction_threshold = min_conviction;
-    
+
     if conviction < min_conviction_threshold {
         /* Very low conviction: set caps to None (skip trading) */
         overrides.up_price_cap = None;
@@ -1529,12 +1711,13 @@ fn build_ladder_overrides(
         debug!(conviction = %format!("{:.2}", conviction), "Low conviction, skipping orders");
         return overrides;
     }
-    
+
     /* Size scales with conviction: conviction 0.4 → 40% size, conviction 1.0 → 100% size */
     let size_scale = conviction.clamp(0.3, 1.0);
     let size_range = size_scale_max - size_scale_min;
-    overrides.size_multiplier = size_scale_min + size_range * Decimal::from_f64(size_scale).unwrap_or(Decimal::ONE);
-    
+    overrides.size_multiplier =
+        size_scale_min + size_range * Decimal::from_f64(size_scale).unwrap_or(Decimal::ONE);
+
     /* Additional boost for pinned markets (near 0 or 100) with clear drift */
     let mid_up = ((up_bid + up_ask) / dec!(2)).to_f64().unwrap_or(0.5);
     let pinned_low_f = pinned_low.to_f64().unwrap_or(0.05);
@@ -1556,36 +1739,35 @@ fn build_ladder_overrides(
     };
     overrides.max_levels = Some(max_levels.clamp(1, max_levels_default));
 
-    /* 
+    /*
      * Target bid price: use RN fair value but don't be too aggressive.
      * Place orders AT or BELOW the current market bid.
      * Returns None if we shouldn't buy that side (no edge).
      */
     let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
     let down_ask_f = down_ask.to_f64().unwrap_or(1.0);
-    
+
     let target_up = conservative_bid_price(
-        rn_mid,
+        up_fair,
         up_bid_f,
         up_ask_f,
         edge_threshold_f,
         tick_size_f,
         vol_metrics.calmness,
     );
-    
-    let target_down_mid = 1.0 - rn_mid;
+
     let target_down = conservative_bid_price(
-        target_down_mid,
+        down_fair,
         down_bid_f,
         down_ask_f,
         edge_threshold_f,
         tick_size_f,
         vol_metrics.calmness,
     );
-    
+
     /* Log edge calculations for debugging */
-    let up_edge = rn_mid - up_bid_f;
-    let down_edge = target_down_mid - down_bid_f;
+    let up_edge = up_fair - up_bid_f;
+    let down_edge = down_fair - down_bid_f;
     let momentum_dir = if vol_metrics.momentum > 0.3 {
         "Up↑"
     } else if vol_metrics.momentum < -0.3 {
@@ -1597,22 +1779,25 @@ fn build_ladder_overrides(
         conviction = %format!("{:.2}", vol_metrics.conviction),
         momentum = %format!("{:.2} ({})", vol_metrics.momentum, momentum_dir),
         calmness = %format!("{:.2}", vol_metrics.calmness),
-        up_fair = %format!("{:.4}", rn_mid),
+        up_fair_raw = %format!("{:.4}", rn_mid),
+        up_rn_bid = %format!("{:.4}", rn_bid),
+        up_rn_ask = %format!("{:.4}", rn_ask),
+        up_fair = %format!("{:.4}", up_fair),
         up_edge = %format!("{:.4}", up_edge),
         up_cap = ?target_up.map(|v| format!("{:.4}", v)),
-        down_fair = %format!("{:.4}", target_down_mid),
+        down_fair = %format!("{:.4}", down_fair),
         down_edge = %format!("{:.4}", down_edge),
         down_cap = ?target_down.map(|v| format!("{:.4}", v)),
         "Model output"
     );
-    
-    /* 
+
+    /*
      * COMBINED COST VALIDATION
      * Even if each side looks profitable independently, the pair must sum to < max_pair_cost.
      * If combined is too high, scale both caps down proportionally.
      */
     let max_pair_cost_f = max_pair_cost.to_f64().unwrap_or(0.98);
-    
+
     match (target_up, target_down) {
         (Some(up), Some(down)) => {
             let combined = up + down;
@@ -1621,7 +1806,7 @@ fn build_ladder_overrides(
                 let scale = max_pair_cost_f / combined;
                 let scaled_up = (up * scale).max(tick_size_f);
                 let scaled_down = (down * scale).max(tick_size_f);
-                
+
                 debug!(
                     original_up = %format!("{:.4}", up),
                     original_down = %format!("{:.4}", down),
@@ -1631,7 +1816,7 @@ fn build_ladder_overrides(
                     max = %format!("{:.4}", max_pair_cost_f),
                     "Combined cost too high, scaling caps down"
                 );
-                
+
                 overrides.up_price_cap = Decimal::from_f64(scaled_up);
                 overrides.down_price_cap = Decimal::from_f64(scaled_down);
             } else {
@@ -1652,7 +1837,7 @@ fn build_ladder_overrides(
             overrides.down_price_cap = None;
         }
     }
-    
+
     /* Pass momentum for asymmetric pricing (chase elusive side) */
     overrides.momentum = vol_metrics.momentum;
 
@@ -1674,23 +1859,23 @@ fn conservative_bid_price(
 ) -> Option<f64> {
     /* Only buy if fair value is ABOVE market bid - prevents buying overpriced sides */
     let edge_above_bid = fair_value - market_bid;
-    
+
     if edge_above_bid < edge_threshold {
         return None; /* No edge */
     }
-    
+
     let spread = market_ask - market_bid;
-    
-    /* 
+
+    /*
      * Improvement into spread depends on calmness:
      * - Calm: up to 30% into spread
      * - Volatile: stay at or below market bid
      */
     let max_improvement_pct = 0.3 * calmness;
     let max_improvement = spread * max_improvement_pct;
-    
+
     let edge_above_ask = (fair_value - market_ask).max(0.0);
-    
+
     let price = if edge_above_ask >= edge_threshold {
         /* Strong edge: bid up to market_bid + max_improvement, but never above fair_value - tick */
         let aggressive_bid = market_bid + max_improvement;
@@ -1698,9 +1883,11 @@ fn conservative_bid_price(
     } else {
         /* Moderate edge: bid at market_bid or slightly above */
         let slight_improvement = (max_improvement * 0.5).min(tick);
-        (market_bid + slight_improvement).min(fair_value - tick).max(tick)
+        (market_bid + slight_improvement)
+            .min(fair_value - tick)
+            .max(tick)
     };
-    
+
     Some(price)
 }
 
@@ -1733,6 +1920,104 @@ fn apply_imbalance_override(
         overrides.allow_imbalance_side = Some(MarketSide::Down);
     } else if imbalance < Decimal::ZERO && up_edge >= edge_threshold_f {
         overrides.allow_imbalance_side = Some(MarketSide::Up);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SideScoreBreakdown {
+    up: f64,
+    down: f64,
+    edge_up: f64,
+    edge_down: f64,
+    edge_up_score: f64,
+    edge_down_score: f64,
+    momentum: f64,
+    velocity: f64,
+    drift: f64,
+    vol_penalty: f64,
+    imbalance_bias: f64,
+    conviction_scale: f64,
+}
+
+fn compute_side_scores(
+    summary: Option<crate::trend_window::RnJdSummary>,
+    up_bid: Decimal,
+    down_bid: Decimal,
+    imbalance: Decimal,
+    max_imbalance: Decimal,
+    mid_start_end: Option<(f64, f64)>,
+    window_secs: u64,
+) -> SideScoreBreakdown {
+    let Some(summary) = summary else {
+        return SideScoreBreakdown::default();
+    };
+
+    let up_bid_f = up_bid.to_f64().unwrap_or(0.0);
+    let down_bid_f = down_bid.to_f64().unwrap_or(0.0);
+    let up_fair = summary.rn_bid;
+    let down_fair = 1.0 - summary.rn_ask;
+
+    let edge_up = (up_fair - up_bid_f).max(-1.0);
+    let edge_down = (down_fair - down_bid_f).max(-1.0);
+    let edge_up_score = (edge_up / SCORE_EDGE_DENOM).clamp(-2.0, 2.0);
+    let edge_down_score = (edge_down / SCORE_EDGE_DENOM).clamp(-2.0, 2.0);
+
+    let momentum = summary.vol_metrics.momentum.clamp(-1.0, 1.0);
+    let momentum_up = momentum;
+    let momentum_down = -momentum;
+
+    let velocity = match mid_start_end {
+        Some((start, end)) if window_secs > 0 => (end - start) / (window_secs as f64),
+        _ => 0.0,
+    };
+    let velocity_up = (velocity / SCORE_VELOCITY_DENOM).clamp(-2.0, 2.0);
+    let velocity_down = (-velocity / SCORE_VELOCITY_DENOM).clamp(-2.0, 2.0);
+
+    let drift = (summary.drift / SCORE_DRIFT_DENOM).clamp(-2.0, 2.0);
+    let drift_up = drift;
+    let drift_down = -drift;
+
+    let vol_penalty = (summary.vol_metrics.realized_vol / SCORE_VOL_DENOM).clamp(0.0, 2.0);
+    let imbalance_bias = if max_imbalance > Decimal::ZERO {
+        (imbalance / max_imbalance)
+            .to_f64()
+            .unwrap_or(0.0)
+            .clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let conviction_scale = 0.5 + 0.5 * summary.vol_metrics.conviction;
+
+    let up_score = (SCORE_EDGE_WEIGHT * edge_up_score
+        + SCORE_MOMENTUM_WEIGHT * momentum_up
+        + SCORE_VELOCITY_WEIGHT * velocity_up
+        + SCORE_DRIFT_WEIGHT * drift_up
+        - SCORE_VOL_WEIGHT * vol_penalty
+        - SCORE_IMBALANCE_WEIGHT * imbalance_bias)
+        * conviction_scale;
+
+    let down_score = (SCORE_EDGE_WEIGHT * edge_down_score
+        + SCORE_MOMENTUM_WEIGHT * momentum_down
+        + SCORE_VELOCITY_WEIGHT * velocity_down
+        + SCORE_DRIFT_WEIGHT * drift_down
+        - SCORE_VOL_WEIGHT * vol_penalty
+        + SCORE_IMBALANCE_WEIGHT * imbalance_bias)
+        * conviction_scale;
+
+    SideScoreBreakdown {
+        up: up_score,
+        down: down_score,
+        edge_up,
+        edge_down,
+        edge_up_score,
+        edge_down_score,
+        momentum,
+        velocity,
+        drift,
+        vol_penalty,
+        imbalance_bias,
+        conviction_scale,
     }
 }
 
