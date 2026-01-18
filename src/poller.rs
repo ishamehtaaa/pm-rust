@@ -35,6 +35,21 @@ struct TrackedOrder {
     is_open: bool,
     placed_at: Instant,
     first_update_logged: bool,
+    /// The paired order on the opposite side (for pair execution protection)
+    paired_order_id: Option<String>,
+    /// Actual fill price (may differ from placed price for limit orders)
+    actual_fill_price: Option<Decimal>,
+}
+
+/// Information about a fill that may require canceling the paired order
+#[derive(Debug, Clone)]
+pub struct PairFillEvent {
+    pub filled_order_id: String,
+    pub paired_order_id: String,
+    pub market_id: String,
+    pub filled_side: MarketSide,
+    pub filled_price: Decimal,
+    pub filled_size: Decimal,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +58,8 @@ pub struct InventoryLedger {
     tracked_orders: HashMap<String, TrackedOrder>,
     /// Maps market_id -> display label
     market_labels: HashMap<String, String>,
+    /// Pending pair fill events that need to be processed by the bot
+    pending_pair_fills: Vec<PairFillEvent>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -103,6 +120,8 @@ impl InventoryLedger {
                 is_open: true,
                 placed_at: Instant::now(),
                 first_update_logged: false,
+                paired_order_id: None,
+                actual_fill_price: None,
             },
         );
 
@@ -113,6 +132,50 @@ impl InventoryLedger {
             price = %price,
             "Order tracked"
         );
+    }
+
+    /// Link two orders as a pair (for pair execution protection)
+    pub fn link_paired_orders(&mut self, order_id_a: &str, order_id_b: &str) {
+        if let Some(order_a) = self.tracked_orders.get_mut(order_id_a) {
+            order_a.paired_order_id = Some(order_id_b.to_string());
+        }
+        if let Some(order_b) = self.tracked_orders.get_mut(order_id_b) {
+            order_b.paired_order_id = Some(order_id_a.to_string());
+        }
+    }
+
+    /// Get pending pair fill events and clear them
+    pub fn take_pending_pair_fills(&mut self) -> Vec<PairFillEvent> {
+        std::mem::take(&mut self.pending_pair_fills)
+    }
+
+    /// Get the filled price for an order (for P&L tracking)
+    pub fn get_fill_price(&self, order_id: &str) -> Option<Decimal> {
+        self.tracked_orders
+            .get(order_id)
+            .and_then(|o| o.actual_fill_price.or(Some(o.price)))
+    }
+
+    /// Get the total filled size for an order (0 if unknown/untracked).
+    pub fn filled_size(&self, order_id: &str) -> Decimal {
+        self.tracked_orders
+            .get(order_id)
+            .map(|o| o.filled_size)
+            .unwrap_or_default()
+    }
+
+    /// Get the order's limit price (if tracked).
+    pub fn order_price(&self, order_id: &str) -> Option<Decimal> {
+        self.tracked_orders.get(order_id).map(|o| o.price)
+    }
+
+    /// Check if paired order is still open
+    pub fn is_paired_order_open(&self, order_id: &str) -> Option<bool> {
+        self.tracked_orders
+            .get(order_id)
+            .and_then(|o| o.paired_order_id.as_ref())
+            .and_then(|paired_id| self.tracked_orders.get(paired_id))
+            .map(|paired| paired.is_open)
     }
 
     /// Update the position for a market from API data.
@@ -141,48 +204,108 @@ impl InventoryLedger {
 
     /// Process an order update from WebSocket.
     pub fn process_order_message(&mut self, msg: OrderMessage) {
-        let order_id = msg.id;
+        let order_id = msg.id.clone();
 
-        let Some(tracked) = self.tracked_orders.get_mut(&order_id) else {
-            debug!(
-                order_id = %short_id(&order_id, 8),
-                msg_type = ?msg.msg_type,
-                "Order update for untracked order"
-            );
-            return;
+        // First pass: gather info about the tracked order without holding a mutable borrow
+        let tracked_info = {
+            let Some(tracked) = self.tracked_orders.get(&order_id) else {
+                debug!(
+                    order_id = %short_id(&order_id, 8),
+                    msg_type = ?msg.msg_type,
+                    "Order update for untracked order"
+                );
+                return;
+            };
+            
+            (
+                tracked.first_update_logged,
+                tracked.placed_at,
+                tracked.price,
+                tracked.actual_fill_price,
+                tracked.filled_size,
+                tracked.market_id.clone(),
+                tracked.side,
+                tracked.paired_order_id.clone(),
+                tracked.is_open,
+            )
         };
+        
+        let (first_update_logged, placed_at, price, actual_fill_price, 
+             prev_filled_size, market_id, side, paired_order_id, was_open) = tracked_info;
 
-        if !tracked.first_update_logged {
-            let elapsed_ms = tracked.placed_at.elapsed().as_millis();
+        // Log first update
+        if !first_update_logged {
+            let elapsed_ms = placed_at.elapsed().as_millis();
             debug!(
                 order_id = %short_id(&order_id, 8),
                 latency_ms = elapsed_ms,
                 "First order update received"
             );
-            tracked.first_update_logged = true;
+            if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
+                tracked.first_update_logged = true;
+            }
         }
 
+        // For limit orders, fills happen at the order price or better.
+        // We track the placed price as the fill price (conservative estimate).
+        // Note: Polymarket limit orders always fill at exactly the limit price.
+        let fill_price = actual_fill_price.unwrap_or(price);
+        if actual_fill_price.is_none() && msg.size_matched.is_some() {
+            if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
+                tracked.actual_fill_price = Some(price);
+            }
+        }
+
+        let mut pair_fill_event: Option<PairFillEvent> = None;
+
         if let Some(size_matched) = msg.size_matched {
-            let fill_delta = size_matched - tracked.filled_size;
+            let fill_delta = size_matched - prev_filled_size;
             if fill_delta > Decimal::ZERO {
-                let pos = self.positions.entry(tracked.market_id.clone()).or_default();
-                match tracked.side {
+                let pos = self.positions.entry(market_id.clone()).or_default();
+                match side {
                     MarketSide::Up => pos.up_shares += fill_delta,
                     MarketSide::Down => pos.down_shares += fill_delta,
                 }
 
-                let market_id = tracked.market_id.clone();
                 info!(
                     order_id = %short_id(&order_id, 8),
-                    side = ?tracked.side,
+                    side = ?side,
                     fill_delta = %fill_delta,
                     total_filled = %size_matched,
+                    fill_price = %fill_price,
                     market = %market_id,
                     "Fill detected via WebSocket"
                 );
 
-                tracked.filled_size = size_matched;
+                // Check if paired order is still open
+                if let Some(ref paired_id) = paired_order_id {
+                    let paired_is_open = self.tracked_orders
+                        .get(paired_id)
+                        .map(|p| p.is_open)
+                        .unwrap_or(false);
+                    
+                    if paired_is_open {
+                        pair_fill_event = Some(PairFillEvent {
+                            filled_order_id: order_id.clone(),
+                            paired_order_id: paired_id.clone(),
+                            market_id: market_id.clone(),
+                            filled_side: side,
+                            filled_price: fill_price,
+                            filled_size: fill_delta,
+                        });
+                    }
+                }
+
+                // Update filled size
+                if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
+                    tracked.filled_size = size_matched;
+                }
             }
+        }
+
+        // Queue the pair fill event
+        if let Some(event) = pair_fill_event {
+            self.pending_pair_fills.push(event);
         }
 
         let is_cancelled = matches!(msg.msg_type, Some(OrderMessageType::Cancellation));
@@ -192,13 +315,15 @@ impl InventoryLedger {
         );
         let is_closed = is_cancelled || is_fully_matched;
 
-        if is_closed && tracked.is_open {
+        if is_closed && was_open {
             debug!(
                 order_id = %short_id(&order_id, 8),
                 msg_type = ?msg.msg_type,
                 "Order closed via WebSocket"
             );
-            tracked.is_open = false;
+            if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
+                tracked.is_open = false;
+            }
         }
     }
 

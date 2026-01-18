@@ -4,21 +4,21 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tracing::{debug, info, trace};
 
-/* Patience multiplier for momentum-aware pricing */
-const PATIENCE_MULT: Decimal = dec!(2.0);
-/* Chase multiplier for elusive side (place tighter to ask) */
-const CHASE_MULT: Decimal = dec!(0.5);
+/* Patience multiplier for momentum-aware pricing (reduced from 2.0 to avoid asymmetric exposure) */
+const PATIENCE_MULT: Decimal = dec!(1.3);
+/* Chase multiplier for elusive side - less aggressive to reduce asymmetric fill risk (was 0.5) */
+const CHASE_MULT: Decimal = dec!(0.8);
 
 use crate::{
     constants::round_size,
     poller::{MarketPosition, MarketSide},
 };
-const MIN_ORDER_SIZE: Decimal = dec!(5);
 
 pub struct LadderConfig {
     pub levels: usize,
     pub spacing: Decimal,
     pub size_per_level: Decimal,
+    pub min_order_size: Decimal,
     pub top_offset: Decimal,
     pub max_pair_cost: Decimal,
     pub tick_size: Decimal,
@@ -36,14 +36,17 @@ impl Default for LadderConfig {
             levels: 3,
             spacing: dec!(0.01),
             size_per_level: dec!(5),
+            // Polymarket enforces a minimum order size (typically 5 shares for these markets).
+            // Never generate orders smaller than this or the API will reject them.
+            min_order_size: dec!(5),
             top_offset: dec!(0.02),
-            max_pair_cost: dec!(0.97),
+            max_pair_cost: dec!(0.96),  /* Tighter cap to ensure profitability even with execution slippage */
             tick_size: dec!(0.01),
             target_per_side: dec!(10),
             max_position_per_side: dec!(50),
             max_pending_per_side: dec!(20),
             reladder_threshold: dec!(0.02),
-            stale_order_distance: dec!(0.10),  /* Relaxed: keep orders longer in wide-spread markets */
+            stale_order_distance: dec!(0.04),  /* Tighter: cancel orders faster when market moves away */
             max_imbalance: dec!(5), // Don't let one side get more than 10 shares ahead
         }
     }
@@ -133,6 +136,7 @@ impl LadderEngine {
         let mut plan = LadderPlan::default();
         let target_per_side = target_per_side.unwrap_or(self.config.target_per_side);
         let overrides = overrides.unwrap_or_default();
+        let min_order_size = self.config.min_order_size.max(dec!(0.01));
 
         /* Calculate pending from open orders (source of truth from remote state) */
         let pending_up: Decimal = open_orders
@@ -209,7 +213,7 @@ impl LadderEngine {
         }
 
         /* Generate paired ladders only when both sides have room */
-        if up_room >= MIN_ORDER_SIZE && down_room >= MIN_ORDER_SIZE {
+        if up_room >= min_order_size && down_room >= min_order_size {
             let pair_orders =
                 self.generate_paired_ladder(up_ask, down_ask, up_room, down_room, overrides);
             plan.orders.extend(pair_orders);
@@ -231,6 +235,14 @@ impl LadderEngine {
         allow_imbalance_side: Option<MarketSide>,
     ) -> Vec<String> {
         let mut to_cancel = Vec::new();
+        let imbalance_abs = imbalance.abs();
+        let underweight_side = if imbalance > Decimal::ZERO {
+            Some(MarketSide::Down) // Heavy Up → need Down
+        } else if imbalance < Decimal::ZERO {
+            Some(MarketSide::Up) // Heavy Down → need Up
+        } else {
+            None
+        };
 
         for order in open_orders {
             let current_ask = match order.side {
@@ -241,6 +253,22 @@ impl LadderEngine {
             /* Cancel if too far from market */
             let distance = current_ask - order.price;
             if distance > self.config.stale_order_distance {
+                // If we're materially imbalanced, keep (don't cancel) deeper orders on the
+                // underweight side so we can still get hedging fills when price reverts.
+                let protect_for_rebalance = underweight_side == Some(order.side)
+                    && imbalance_abs >= self.config.max_imbalance * dec!(0.5);
+                if protect_for_rebalance {
+                    debug!(
+                        order_id = %order.order_id,
+                        side = ?order.side,
+                        price = %order.price,
+                        current_ask = %current_ask,
+                        distance = %distance,
+                        imbalance = %imbalance,
+                        "Keeping underweight-side order despite distance (rebalance hedge)"
+                    );
+                    continue;
+                }
                 debug!(
                     order_id = %order.order_id,
                     price = %order.price,
@@ -282,21 +310,39 @@ impl LadderEngine {
         overrides: LadderOverrides,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
+        let base_offset = self.config.top_offset + overrides.extra_offset;
+        let min_order_size = self.config.min_order_size.max(dec!(0.01));
 
-        /* If either price cap is None, we have no edge on that side.
-         * For paired orders, we need edge on BOTH sides. */
+        /*
+         * Price cap logic with fallback for rebalancing:
+         * - If we have a model-derived cap, use it
+         * - If no cap but we need to rebalance (allow_imbalance_side), use market_bid as fallback
+         * - Otherwise skip that side
+         */
         let up_cap = match overrides.up_price_cap {
             Some(cap) => cap,
             None => {
-                trace!("No edge on Up side - skipping paired ladder");
-                return orders;
+                // No model edge - use fallback price (bid at market_ask - offset)
+                // This is conservative but ensures we have orders in the book
+                let fallback = (up_ask - base_offset).max(dec!(0.01));
+                debug!(
+                    up_ask = %up_ask,
+                    fallback = %fallback,
+                    "No Up edge from model, using fallback price"
+                );
+                fallback
             }
         };
         let down_cap = match overrides.down_price_cap {
             Some(cap) => cap,
             None => {
-                trace!("No edge on Down side - skipping paired ladder");
-                return orders;
+                let fallback = (down_ask - base_offset).max(dec!(0.01));
+                debug!(
+                    down_ask = %down_ask,
+                    fallback = %fallback,
+                    "No Down edge from model, using fallback price"
+                );
+                fallback
             }
         };
 
@@ -306,7 +352,7 @@ impl LadderEngine {
         }
 
         let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
+            (self.config.size_per_level * overrides.size_multiplier).max(min_order_size);
         let spacing = self.config.spacing * overrides.spacing_multiplier;
         let base_offset = self.config.top_offset + overrides.extra_offset;
         
@@ -328,6 +374,39 @@ impl LadderEngine {
             /* Stable market - bid normally on both */
             (base_offset, base_offset)
         };
+
+        /*
+         * INVENTORY-AWARE SKEW (equalization):
+         * Use current inventory imbalance to bias quoting:
+         * - Heavy Up (imbalance > 0): make Up bids more passive, Down bids more aggressive.
+         * - Heavy Down (imbalance < 0): make Down bids more passive, Up bids more aggressive.
+         *
+         * We derive imbalance from remaining room:
+         *   imbalance = total_up - total_down = down_room - up_room
+         */
+        let imbalance = down_room - up_room;
+        let max_imbalance = self.config.max_imbalance.abs();
+        let strength = if max_imbalance > Decimal::ZERO {
+            (imbalance.abs() / max_imbalance).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+
+        let chase_adjust = (Decimal::ONE - CHASE_MULT) * strength; // 0..0.2
+        let patience_adjust = (PATIENCE_MULT - Decimal::ONE) * strength; // 0..0.3
+
+        let (inv_up_mult, inv_down_mult) = if imbalance > Decimal::ZERO {
+            // Heavy Up → avoid filling Up, chase Down
+            (Decimal::ONE + patience_adjust, Decimal::ONE - chase_adjust)
+        } else if imbalance < Decimal::ZERO {
+            // Heavy Down → avoid filling Down, chase Up
+            (Decimal::ONE - chase_adjust, Decimal::ONE + patience_adjust)
+        } else {
+            (Decimal::ONE, Decimal::ONE)
+        };
+
+        let up_offset = up_offset * inv_up_mult;
+        let down_offset = down_offset * inv_down_mult;
         
         /* Apply price caps - the MAXIMUM we're willing to pay */
         let top_up = (up_ask - up_offset).max(dec!(0.01)).min(up_cap);
@@ -360,7 +439,7 @@ impl LadderEngine {
             }
 
             let size = round_size(size_per_level.min(remaining_room));
-            if size < MIN_ORDER_SIZE {
+            if size < min_order_size {
                 break;
             }
 
@@ -411,6 +490,8 @@ impl LadderEngine {
         overrides: LadderOverrides,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
+        let base_offset = self.config.top_offset + overrides.extra_offset;
+        let min_order_size = self.config.min_order_size.max(dec!(0.01));
         
         /* Check if we have edge on this side (price cap exists) */
         let price_cap = match side {
@@ -421,8 +502,14 @@ impl LadderEngine {
         let cap = match price_cap {
             Some(cap) => cap,
             None => {
-                trace!(side = ?side, "No edge on side - skipping single ladder");
-                return orders;
+                // No model edge - use fallback (ask - offset) for rebalancing
+                let ask = match side {
+                    MarketSide::Up => up_ask,
+                    MarketSide::Down => down_ask,
+                };
+                let fallback = (ask - base_offset).max(dec!(0.01));
+                debug!(side = ?side, ask = %ask, fallback = %fallback, "No edge, using fallback price");
+                fallback
             }
         };
         
@@ -436,7 +523,7 @@ impl LadderEngine {
         }
 
         let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
+            (self.config.size_per_level * overrides.size_multiplier).max(min_order_size);
         let spacing = self.config.spacing * overrides.spacing_multiplier;
         let top_offset = self.config.top_offset + overrides.extra_offset;
         let tick = self.config.tick_size.max(dec!(0.01));
@@ -462,7 +549,7 @@ impl LadderEngine {
             }
 
             let size = round_size(size_per_level.min(remaining_room));
-            if size < MIN_ORDER_SIZE {
+            if size < min_order_size {
                 break;
             }
 

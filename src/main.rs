@@ -20,7 +20,7 @@ struct Args {
     #[arg(
         long = "shares",
         short = 's',
-        default_value = "20",
+        default_value = "5",
         value_parser = clap::value_parser!(Decimal),
         aliases = ["shares-target-per-side"]
     )]

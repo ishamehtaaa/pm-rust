@@ -4,9 +4,10 @@ use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 
 pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
-const DEFAULT_SHARES_TARGET_PER_SIDE: Decimal = dec!(20);
+// Focus mode default: target exactly one minimum-size pair per market (5 shares/side).
+const DEFAULT_SHARES_TARGET_PER_SIDE: Decimal = dec!(5);
 const DEFAULT_ORDER_SIZE: Decimal = dec!(5);
-const DEFAULT_TARGET_TOTAL_COST: Decimal = dec!(0.98);
+const DEFAULT_TARGET_TOTAL_COST: Decimal = dec!(0.96);  /* Tighter to ensure profitability with execution slippage */
 const DEFAULT_MAKER_PRICE_OFFSET: Decimal = dec!(0.01);
 const DEFAULT_MAX_PRICE_AGE_MS: i64 = 2_500;
 const DEFAULT_COOLDOWN_SECS: u64 = 2;

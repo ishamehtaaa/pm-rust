@@ -2,7 +2,7 @@ use crate::config::ASSETS_BY_NAME;
 use crate::config::Config;
 use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderOverrides, LadderState};
 use crate::market_cache::MarketCache;
-use crate::models::{MarketInfo, MarketState, TradingPair};
+use crate::models::{MarketInfo, MarketState};
 use crate::poller::{InventoryLedger, MarketSide, spawn_order_feed};
 use crate::price_feed::{PriceCache, spawn_price_feed};
 use crate::training_log::{
@@ -12,6 +12,7 @@ use crate::trend_window::TrendWindow;
 use chrono::Timelike;
 use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
@@ -41,6 +42,8 @@ type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
 const LOOP_DELAY: Duration = Duration::from_millis(200);
 const BALANCE_REFRESH_SECS: u64 = 30;
+/* Maximum combined cost allowed after one leg fills - cancel remaining if exceeded */
+const PAIR_PROTECTION_MAX_COST: f64 = 0.995;
 
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 /* Max fair-value haircut (in ticks) applied to the momentum-expensive side. */
@@ -56,7 +59,8 @@ const SCORE_EDGE_DENOM: f64 = 0.02;
 const SCORE_VELOCITY_DENOM: f64 = 0.01;
 const SCORE_DRIFT_DENOM: f64 = 0.01;
 const SCORE_VOL_DENOM: f64 = 0.8;
-const SCORE_MIN: f64 = 0.0;
+/* Minimum score to allow trading on a side - raised from 0.0 to require meaningful edge */
+const SCORE_MIN: f64 = 0.5;
 const EXTREME_SKEW_LOW: f64 = 0.05;
 const EXTREME_SKEW_HIGH: f64 = 0.95;
 
@@ -75,7 +79,6 @@ pub struct SimpleBot {
     signer: PrivateKeySigner,
     market_cache: MarketCache,
     markets: HashMap<String, MarketState>,
-    trading_pairs: HashMap<String, Arc<RwLock<TradingPair>>>,
     last_market_refresh: Instant,
     last_order_by_market: HashMap<String, Instant>,
     last_order_status_check: HashMap<String, Instant>,
@@ -87,7 +90,6 @@ pub struct SimpleBot {
     price_cache: Arc<RwLock<PriceCache>>,
     _order_feed: Option<tokio::task::JoinHandle<()>>,
     _price_feed: Option<tokio::task::JoinHandle<()>>,
-    active_market_ids: Arc<RwLock<Vec<String>>>,
     ws_client: Arc<AuthenticatedWsClient>,
 
     ladder_engine: LadderEngine,
@@ -96,6 +98,8 @@ pub struct SimpleBot {
     trend_log_state: HashMap<String, TrendLogState>,
     last_missing_price_log: HashMap<String, Instant>,
     last_dry_run_log: HashMap<String, Instant>,
+    last_skip_log: HashMap<String, Instant>,
+    last_rest_crosscheck_log: HashMap<String, Instant>,
     out_of_range_streak: HashMap<String, usize>,
 
     /* Training and adaptive learning */
@@ -118,6 +122,7 @@ impl SimpleBot {
             target_per_side: config.shares_target_per_side,
             max_pair_cost: config.target_total_cost,
             top_offset: config.maker_price_offset,
+            min_order_size: dec!(5),
             ..Default::default()
         };
         let ladder_engine = LadderEngine::new(ladder_config);
@@ -151,7 +156,6 @@ impl SimpleBot {
         );
 
         let ledger = Arc::new(RwLock::new(InventoryLedger::default()));
-        let active_market_ids = Arc::new(RwLock::new(Vec::new()));
 
         let adaptive_params_path = AdaptiveParams::default_path().to_string();
         let adaptive_params = AdaptiveParams::load_or_default(&adaptive_params_path);
@@ -162,14 +166,12 @@ impl SimpleBot {
             signer,
             market_cache,
             markets: HashMap::new(),
-            trading_pairs: HashMap::new(),
             last_market_refresh: Instant::now(),
             last_order_by_market: HashMap::new(),
             last_order_status_check: HashMap::new(),
             last_model_cancel: HashMap::new(),
             last_balance_refresh: HashMap::new(),
             last_position_log: HashMap::new(),
-            active_market_ids,
             ledger,
             _order_feed: None,
             ws_client,
@@ -181,6 +183,8 @@ impl SimpleBot {
             trend_log_state: HashMap::new(),
             last_missing_price_log: HashMap::new(),
             last_dry_run_log: HashMap::new(),
+            last_skip_log: HashMap::new(),
+            last_rest_crosscheck_log: HashMap::new(),
             out_of_range_streak: HashMap::new(),
             training_logger: TrainingLogger::default(),
             adaptive_params,
@@ -339,15 +343,12 @@ impl SimpleBot {
         }
 
         self.markets.clear();
-        self.trading_pairs.clear();
 
         for (asset, info) in selected {
             let market_id = info.id.clone();
             let market_symbol = market_symbol(&info);
             let market_id_for_ledger = market_id.clone();
-            let pair = Arc::new(RwLock::new(info.to_trading_pair()));
             let state = MarketState {
-                pair: pair.clone(),
                 info: info.clone(),
                 start_time: info.start_time,
                 end_time: info.end_time,
@@ -361,7 +362,6 @@ impl SimpleBot {
             );
 
             self.markets.insert(market_id.clone(), state);
-            self.trading_pairs.insert(market_id, pair);
             self.ledger
                 .write()
                 .register_market(market_id_for_ledger, market_symbol);
@@ -379,6 +379,8 @@ impl SimpleBot {
                 self.trend_log_state.remove(market_id);
                 self.last_missing_price_log.remove(market_id);
                 self.last_dry_run_log.remove(market_id);
+                self.last_skip_log.remove(market_id);
+                self.last_rest_crosscheck_log.remove(market_id);
                 self.last_order_by_market.remove(market_id);
             }
         }
@@ -414,12 +416,6 @@ impl SimpleBot {
             for (market_id, _, _) in removed_markets {
                 ledger.unregister_market(&market_id);
             }
-        }
-
-        /* Update active market IDs after processing all markets */
-        {
-            let mut ids = self.active_market_ids.write();
-            *ids = self.markets.keys().cloned().collect();
         }
 
         let token_ids: Vec<String> = self
@@ -525,6 +521,9 @@ impl SimpleBot {
     }
 
     async fn scan(&mut self) {
+        // Check for pair fill events and cancel remaining legs if combined cost too high
+        self.check_pair_fills().await;
+
         let market_ids: Vec<String> = self.markets.keys().cloned().collect();
 
         for market_id in market_ids {
@@ -574,8 +573,20 @@ impl SimpleBot {
                     extra.max_age_ms = Some(up_age.max(down_age) as i64);
                     let news_guard_active = self.news_guard_active(Utc::now());
 
-                    let mut mid_start_end = None;
-                    let (ranges, span_ms, sample_count, effective_target, overrides) = {
+                    // Optional debug-only REST snapshot to compare against WS top-of-book.
+                    self.maybe_log_rest_vs_ws(
+                        &market_id,
+                        &market_symbol,
+                        &up_token_id,
+                        &down_token_id,
+                        up_bid,
+                        up_ask,
+                        down_bid,
+                        down_ask,
+                    )
+                    .await;
+
+                    let (ranges, span_ms, sample_count, effective_target, overrides, mid_start_end) = {
                         let window = self.trend_windows.entry(market_id.clone()).or_default();
                         window.record(
                             now_ms,
@@ -587,7 +598,7 @@ impl SimpleBot {
                         );
 
                         let ranges = window.ranges();
-                        mid_start_end = window.mid_start_end();
+                        let mid_start_end = window.mid_start_end();
                         if let Some((start, end)) = mid_start_end {
                             extra.start_mid = Some(start);
                             extra.end_mid = Some(end);
@@ -669,11 +680,17 @@ impl SimpleBot {
                         let swing_zone = mid_up >= self.config.swing_zone_low
                             && mid_up <= self.config.swing_zone_high;
                         extra.swing_zone = swing_zone;
+                        let base_target = self.config.shares_target_per_side;
                         let effective_target = if swing_zone {
-                            self.config.shares_target_per_side
-                                * self.config.swing_zone_target_factor
+                            let scaled = base_target * self.config.swing_zone_target_factor;
+                            // Don't scale below the exchange minimum when the user intends to trade.
+                            if base_target >= self.ladder_engine.config().min_order_size {
+                                scaled.max(self.ladder_engine.config().min_order_size)
+                            } else {
+                                scaled
+                            }
                         } else {
-                            self.config.shares_target_per_side
+                            base_target
                         };
 
                         let (span_ms, sample_count) = window.span_ms_and_count();
@@ -704,7 +721,7 @@ impl SimpleBot {
                         extra.down_price_cap = overrides.down_price_cap;
                         extra.max_levels = overrides.max_levels;
                         extra.conviction = summary.map(|s| s.vol_metrics.conviction).unwrap_or(0.0);
-                        (ranges, span_ms, sample_count, effective_target, overrides)
+                        (ranges, span_ms, sample_count, effective_target, overrides, mid_start_end)
                     };
 
                     if self.should_log_trend(&market_id, status) {
@@ -808,6 +825,20 @@ impl SimpleBot {
                                 }
                             }
                         }
+
+                        if self.should_log_skip(&market_id) {
+                            debug!(
+                                market = %market_symbol,
+                                status = ?status,
+                                reason = %reason,
+                                up_bid = %up_bid,
+                                up_ask = %up_ask,
+                                down_bid = %down_bid,
+                                down_ask = %down_ask,
+                                max_age_ms = ?extra.max_age_ms,
+                                "Skipping ladder: trend gate"
+                            );
+                        }
                         continue;
                     }
 
@@ -839,6 +870,14 @@ impl SimpleBot {
             );
 
             if !should_reladder && !self.cooldown_elapsed(&market_id) {
+                if self.should_log_skip(&market_id) {
+                    debug!(
+                        market = %market_symbol,
+                        up_ask = %up_ask,
+                        down_ask = %down_ask,
+                        "Skipping ladder: no reladder + cooldown"
+                    );
+                }
                 continue;
             }
 
@@ -877,6 +916,19 @@ impl SimpleBot {
             let total_up = pos.up_shares + pending_up;
             let total_down = pos.down_shares + pending_down;
             let imbalance = total_up - total_down;
+
+            // Mirror ladder "room" math for diagnostics (why no orders were generated).
+            let min_order_size = self.ladder_engine.config().min_order_size;
+            let up_room = if pos.up_shares >= effective_target {
+                Decimal::ZERO
+            } else {
+                (effective_target - total_up).max(Decimal::ZERO)
+            };
+            let down_room = if pos.down_shares >= effective_target {
+                Decimal::ZERO
+            } else {
+                (effective_target - total_down).max(Decimal::ZERO)
+            };
 
             apply_imbalance_override(
                 &mut overrides,
@@ -928,6 +980,25 @@ impl SimpleBot {
             );
 
             if plan.cancellations.is_empty() && plan.orders.is_empty() {
+                if self.should_log_skip(&market_id) {
+                    debug!(
+                        market = %market_symbol,
+                        up_bid = %up_bid,
+                        up_ask = %up_ask,
+                        down_bid = %down_bid,
+                        down_ask = %down_ask,
+                        combined_ask = %(up_ask + down_ask),
+                        up_room = %up_room,
+                        down_room = %down_room,
+                        min_order_size = %min_order_size,
+                        target = %effective_target,
+                        total_up = %total_up,
+                        total_down = %total_down,
+                        pending_up = %pending_up,
+                        pending_down = %pending_down,
+                        "No ladder updates (no cancels, no orders)"
+                    );
+                }
                 continue;
             }
 
@@ -952,6 +1023,20 @@ impl SimpleBot {
                 }
             }
 
+            if plan.orders.is_empty() {
+                if self.should_log_skip(&market_id) {
+                    debug!(
+                        market = %market_symbol,
+                        cancelled = plan.cancellations.len(),
+                        up_room = %up_room,
+                        down_room = %down_room,
+                        min_order_size = %min_order_size,
+                        target = %effective_target,
+                        "No new orders in ladder plan"
+                    );
+                }
+            }
+
             if !plan.orders.is_empty() {
                 let scores = compute_side_scores(
                     summary,
@@ -962,15 +1047,141 @@ impl SimpleBot {
                     mid_start_end,
                     self.config.trend_window_secs,
                 );
-                let allow_up = scores.up >= SCORE_MIN;
-                let allow_down = scores.down >= SCORE_MIN;
+                
+                /*
+                 * Score-based filtering with imbalance override:
+                 * - If we're imbalanced, ALWAYS allow the underweight side
+                 * - This ensures we always have limit orders in the book for both sides
+                 * - The limit order will fill when the market comes to us
+                 */
+                let max_imbalance = self.ladder_engine.config().max_imbalance;
+                let imbalance_favors_up = imbalance < -max_imbalance * dec!(0.5);  // Heavy on Down, need Up
+                let imbalance_favors_down = imbalance > max_imbalance * dec!(0.5); // Heavy on Up, need Down
+                
+                let allow_up = scores.up >= SCORE_MIN || imbalance_favors_up;
+                let allow_down = scores.down >= SCORE_MIN || imbalance_favors_down;
+                
+                if imbalance_favors_up && scores.up < SCORE_MIN {
+                    debug!(
+                        market = %market_symbol,
+                        score_up = %format!("{:.2}", scores.up),
+                        imbalance = %imbalance,
+                        "Allowing Up order despite low score - need to rebalance"
+                    );
+                }
+                if imbalance_favors_down && scores.down < SCORE_MIN {
+                    debug!(
+                        market = %market_symbol,
+                        score_down = %format!("{:.2}", scores.down),
+                        imbalance = %imbalance,
+                        "Allowing Down order despite low score - need to rebalance"
+                    );
+                }
+                
                 let mut orders = plan.orders;
-                orders.retain(|order| match order.side {
-                    MarketSide::Up => allow_up,
-                    MarketSide::Down => allow_down,
-                });
+
+                /*
+                 * HYBRID MODE (paired-preserving):
+                 * - If the ladder engine produced a paired plan (Up + Down), NEVER drop a leg.
+                 * - Use model score/conviction only to scale depth (number of pairs), not to
+                 *   filter out one side entirely.
+                 */
+                let has_up = orders.iter().any(|o| o.side == MarketSide::Up);
+                let has_down = orders.iter().any(|o| o.side == MarketSide::Down);
+                let is_paired_plan = has_up && has_down;
+
+                if is_paired_plan {
+                    let available_pairs = (orders.len() / 2).max(1);
+                    let conviction = summary.map(|s| s.vol_metrics.conviction).unwrap_or(0.0);
+                    let pair_score = scores.up.min(scores.down);
+                    let max_imbalance = self.ladder_engine.config().max_imbalance;
+                    let imbalance_abs = imbalance.abs();
+
+                    let keep_pairs = if pair_score >= SCORE_MIN {
+                        available_pairs
+                    } else if conviction >= 0.65 || pair_score >= SCORE_MIN * 0.5 {
+                        available_pairs.min(2)
+                    } else {
+                        1
+                    };
+                    let mut keep_pairs = keep_pairs.clamp(1, available_pairs);
+
+                    // If we're already materially imbalanced, keep only a minimal paired quote
+                    // and let inventory-skewed pricing + rebalancing do the work.
+                    if max_imbalance > Decimal::ZERO {
+                        if imbalance_abs >= max_imbalance {
+                            keep_pairs = 1;
+                        } else if imbalance_abs >= max_imbalance * dec!(0.5) {
+                            keep_pairs = keep_pairs.min(2);
+                        }
+                    }
+
+                    if keep_pairs < available_pairs {
+                        debug!(
+                            market = %market_symbol,
+                            keep_pairs,
+                            available_pairs,
+                            imbalance = %imbalance,
+                            max_imbalance = %max_imbalance,
+                            conviction = %format!("{:.2}", conviction),
+                            score_up = %format!("{:.2}", scores.up),
+                            score_down = %format!("{:.2}", scores.down),
+                            "Paired plan: limiting depth (keeping both legs)"
+                        );
+                        orders.truncate(keep_pairs * 2);
+                    }
+                } else {
+                    // Single-side plans can still be score-gated.
+                    orders.retain(|order| match order.side {
+                        MarketSide::Up => allow_up,
+                        MarketSide::Down => allow_down,
+                    });
+                }
                 if orders.is_empty() {
+                    if self.should_log_skip(&market_id) {
+                        debug!(
+                            market = %market_symbol,
+                            is_paired_plan,
+                            allow_up,
+                            allow_down,
+                            score_up = %format!("{:.2}", scores.up),
+                            score_down = %format!("{:.2}", scores.down),
+                            "All planned orders were filtered out"
+                        );
+                    }
                     continue;
+                }
+
+                if self.should_log_skip(&market_id) {
+                    let top_up = orders
+                        .iter()
+                        .filter(|o| o.side == MarketSide::Up)
+                        .map(|o| o.price)
+                        .max();
+                    let top_down = orders
+                        .iter()
+                        .filter(|o| o.side == MarketSide::Down)
+                        .map(|o| o.price)
+                        .max();
+                    let top_pair = top_up.zip(top_down).map(|(u, d)| u + d);
+
+                    debug!(
+                        market = %market_symbol,
+                        up_bid = %up_bid,
+                        up_ask = %up_ask,
+                        down_bid = %down_bid,
+                        down_ask = %down_ask,
+                        combined_ask = %(up_ask + down_ask),
+                        top_up = ?top_up,
+                        top_down = ?top_down,
+                        top_pair = ?top_pair,
+                        pair_cap = %self.ladder_engine.config().max_pair_cost,
+                        up_room = %up_room,
+                        down_room = %down_room,
+                        min_order_size = %min_order_size,
+                        target = %effective_target,
+                        "WS quote vs intended ladder (summary)"
+                    );
                 }
 
                 for order in &orders {
@@ -1045,6 +1256,8 @@ impl SimpleBot {
                     match self.client.post_orders(signed_orders).await {
                         Ok(responses) => {
                             let mut placed = 0;
+                            let mut placed_order_ids: Vec<(String, MarketSide)> = Vec::new();
+                            
                             for (resp, order) in responses.iter().zip(orders.iter()) {
                                 if resp
                                     .error_msg
@@ -1059,6 +1272,7 @@ impl SimpleBot {
                                         order.size,
                                         order.price,
                                     );
+                                    placed_order_ids.push((resp.order_id.clone(), order.side));
 
                                     /* Log for training */
                                     let mut record = TrainingLogger::create_record(
@@ -1087,12 +1301,37 @@ impl SimpleBot {
                                 }
                             }
 
+                            // Link paired orders for pair execution protection
+                            // Find Up and Down orders and link them together
+                            let up_orders: Vec<_> = placed_order_ids.iter()
+                                .filter(|(_, side)| *side == MarketSide::Up)
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            let down_orders: Vec<_> = placed_order_ids.iter()
+                                .filter(|(_, side)| *side == MarketSide::Down)
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            
+                            // Link matching pairs (by index)
+                            {
+                                let mut ledger = self.ledger.write();
+                                for (up_id, down_id) in up_orders.iter().zip(down_orders.iter()) {
+                                    ledger.link_paired_orders(up_id, down_id);
+                                    debug!(
+                                        up_order = %up_id,
+                                        down_order = %down_id,
+                                        "Linked paired orders for protection"
+                                    );
+                                }
+                            }
+
                             info!(
                                 market = %market_symbol,
                                 up_ask = %up_ask,
                                 down_ask = %down_ask,
                                 cancelled = plan.cancellations.len(),
                                 placed,
+                                pairs_linked = up_orders.len().min(down_orders.len()),
                                 "Ladder updated"
                             );
 
@@ -1118,44 +1357,67 @@ impl SimpleBot {
      * Check for completed trade pairs and update adaptive parameters.
      * A "completed pair" is when we've bought both Up and Down shares.
      *
-     * Uses pending_orders to track what prices we placed at.
-     * Limit orders fill at their price or better, so the placed price is
-     * the maximum we paid (actual could be lower = more profit).
+     * Now uses actual fill prices from the ledger (via WebSocket updates)
+     * instead of placed prices for accurate P&L calculation.
      */
     fn check_completed_pairs(&mut self, market_id: &str) {
         let ledger = self.ledger.read();
         let (up_shares, down_shares) = ledger.confirmed_position(market_id);
-        drop(ledger);
-
-        /* Calculate average fill prices from our placed orders */
+        
+        /*
+         * Calculate average fill prices from actual fills tracked in the ledger.
+         * NOTE: use filled_size, not the placed size from the training record.
+         */
         let mut up_fill_value = 0.0;
         let mut down_fill_value = 0.0;
         let mut up_fill_size = 0.0;
         let mut down_fill_size = 0.0;
 
-        for record in self.pending_orders.values() {
-            if record.market_id != market_id {
+        /* Placement-time features (for training) */
+        let mut placement_conviction_sum = 0.0;
+        let mut placement_momentum_sum = 0.0;
+        let mut placement_calmness_sum = 0.0;
+        let mut placement_n = 0.0;
+
+        for (order_id, record) in self
+            .pending_orders
+            .iter()
+            .filter(|(_, r)| r.market_id == market_id)
+        {
+            placement_conviction_sum += record.conviction;
+            placement_momentum_sum += record.momentum;
+            placement_calmness_sum += record.calmness;
+            placement_n += 1.0;
+
+            let filled = ledger.filled_size(order_id).to_f64().unwrap_or(0.0);
+            if filled <= 0.0 {
                 continue;
             }
-            let price = record.order_price.unwrap_or(0.5);
-            let size = record.order_size.unwrap_or(0.0);
+
+            let limit_price = ledger
+                .order_price(order_id)
+                .and_then(|d| d.to_f64())
+                .or(record.order_price);
+            let limit_price = limit_price.unwrap_or(0.5);
 
             match record.order_side.as_deref() {
                 Some("Up") => {
-                    up_fill_value += price * size;
-                    up_fill_size += size;
+                    up_fill_value += limit_price * filled;
+                    up_fill_size += filled;
                 }
                 Some("Down") => {
-                    down_fill_value += price * size;
-                    down_fill_size += size;
+                    down_fill_value += limit_price * filled;
+                    down_fill_size += filled;
                 }
                 _ => {}
             }
         }
+        drop(ledger);
 
-        /* Check if we have a complete pair (at least 1 share of each side) */
+        /* Check if we have a complete pair (at least min_order_size of each side) */
         let min_pair_size = up_shares.min(down_shares);
-        if min_pair_size >= dec!(1) && up_fill_size > 0.0 && down_fill_size > 0.0 {
+        let min_pair_threshold = self.ladder_engine.config().min_order_size;
+        if min_pair_size >= min_pair_threshold && up_fill_size > 0.0 && down_fill_size > 0.0 {
             /* Calculate profit: 1 share pair = $1 payout, cost = what we paid */
             let avg_up_cost = up_fill_value / up_fill_size;
             let avg_down_cost = down_fill_value / down_fill_size;
@@ -1164,20 +1426,28 @@ impl SimpleBot {
             let profit_per_share = 1.0 - combined_cost;
             let profit_cents = profit_per_share * 100.0;
 
-            /* Get current model state for learning */
+            /* Use placement-time features when available; fall back to current model state. */
             let summary = self
                 .trend_windows
                 .get_mut(market_id)
                 .and_then(|w| w.rn_jd_summary());
-            let (conviction, momentum, calmness) = summary
-                .map(|s| {
-                    (
-                        s.vol_metrics.conviction,
-                        s.vol_metrics.momentum,
-                        s.vol_metrics.calmness,
-                    )
-                })
-                .unwrap_or((0.5, 0.0, 0.5));
+            let (conviction, momentum, calmness) = if placement_n > 0.0 {
+                (
+                    placement_conviction_sum / placement_n,
+                    placement_momentum_sum / placement_n,
+                    placement_calmness_sum / placement_n,
+                )
+            } else {
+                summary
+                    .map(|s| {
+                        (
+                            s.vol_metrics.conviction,
+                            s.vol_metrics.momentum,
+                            s.vol_metrics.calmness,
+                        )
+                    })
+                    .unwrap_or((0.5, 0.0, 0.5))
+            };
             let mid_start_end = self
                 .trend_windows
                 .get(market_id)
@@ -1267,6 +1537,128 @@ impl SimpleBot {
         }
     }
 
+    fn should_log_skip(&mut self, market_id: &str) -> bool {
+        let now = Instant::now();
+        let min_interval = Duration::from_secs(3);
+        match self.last_skip_log.get(market_id) {
+            Some(last) if now.duration_since(*last) < min_interval => false,
+            _ => {
+                self.last_skip_log.insert(market_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    fn should_log_rest_crosscheck(&mut self, market_id: &str) -> bool {
+        let now = Instant::now();
+        let min_interval = Duration::from_secs(10);
+        match self.last_rest_crosscheck_log.get(market_id) {
+            Some(last) if now.duration_since(*last) < min_interval => false,
+            _ => {
+                self.last_rest_crosscheck_log
+                    .insert(market_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    async fn maybe_log_rest_vs_ws(
+        &mut self,
+        market_id: &str,
+        market_symbol: &str,
+        up_token_id: &str,
+        down_token_id: &str,
+        ws_up_bid: Decimal,
+        ws_up_ask: Decimal,
+        ws_down_bid: Decimal,
+        ws_down_ask: Decimal,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        if !self.should_log_rest_crosscheck(market_id) {
+            return;
+        }
+
+        let up_token = match U256::from_str(up_token_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    market = %market_symbol,
+                    token_id = %up_token_id,
+                    error = %e,
+                    "REST crosscheck: invalid Up token id"
+                );
+                return;
+            }
+        };
+        let down_token = match U256::from_str(down_token_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    market = %market_symbol,
+                    token_id = %down_token_id,
+                    error = %e,
+                    "REST crosscheck: invalid Down token id"
+                );
+                return;
+            }
+        };
+
+        let up_req = OrderBookSummaryRequest::builder().token_id(up_token).build();
+        let down_req = OrderBookSummaryRequest::builder().token_id(down_token).build();
+        let requests = vec![up_req, down_req];
+
+        let books = match self.client.order_books(&requests).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(market = %market_symbol, error = %e, "REST crosscheck: order_books failed");
+                return;
+            }
+        };
+
+        let mut rest_up = None;
+        let mut rest_down = None;
+        for book in books {
+            if book.asset_id == up_token {
+                rest_up = Some(book);
+            } else if book.asset_id == down_token {
+                rest_down = Some(book);
+            }
+        }
+
+        let Some(rest_up) = rest_up else {
+            warn!(market = %market_symbol, "REST crosscheck: missing Up book in response");
+            return;
+        };
+        let Some(rest_down) = rest_down else {
+            warn!(market = %market_symbol, "REST crosscheck: missing Down book in response");
+            return;
+        };
+
+        let rest_up_bid = rest_up.bids.iter().map(|l| l.price).max();
+        let rest_up_ask = rest_up.asks.iter().map(|l| l.price).min();
+        let rest_down_bid = rest_down.bids.iter().map(|l| l.price).max();
+        let rest_down_ask = rest_down.asks.iter().map(|l| l.price).min();
+
+        debug!(
+            market = %market_symbol,
+            ws_up_bid = %ws_up_bid,
+            ws_up_ask = %ws_up_ask,
+            ws_down_bid = %ws_down_bid,
+            ws_down_ask = %ws_down_ask,
+            rest_up_bid = ?rest_up_bid,
+            rest_up_ask = ?rest_up_ask,
+            rest_down_bid = ?rest_down_bid,
+            rest_down_ask = ?rest_down_ask,
+            rest_up_ts = %rest_up.timestamp,
+            rest_down_ts = %rest_down.timestamp,
+            rest_min_size = %rest_up.min_order_size,
+            rest_tick = ?rest_up.tick_size,
+            "REST vs WS top-of-book crosscheck"
+        );
+    }
+
     fn should_log_position(&mut self, market_id: &str, snapshot: PositionSnapshot) -> bool {
         let min_interval = Duration::from_secs(5);
         let Some(prev) = self.last_position_log.get(market_id) else {
@@ -1297,6 +1689,125 @@ impl SimpleBot {
             _ => {
                 self.last_model_cancel.insert(market_id.to_string(), now);
                 true
+            }
+        }
+    }
+
+    /// Check for pair fill events and (optionally) protect against bad pair completion.
+    ///
+    /// Important: for this bot's maker-pair strategy, we generally want the remaining
+    /// resting order to stay on the book even if the current ask has moved away.
+    /// Otherwise we end up with unhedged single-leg exposure.
+    async fn check_pair_fills(&mut self) {
+        let pair_fills = self.ledger.write().take_pending_pair_fills();
+        
+        if pair_fills.is_empty() {
+            return;
+        }
+
+        for event in pair_fills {
+            // Get current market ask for the remaining side (for diagnostics only)
+            let (remaining_ask, market_symbol, remaining_token_id) = {
+                let state = match self.markets.get(&event.market_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let symbol = market_symbol(&state.info);
+                
+                let cache = self.price_cache.read();
+                let now_ms = Utc::now().timestamp_millis() as u64;
+                
+                // The remaining side is opposite of the filled side
+                let remaining_token = match event.filled_side {
+                    MarketSide::Up => &state.info.down_token_id,
+                    MarketSide::Down => &state.info.up_token_id,
+                };
+                
+                match cache.get_with_age(remaining_token, now_ms) {
+                    Some((_bid, ask, _age)) => (ask, symbol, remaining_token.clone()),
+                    None => continue, // No price data, can't evaluate
+                }
+            };
+
+            let remaining_side = match event.filled_side {
+                MarketSide::Up => MarketSide::Down,
+                MarketSide::Down => MarketSide::Up,
+            };
+
+            // Our *resting* paired order price is what matters for arb (not the current ask).
+            let paired_limit_price = {
+                let ledger = self.ledger.read();
+                ledger.get_fill_price(&event.paired_order_id)
+            };
+
+            let filled_price_f = event.filled_price.to_f64().unwrap_or(0.5);
+            let remaining_ask_f = remaining_ask.to_f64().unwrap_or(0.5);
+            let projected_combined_at_ask = filled_price_f + remaining_ask_f;
+
+            let max_pair_cost = self.ladder_engine.config().max_pair_cost;
+            let max_pair_cost_f = max_pair_cost.to_f64().unwrap_or(PAIR_PROTECTION_MAX_COST);
+
+            if let Some(paired_price) = paired_limit_price {
+                let paired_price_f = paired_price.to_f64().unwrap_or(0.5);
+                let projected_combined_at_limit = filled_price_f + paired_price_f;
+
+                // Only cancel if our remaining LIMIT would make the pair exceed the cap.
+                // (For paired ladder orders this should basically never happen, but keep the guard.)
+                if projected_combined_at_limit > max_pair_cost_f {
+                    warn!(
+                        market = %market_symbol,
+                        filled_side = ?event.filled_side,
+                        filled_price = %format!("{:.4}", filled_price_f),
+                        remaining_side = ?remaining_side,
+                        paired_limit = %format!("{:.4}", paired_price_f),
+                        combined_at_limit = %format!("{:.4}", projected_combined_at_limit),
+                        max_pair_cost = %format!("{:.4}", max_pair_cost_f),
+                        remaining_ask = %format!("{:.4}", remaining_ask_f),
+                        combined_at_ask = %format!("{:.4}", projected_combined_at_ask),
+                        "Pair protection: cancelling remaining leg (limit price exceeds pair cap)"
+                    );
+
+                    if !self.config.dry_run {
+                        match self.cancel_orders(&[event.paired_order_id.clone()]).await {
+                            Ok(cancelled) => {
+                                if !cancelled.is_empty() {
+                                    self.ledger.write().mark_orders_cancelled(&cancelled);
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    market = %market_symbol,
+                                    error = %e,
+                                    "Failed to cancel remaining leg of bad pair"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    debug!(
+                        market = %market_symbol,
+                        filled_side = ?event.filled_side,
+                        filled_price = %format!("{:.4}", filled_price_f),
+                        remaining_side = ?remaining_side,
+                        paired_limit = %format!("{:.4}", paired_price_f),
+                        combined_at_limit = %format!("{:.4}", projected_combined_at_limit),
+                        remaining_ask = %format!("{:.4}", remaining_ask_f),
+                        combined_at_ask = %format!("{:.4}", projected_combined_at_ask),
+                        remaining_token = %remaining_token_id,
+                        "Pair fill: keeping remaining resting leg"
+                    );
+                }
+            } else {
+                // If we don't know the paired price, fall back to old behavior (ask-based)
+                // but keep it conservative: do NOT cancel automatically; just log.
+                debug!(
+                    market = %market_symbol,
+                    filled_side = ?event.filled_side,
+                    filled_price = %format!("{:.4}", filled_price_f),
+                    remaining_ask = %format!("{:.4}", remaining_ask_f),
+                    combined_at_ask = %format!("{:.4}", projected_combined_at_ask),
+                    "Pair fill: missing paired order info; skipping protection"
+                );
             }
         }
     }
@@ -1456,6 +1967,16 @@ impl SimpleBot {
 
                     if !confirmed_closed.is_empty() {
                         self.ledger.write().mark_orders_cancelled(&confirmed_closed);
+                    }
+                }
+
+                // Prune training records for cancelled orders that never filled.
+                if !response.canceled.is_empty() {
+                    let ledger = self.ledger.read();
+                    for order_id in &response.canceled {
+                        if ledger.filled_size(order_id).is_zero() {
+                            self.pending_orders.remove(order_id);
+                        }
                     }
                 }
 
@@ -1931,7 +2452,6 @@ struct SideScoreBreakdown {
     edge_down: f64,
     edge_up_score: f64,
     edge_down_score: f64,
-    momentum: f64,
     velocity: f64,
     drift: f64,
     vol_penalty: f64,
@@ -2012,7 +2532,6 @@ fn compute_side_scores(
         edge_down,
         edge_up_score,
         edge_down_score,
-        momentum,
         velocity,
         drift,
         vol_penalty,
