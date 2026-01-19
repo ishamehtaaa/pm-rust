@@ -1,12 +1,12 @@
 use crate::config::ASSETS_BY_PREFIX;
 use crate::config::MarketDuration;
-use crate::models::{duration_label, MarketInfo};
+use crate::models::{MarketInfo, duration_label};
 use chrono::{DateTime, Utc};
+use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market as GammaMarket;
-use polymarket_client_sdk::gamma::Client as GammaClient;
 use std::collections::HashSet;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MarketCacheError {
@@ -32,16 +32,19 @@ impl MarketCache {
         }
     }
 
-    pub async fn get_markets(&self, _now: DateTime<Utc>) -> Result<Vec<MarketInfo>, MarketCacheError> {
+    pub async fn get_markets(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<MarketInfo>, MarketCacheError> {
         let raw_markets = self.fetch_raw_markets().await?;
-        info!("Fetched {} raw markets from Gamma API", raw_markets.len());
+        debug!("Fetched {} raw markets from Gamma API", raw_markets.len());
 
         let markets: Vec<MarketInfo> = raw_markets
             .into_iter()
             .filter_map(|m| self.convert_market(m))
             .collect();
 
-        info!("Filtered to {} valid markets", markets.len());
+        debug!("Filtered to {} valid markets", markets.len());
         Ok(markets)
     }
 
@@ -65,7 +68,7 @@ impl MarketCache {
 
     fn convert_market(&self, m: GammaMarket) -> Option<MarketInfo> {
         let slug = m.slug.as_deref()?;
-         
+
         let duration_match = match self.target_duration {
             MarketDuration::FifteenMin => is_15m_market(slug),
             MarketDuration::OneHour => is_1h_market(slug),
@@ -94,7 +97,9 @@ impl MarketCache {
         }
 
         let up_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("up"))?;
-        let down_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))?;
+        let down_idx = outcomes
+            .iter()
+            .position(|o| o.eq_ignore_ascii_case("down"))?;
 
         let start_time = m.start_date?;
         let end_time = m.end_date?;
@@ -114,7 +119,6 @@ impl MarketCache {
         })
     }
 }
-
 
 fn is_15m_market(slug: &str) -> bool {
     // Match pattern: {asset}-updown-15m-{number}

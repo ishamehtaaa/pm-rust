@@ -3,6 +3,8 @@ use rust_decimal_macros::dec;
 
 pub const SHARE_DECIMALS: Decimal = dec!(1_000_000);
 pub const SIZE_DP: u32 = 2;
+pub const MIN_ORDER_SIZE: Decimal = dec!(5);
+pub const TICK_SIZE: Decimal = dec!(0.01);
 
 /* Convert raw sizes to human readable shares. */
 pub fn to_shares(raw: Decimal) -> Decimal {

@@ -1,8 +1,12 @@
 use clap::Parser;
 use polymarket::bot::SimpleBot;
-use polymarket::config::{Config, MarketDuration, ASSETS_BY_NAME, ASSETS_BY_PREFIX};
+use polymarket::config::{ASSETS_BY_NAME, ASSETS_BY_PREFIX, Config, MarketDuration};
 use rust_decimal::Decimal;
 use std::collections::HashSet;
+use std::fmt::Result;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, time::ChronoLocal},
@@ -20,7 +24,7 @@ struct Args {
     #[arg(
         long = "shares",
         short = 's',
-        default_value = "5",
+        default_value = "15",
         value_parser = clap::value_parser!(Decimal),
         aliases = ["shares-target-per-side"]
     )]

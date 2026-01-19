@@ -8,9 +8,11 @@ use tracing::{debug, info, trace};
 const PATIENCE_MULT: Decimal = dec!(1.3);
 /* Chase multiplier for elusive side - less aggressive to reduce asymmetric fill risk (was 0.5) */
 const CHASE_MULT: Decimal = dec!(0.8);
+/* Cap offset asymmetry so traps stay roughly symmetric. */
+const MAX_OFFSET_ASYMMETRY: Decimal = dec!(0.10);
 
 use crate::{
-    constants::round_size,
+    constants::{MIN_ORDER_SIZE, TICK_SIZE, round_size, short_id},
     poller::{MarketPosition, MarketSide},
 };
 
@@ -18,10 +20,8 @@ pub struct LadderConfig {
     pub levels: usize,
     pub spacing: Decimal,
     pub size_per_level: Decimal,
-    pub min_order_size: Decimal,
     pub top_offset: Decimal,
     pub max_pair_cost: Decimal,
-    pub tick_size: Decimal,
     pub target_per_side: Decimal,
     pub max_position_per_side: Decimal,
     pub max_pending_per_side: Decimal,
@@ -36,18 +36,14 @@ impl Default for LadderConfig {
             levels: 3,
             spacing: dec!(0.01),
             size_per_level: dec!(5),
-            // Polymarket enforces a minimum order size (typically 5 shares for these markets).
-            // Never generate orders smaller than this or the API will reject them.
-            min_order_size: dec!(5),
-            top_offset: dec!(0.02),
-            max_pair_cost: dec!(0.96),  /* Tighter cap to ensure profitability even with execution slippage */
-            tick_size: dec!(0.01),
+            top_offset: dec!(0.01),
+            max_pair_cost: dec!(0.97),
             target_per_side: dec!(10),
             max_position_per_side: dec!(50),
             max_pending_per_side: dec!(20),
             reladder_threshold: dec!(0.02),
-            stale_order_distance: dec!(0.04),  /* Tighter: cancel orders faster when market moves away */
-            max_imbalance: dec!(5), // Don't let one side get more than 10 shares ahead
+            stale_order_distance: dec!(0.20),
+            max_imbalance: dec!(10),
         }
     }
 }
@@ -62,7 +58,7 @@ pub struct LadderOrder {
 #[derive(Debug, Default)]
 pub struct LadderPlan {
     pub orders: Vec<LadderOrder>,
-    pub cancellations: Vec<String>, // Order IDs to cancel
+    pub cancellations: Vec<String>,
 }
 
 /* Tracks the last price we laddered at for each market */
@@ -136,7 +132,7 @@ impl LadderEngine {
         let mut plan = LadderPlan::default();
         let target_per_side = target_per_side.unwrap_or(self.config.target_per_side);
         let overrides = overrides.unwrap_or_default();
-        let min_order_size = self.config.min_order_size.max(dec!(0.01));
+        let min_order_size = MIN_ORDER_SIZE.max(dec!(0.01));
 
         /* Calculate pending from open orders (source of truth from remote state) */
         let pending_up: Decimal = open_orders
@@ -253,28 +249,18 @@ impl LadderEngine {
             /* Cancel if too far from market */
             let distance = current_ask - order.price;
             if distance > self.config.stale_order_distance {
-                // If we're materially imbalanced, keep (don't cancel) deeper orders on the
-                // underweight side so we can still get hedging fills when price reverts.
                 let protect_for_rebalance = underweight_side == Some(order.side)
                     && imbalance_abs >= self.config.max_imbalance * dec!(0.5);
                 if protect_for_rebalance {
-                    debug!(
-                        order_id = %order.order_id,
-                        side = ?order.side,
-                        price = %order.price,
-                        current_ask = %current_ask,
-                        distance = %distance,
-                        imbalance = %imbalance,
-                        "Keeping underweight-side order despite distance (rebalance hedge)"
-                    );
                     continue;
                 }
-                debug!(
-                    order_id = %order.order_id,
+                info!(
+                    order_id = %short_id(&order.order_id, 8),
                     price = %order.price,
                     current_ask = %current_ask,
                     distance = %distance,
-                    "Order too far from market"
+                    threshold = %self.config.stale_order_distance,
+                    "Cancelling stale order (too far from market)"
                 );
                 to_cancel.push(order.order_id.clone());
                 continue;
@@ -287,12 +273,12 @@ impl LadderEngine {
             };
 
             if should_cancel_for_balance && allow_imbalance_side != Some(order.side) {
-                debug!(
-                    order_id = %order.order_id,
+                info!(
+                    order_id = %short_id(&order.order_id, 8),
                     side = ?order.side,
                     imbalance = %imbalance,
                     max_imbalance = %self.config.max_imbalance,
-                    "Cancelling to rebalance"
+                    "Cancelling stale order (rebalance)"
                 );
                 to_cancel.push(order.order_id.clone());
             }
@@ -310,52 +296,176 @@ impl LadderEngine {
         overrides: LadderOverrides,
     ) -> Vec<LadderOrder> {
         let mut orders = Vec::new();
-        let base_offset = self.config.top_offset + overrides.extra_offset;
-        let min_order_size = self.config.min_order_size.max(dec!(0.01));
+        let params = self.ladder_params(overrides);
 
-        /*
-         * Price cap logic with fallback for rebalancing:
-         * - If we have a model-derived cap, use it
-         * - If no cap but we need to rebalance (allow_imbalance_side), use market_bid as fallback
-         * - Otherwise skip that side
-         */
-        let up_cap = match overrides.up_price_cap {
-            Some(cap) => cap,
-            None => {
-                // No model edge - use fallback price (bid at market_ask - offset)
-                // This is conservative but ensures we have orders in the book
-                let fallback = (up_ask - base_offset).max(dec!(0.01));
-                debug!(
-                    up_ask = %up_ask,
-                    fallback = %fallback,
-                    "No Up edge from model, using fallback price"
-                );
-                fallback
-            }
-        };
-        let down_cap = match overrides.down_price_cap {
-            Some(cap) => cap,
-            None => {
-                let fallback = (down_ask - base_offset).max(dec!(0.01));
-                debug!(
-                    down_ask = %down_ask,
-                    fallback = %fallback,
-                    "No Down edge from model, using fallback price"
-                );
-                fallback
-            }
-        };
+        let up_cap = price_cap_with_fallback(
+            MarketSide::Up,
+            up_ask,
+            down_ask,
+            overrides,
+            params.top_offset,
+        );
+        let down_cap = price_cap_with_fallback(
+            MarketSide::Down,
+            up_ask,
+            down_ask,
+            overrides,
+            params.top_offset,
+        );
 
         let mut remaining_room = up_room.min(down_room);
         if remaining_room <= Decimal::ZERO {
             return orders;
         }
 
-        let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(min_order_size);
-        let spacing = self.config.spacing * overrides.spacing_multiplier;
-        let base_offset = self.config.top_offset + overrides.extra_offset;
-        
+        let (up_offset, down_offset, down_first) =
+            self.momentum_offsets_and_priority(params.top_offset, overrides, up_room, down_room);
+
+        /* Apply price caps - the MAXIMUM we're willing to pay */
+        let top_up = (up_ask - up_offset).max(dec!(0.01)).min(up_cap);
+        let top_down = (down_ask - down_offset).max(dec!(0.01)).min(down_cap);
+
+        for level in 0..params.levels {
+            let price_up = (top_up - params.spacing * Decimal::from(level as u32)).max(dec!(0.01));
+            let price_down =
+                (top_down - params.spacing * Decimal::from(level as u32)).max(dec!(0.01));
+
+            let price_up = floor_to_tick(price_up, params.tick);
+            let price_down = floor_to_tick(price_down, params.tick);
+
+            if price_up >= up_ask || price_down >= down_ask {
+                continue;
+            }
+
+            /* Combined cost must be below threshold */
+            if price_up + price_down > self.config.max_pair_cost {
+                debug!(
+                    up = %price_up,
+                    down = %price_down,
+                    combined = %(price_up + price_down),
+                    max = %self.config.max_pair_cost,
+                    "Combined cost too high - skipping level"
+                );
+                continue;
+            }
+
+            let size = round_size(params.size_per_level.min(remaining_room));
+            if size < params.min_order_size {
+                break;
+            }
+
+            /*
+             * MOMENTUM-AWARE ORDER PRIORITY
+             * Buy the "elusive" side first (the one getting more expensive).
+             * - momentum > 0: Up is rising → buy Up first
+             * - momentum < 0: Down is rising → buy Down first
+             * This ensures we catch the side that's moving away from us.
+             */
+            if down_first {
+                /* Down is trending up (getting expensive) → buy Down first */
+                orders.push(LadderOrder {
+                    side: MarketSide::Down,
+                    price: price_down,
+                    size,
+                });
+                orders.push(LadderOrder {
+                    side: MarketSide::Up,
+                    price: price_up,
+                    size,
+                });
+            } else {
+                /* Up is trending up or stable → buy Up first (default) */
+                orders.push(LadderOrder {
+                    side: MarketSide::Up,
+                    price: price_up,
+                    size,
+                });
+                orders.push(LadderOrder {
+                    side: MarketSide::Down,
+                    price: price_down,
+                    size,
+                });
+            }
+            remaining_room -= size;
+        }
+        orders
+    }
+
+    fn generate_single_ladder(
+        &self,
+        side: MarketSide,
+        up_ask: Decimal,
+        down_ask: Decimal,
+        up_room: Decimal,
+        down_room: Decimal,
+        overrides: LadderOverrides,
+    ) -> Vec<LadderOrder> {
+        let mut orders = Vec::new();
+        let params = self.ladder_params(overrides);
+
+        /* Check if we have edge on this side (price cap exists) */
+        let cap = price_cap_with_fallback(side, up_ask, down_ask, overrides, params.top_offset);
+
+        let room = match side {
+            MarketSide::Up => up_room,
+            MarketSide::Down => down_room,
+        };
+
+        if room <= Decimal::ZERO {
+            return orders;
+        }
+
+        let top_price = match side {
+            MarketSide::Up => (up_ask - params.top_offset).max(dec!(0.01)).min(cap),
+            MarketSide::Down => (down_ask - params.top_offset).max(dec!(0.01)).min(cap),
+        };
+
+        let mut remaining_room = room;
+        for level in 0..params.levels {
+            let price = (top_price - params.spacing * Decimal::from(level as u32)).max(dec!(0.01));
+            let price = floor_to_tick(price, params.tick);
+
+            let current_ask = match side {
+                MarketSide::Up => up_ask,
+                MarketSide::Down => down_ask,
+            };
+
+            if price >= current_ask {
+                continue;
+            }
+
+            let size = round_size(params.size_per_level.min(remaining_room));
+            if size < params.min_order_size {
+                break;
+            }
+
+            orders.push(LadderOrder { side, price, size });
+            remaining_room -= size;
+        }
+
+        orders
+    }
+
+    fn ladder_params(&self, overrides: LadderOverrides) -> LadderParams {
+        let min_order_size = MIN_ORDER_SIZE.max(dec!(0.01));
+        LadderParams {
+            size_per_level: (self.config.size_per_level * overrides.size_multiplier)
+                .max(min_order_size),
+            spacing: self.config.spacing * overrides.spacing_multiplier,
+            tick: TICK_SIZE.max(dec!(0.01)),
+            levels: self.config.levels,
+            min_order_size,
+            top_offset: self.config.top_offset,
+        }
+    }
+
+    fn momentum_offsets_and_priority(
+        &self,
+        base_offset: Decimal,
+        overrides: LadderOverrides,
+        up_room: Decimal,
+        down_room: Decimal,
+    ) -> (Decimal, Decimal, bool) {
         /*
          * Momentum-aware asymmetric pricing:
          * - When Up trending up (momentum > 0): bid tight on Up (elusive), wide on Down (cheap)
@@ -363,7 +473,8 @@ impl LadderEngine {
          * - The "elusive" side is chased aggressively, the "cheap" side we wait for
          */
         const MOMENTUM_THRESHOLD: f64 = 0.15;
-        
+        const PRIORITY_THRESHOLD: f64 = -0.1;
+
         let (up_offset, down_offset) = if overrides.momentum > MOMENTUM_THRESHOLD {
             /* Up is elusive (trending up), Down is cheap (will get cheaper) */
             (base_offset * CHASE_MULT, base_offset * PATIENCE_MULT)
@@ -405,159 +516,22 @@ impl LadderEngine {
             (Decimal::ONE, Decimal::ONE)
         };
 
-        let up_offset = up_offset * inv_up_mult;
-        let down_offset = down_offset * inv_down_mult;
-        
-        /* Apply price caps - the MAXIMUM we're willing to pay */
-        let top_up = (up_ask - up_offset).max(dec!(0.01)).min(up_cap);
-        let top_down = (down_ask - down_offset).max(dec!(0.01)).min(down_cap);
-        
-        let tick = self.config.tick_size.max(dec!(0.01));
-        let levels = overrides.max_levels.unwrap_or(self.config.levels);
-
-        for level in 0..levels {
-            let price_up = (top_up - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-            let price_down = (top_down - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-
-            let price_up = floor_to_tick(price_up, tick);
-            let price_down = floor_to_tick(price_down, tick);
-
-            if price_up >= up_ask || price_down >= down_ask {
-                continue;
-            }
-
-            /* Combined cost must be below threshold */
-            if price_up + price_down > self.config.max_pair_cost {
-                debug!(
-                    up = %price_up,
-                    down = %price_down,
-                    combined = %(price_up + price_down),
-                    max = %self.config.max_pair_cost,
-                    "Combined cost too high - skipping level"
-                );
-                continue;
-            }
-
-            let size = round_size(size_per_level.min(remaining_room));
-            if size < min_order_size {
-                break;
-            }
-
-            /* 
-             * MOMENTUM-AWARE ORDER PRIORITY
-             * Buy the "elusive" side first (the one getting more expensive).
-             * - momentum > 0: Up is rising → buy Up first
-             * - momentum < 0: Down is rising → buy Down first
-             * This ensures we catch the side that's moving away from us.
-             */
-            if overrides.momentum < -0.1 {
-                /* Down is trending up (getting expensive) → buy Down first */
-                orders.push(LadderOrder {
-                    side: MarketSide::Down,
-                    price: price_down,
-                    size,
-                });
-                orders.push(LadderOrder {
-                    side: MarketSide::Up,
-                    price: price_up,
-                    size,
-                });
+        let mut up_offset = up_offset * inv_up_mult;
+        let mut down_offset = down_offset * inv_down_mult;
+        let max_ratio = Decimal::ONE + MAX_OFFSET_ASYMMETRY;
+        let min_offset = up_offset.min(down_offset);
+        let max_offset = up_offset.max(down_offset);
+        let capped_max = min_offset * max_ratio;
+        if max_offset > capped_max {
+            if up_offset > down_offset {
+                up_offset = capped_max;
             } else {
-                /* Up is trending up or stable → buy Up first (default) */
-                orders.push(LadderOrder {
-                    side: MarketSide::Up,
-                    price: price_up,
-                    size,
-                });
-                orders.push(LadderOrder {
-                    side: MarketSide::Down,
-                    price: price_down,
-                    size,
-                });
+                down_offset = capped_max;
             }
-            remaining_room -= size;
         }
-        orders
-    }
+        let down_first = overrides.momentum < PRIORITY_THRESHOLD;
 
-    fn generate_single_ladder(
-        &self,
-        side: MarketSide,
-        up_ask: Decimal,
-        down_ask: Decimal,
-        up_room: Decimal,
-        down_room: Decimal,
-        overrides: LadderOverrides,
-    ) -> Vec<LadderOrder> {
-        let mut orders = Vec::new();
-        let base_offset = self.config.top_offset + overrides.extra_offset;
-        let min_order_size = self.config.min_order_size.max(dec!(0.01));
-        
-        /* Check if we have edge on this side (price cap exists) */
-        let price_cap = match side {
-            MarketSide::Up => overrides.up_price_cap,
-            MarketSide::Down => overrides.down_price_cap,
-        };
-        
-        let cap = match price_cap {
-            Some(cap) => cap,
-            None => {
-                // No model edge - use fallback (ask - offset) for rebalancing
-                let ask = match side {
-                    MarketSide::Up => up_ask,
-                    MarketSide::Down => down_ask,
-                };
-                let fallback = (ask - base_offset).max(dec!(0.01));
-                debug!(side = ?side, ask = %ask, fallback = %fallback, "No edge, using fallback price");
-                fallback
-            }
-        };
-        
-        let room = match side {
-            MarketSide::Up => up_room,
-            MarketSide::Down => down_room,
-        };
-
-        if room <= Decimal::ZERO {
-            return orders;
-        }
-
-        let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(min_order_size);
-        let spacing = self.config.spacing * overrides.spacing_multiplier;
-        let top_offset = self.config.top_offset + overrides.extra_offset;
-        let tick = self.config.tick_size.max(dec!(0.01));
-        let levels = overrides.max_levels.unwrap_or(self.config.levels);
-
-        let top_price = match side {
-            MarketSide::Up => (up_ask - top_offset).max(dec!(0.01)).min(cap),
-            MarketSide::Down => (down_ask - top_offset).max(dec!(0.01)).min(cap),
-        };
-
-        let mut remaining_room = room;
-        for level in 0..levels {
-            let price = (top_price - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-            let price = floor_to_tick(price, tick);
-
-            let current_ask = match side {
-                MarketSide::Up => up_ask,
-                MarketSide::Down => down_ask,
-            };
-
-            if price >= current_ask {
-                continue;
-            }
-
-            let size = round_size(size_per_level.min(remaining_room));
-            if size < min_order_size {
-                break;
-            }
-
-            orders.push(LadderOrder { side, price, size });
-            remaining_room -= size;
-        }
-
-        orders
+        (up_offset, down_offset, down_first)
     }
 }
 
@@ -565,7 +539,6 @@ impl LadderEngine {
 pub struct LadderOverrides {
     pub size_multiplier: Decimal,
     pub spacing_multiplier: Decimal,
-    pub extra_offset: Decimal,
     pub up_price_cap: Option<Decimal>,
     pub down_price_cap: Option<Decimal>,
     pub max_levels: Option<usize>,
@@ -574,12 +547,51 @@ pub struct LadderOverrides {
     pub momentum: f64,
 }
 
+struct LadderParams {
+    size_per_level: Decimal,
+    spacing: Decimal,
+    tick: Decimal,
+    levels: usize,
+    min_order_size: Decimal,
+    top_offset: Decimal,
+}
+
+fn price_cap_with_fallback(
+    side: MarketSide,
+    up_ask: Decimal,
+    down_ask: Decimal,
+    overrides: LadderOverrides,
+    base_offset: Decimal,
+) -> Decimal {
+    let price_cap = match side {
+        MarketSide::Up => overrides.up_price_cap,
+        MarketSide::Down => overrides.down_price_cap,
+    };
+
+    match price_cap {
+        Some(cap) => cap,
+        None => {
+            let ask = match side {
+                MarketSide::Up => up_ask,
+                MarketSide::Down => down_ask,
+            };
+            let fallback = (ask - base_offset).max(dec!(0.01));
+            debug!(
+                side = ?side,
+                ask = %ask,
+                fallback = %fallback,
+                "No edge from model, using fallback price"
+            );
+            fallback
+        }
+    }
+}
+
 impl Default for LadderOverrides {
     fn default() -> Self {
         Self {
             size_multiplier: Decimal::ONE,
             spacing_multiplier: Decimal::ONE,
-            extra_offset: Decimal::ZERO,
             up_price_cap: None,
             down_price_cap: None,
             momentum: 0.0,

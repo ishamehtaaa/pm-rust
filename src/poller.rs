@@ -1,7 +1,7 @@
 // poller.rs - WebSocket order updates (no notifications/trades)
 
-use parking_lot::RwLock;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
@@ -35,13 +35,10 @@ struct TrackedOrder {
     is_open: bool,
     placed_at: Instant,
     first_update_logged: bool,
-    /// The paired order on the opposite side (for pair execution protection)
     paired_order_id: Option<String>,
-    /// Actual fill price (may differ from placed price for limit orders)
     actual_fill_price: Option<Decimal>,
 }
 
-/// Information about a fill that may require canceling the paired order
 #[derive(Debug, Clone)]
 pub struct PairFillEvent {
     pub filled_order_id: String,
@@ -56,9 +53,7 @@ pub struct PairFillEvent {
 pub struct InventoryLedger {
     positions: HashMap<String, MarketPosition>,
     tracked_orders: HashMap<String, TrackedOrder>,
-    /// Maps market_id -> display label
     market_labels: HashMap<String, String>,
-    /// Pending pair fill events that need to be processed by the bot
     pending_pair_fills: Vec<PairFillEvent>,
 }
 
@@ -78,7 +73,6 @@ impl InventoryLedger {
             .unwrap_or_else(|| market_id.to_string())
     }
 
-    /// Register a market label for logging.
     pub fn register_market(&mut self, market_id: String, label: String) {
         self.market_labels.insert(market_id, label);
     }
@@ -179,13 +173,7 @@ impl InventoryLedger {
     }
 
     /// Update the position for a market from API data.
-    /// Called both on initial discovery and periodic refreshes.
-    pub fn sync_position(
-        &mut self,
-        market_id: String,
-        up_shares: Decimal,
-        down_shares: Decimal,
-    ) {
+    pub fn sync_position(&mut self, market_id: String, up_shares: Decimal, down_shares: Decimal) {
         let pos = self.positions.entry(market_id.clone()).or_default();
         let changed = pos.up_shares != up_shares || pos.down_shares != down_shares;
         pos.up_shares = up_shares;
@@ -206,7 +194,6 @@ impl InventoryLedger {
     pub fn process_order_message(&mut self, msg: OrderMessage) {
         let order_id = msg.id.clone();
 
-        // First pass: gather info about the tracked order without holding a mutable borrow
         let tracked_info = {
             let Some(tracked) = self.tracked_orders.get(&order_id) else {
                 debug!(
@@ -216,7 +203,7 @@ impl InventoryLedger {
                 );
                 return;
             };
-            
+
             (
                 tracked.first_update_logged,
                 tracked.placed_at,
@@ -229,11 +216,19 @@ impl InventoryLedger {
                 tracked.is_open,
             )
         };
-        
-        let (first_update_logged, placed_at, price, actual_fill_price, 
-             prev_filled_size, market_id, side, paired_order_id, was_open) = tracked_info;
 
-        // Log first update
+        let (
+            first_update_logged,
+            placed_at,
+            price,
+            actual_fill_price,
+            prev_filled_size,
+            market_id,
+            side,
+            paired_order_id,
+            was_open,
+        ) = tracked_info;
+
         if !first_update_logged {
             let elapsed_ms = placed_at.elapsed().as_millis();
             debug!(
@@ -246,9 +241,7 @@ impl InventoryLedger {
             }
         }
 
-        // For limit orders, fills happen at the order price or better.
-        // We track the placed price as the fill price (conservative estimate).
-        // Note: Polymarket limit orders always fill at exactly the limit price.
+        // Note: Polymarket limit orders may not always fill at exactly the given price (could be better)
         let fill_price = actual_fill_price.unwrap_or(price);
         if actual_fill_price.is_none() && msg.size_matched.is_some() {
             if let Some(tracked) = self.tracked_orders.get_mut(&order_id) {
@@ -279,11 +272,12 @@ impl InventoryLedger {
 
                 // Check if paired order is still open
                 if let Some(ref paired_id) = paired_order_id {
-                    let paired_is_open = self.tracked_orders
+                    let paired_is_open = self
+                        .tracked_orders
                         .get(paired_id)
                         .map(|p| p.is_open)
                         .unwrap_or(false);
-                    
+
                     if paired_is_open {
                         pair_fill_event = Some(PairFillEvent {
                             filled_order_id: order_id.clone(),
@@ -303,7 +297,6 @@ impl InventoryLedger {
             }
         }
 
-        // Queue the pair fill event
         if let Some(event) = pair_fill_event {
             self.pending_pair_fills.push(event);
         }
@@ -328,10 +321,7 @@ impl InventoryLedger {
     }
 
     pub fn effective_position(&self, market_id: &str) -> MarketPosition {
-        self.positions
-            .get(market_id)
-            .cloned()
-            .unwrap_or_default()
+        self.positions.get(market_id).cloned().unwrap_or_default()
     }
 
     pub fn open_orders_for_market(&self, market_id: &str) -> Vec<OpenOrderInfo> {
@@ -363,12 +353,7 @@ impl InventoryLedger {
         }
     }
 
-    pub fn apply_order_status(
-        &mut self,
-        order_id: &str,
-        filled_size: Decimal,
-        is_open: bool,
-    ) {
+    pub fn apply_order_status(&mut self, order_id: &str, filled_size: Decimal, is_open: bool) {
         let Some(tracked) = self.tracked_orders.get_mut(order_id) else {
             debug!(
                 order_id = %short_id(order_id, 8),
@@ -406,7 +391,6 @@ impl InventoryLedger {
     }
 }
 
-/// Spawn WebSocket order feed that updates the ledger.
 pub fn spawn_order_feed(
     client: Arc<AuthenticatedWsClient>,
     ledger: Arc<RwLock<InventoryLedger>>,
@@ -417,7 +401,6 @@ pub fn spawn_order_feed(
             warn!("No valid markets for order WebSocket subscription");
             return;
         }
-
         loop {
             info!(markets = ?market_ids, "Connecting order WebSocket");
 
