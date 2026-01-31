@@ -85,8 +85,8 @@ pub fn quote_with_drift(
         0.0
     };
     let fair_x = current_x + drift;
-    let reservation_x = fair_x
-        - (inventory_q * risk_aversion_gamma * sigma_b.powi(2) * time_horizon_t_minus_t);
+    let reservation_x =
+        fair_x - (inventory_q * risk_aversion_gamma * sigma_b.powi(2) * time_horizon_t_minus_t);
 
     let vol_component = risk_aversion_gamma * sigma_b.powi(2) * time_horizon_t_minus_t;
     let liquidity_component =
@@ -106,7 +106,10 @@ pub fn quote_with_drift(
 
 /// Calibrate jump-diffusion parameters using EM algorithm with exponential smoothing.
 /// Smoothing reduces noise from short windows, giving more stable fair value estimates.
-pub fn calibrate_step_em(log_odds_increments: &[f64], current_params: &MarketParams) -> MarketParams {
+pub fn calibrate_step_em(
+    log_odds_increments: &[f64],
+    current_params: &MarketParams,
+) -> MarketParams {
     let mut new_sigma_sq_sum = 0.0;
     let mut new_lambda_sum = 0.0;
     let mut weights_sum = 0.0;
@@ -122,7 +125,11 @@ pub fn calibrate_step_em(log_odds_increments: &[f64], current_params: &MarketPar
         let p_jump = current_params.jump_intensity * DT;
         let numerator = p_jump * psi;
         let denominator = numerator + (1.0 - p_jump) * phi;
-        let gamma = if denominator > 0.0 { numerator / denominator } else { 0.0 };
+        let gamma = if denominator > 0.0 {
+            numerator / denominator
+        } else {
+            0.0
+        };
 
         new_sigma_sq_sum += (1.0 - gamma) * dx.powi(2);
         weights_sum += 1.0 - gamma;
@@ -130,21 +137,25 @@ pub fn calibrate_step_em(log_odds_increments: &[f64], current_params: &MarketPar
     }
 
     let n = log_odds_increments.len() as f64;
-    
+
     // Raw estimates from this window
     let raw_sigma_b = if weights_sum > 0.0 {
         (new_sigma_sq_sum / (weights_sum * DT)).sqrt()
     } else {
         current_params.sigma_b
     };
-    let raw_jump_intensity = if n > 0.0 { (new_lambda_sum / n) / DT } else { 0.0 };
+    let raw_jump_intensity = if n > 0.0 {
+        (new_lambda_sum / n) / DT
+    } else {
+        0.0
+    };
 
     // Apply exponential smoothing: blend new estimate with previous
     // This reduces noise from short 8-second windows
-    let smoothed_sigma_b = PARAM_SMOOTHING_ALPHA * raw_sigma_b 
+    let smoothed_sigma_b = PARAM_SMOOTHING_ALPHA * raw_sigma_b
         + (1.0 - PARAM_SMOOTHING_ALPHA) * current_params.sigma_b;
-    
-    let smoothed_jump_intensity = PARAM_SMOOTHING_ALPHA * raw_jump_intensity 
+
+    let smoothed_jump_intensity = PARAM_SMOOTHING_ALPHA * raw_jump_intensity
         + (1.0 - PARAM_SMOOTHING_ALPHA) * current_params.jump_intensity;
 
     // Clamp to reasonable bounds to prevent extreme estimates
@@ -171,8 +182,8 @@ pub fn generate_quotes(
     params: &MarketParams,
     k_liquidity_param: f64,
 ) -> Quote {
-    let reservation_x =
-        current_x - (inventory_q * risk_aversion_gamma * params.sigma_b.powi(2) * time_horizon_t_minus_t);
+    let reservation_x = current_x
+        - (inventory_q * risk_aversion_gamma * params.sigma_b.powi(2) * time_horizon_t_minus_t);
 
     let vol_component = risk_aversion_gamma * params.sigma_b.powi(2) * time_horizon_t_minus_t;
     let liquidity_component =

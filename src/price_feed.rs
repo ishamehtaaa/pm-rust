@@ -1,11 +1,11 @@
 // price_feed.rs
+use alloy::primitives::U256;
 use futures::StreamExt;
 use parking_lot::RwLock;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 use rust_decimal::Decimal;
-use alloy::primitives::U256;
-use std::str::FromStr;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -22,9 +22,9 @@ impl PriceCache {
     }
 
     pub fn get_with_age(&self, token_id: &str, now_ms: u64) -> Option<(Decimal, Decimal, u64)> {
-        self.prices.get(token_id).map(|(bid, ask, ts)| {
-            (*bid, *ask, now_ms.saturating_sub(*ts))
-        })
+        self.prices
+            .get(token_id)
+            .map(|(bid, ask, ts)| (*bid, *ask, now_ms.saturating_sub(*ts)))
     }
 
     fn update(&mut self, token_id: String, bid: Decimal, ask: Decimal, timestamp_ms: u64) {
@@ -63,14 +63,10 @@ pub fn spawn_price_feed(
             match result {
                 Ok(book) => {
                     trace!(asset_id = %book.asset_id, bids = book.bids.len(), asks = book.asks.len(), "Orderbook update");
-                    let best_bid = book.bids.iter()
-                        .map(|l| l.price)
-                        .max();
+                    let best_bid = book.bids.iter().map(|l| l.price).max();
 
                     // Best ask = lowest ask (cheapest offer to sell)
-                    let best_ask = book.asks.iter()
-                        .map(|l| l.price)
-                        .min();
+                    let best_ask = book.asks.iter().map(|l| l.price).min();
 
                     if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                         let ts: u64 = book.timestamp.try_into().unwrap_or(0);

@@ -1,7 +1,7 @@
 // poller.rs - WebSocket order updates (no notifications/trades)
 
-use parking_lot::RwLock;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
@@ -197,10 +197,7 @@ impl InventoryLedger {
     }
 
     pub fn effective_position(&self, market_id: &str) -> MarketPosition {
-        self.positions
-            .get(market_id)
-            .cloned()
-            .unwrap_or_default()
+        self.positions.get(market_id).cloned().unwrap_or_default()
     }
 
     pub fn open_orders_for_market(&self, market_id: &str) -> Vec<OpenOrderInfo> {
@@ -232,12 +229,7 @@ impl InventoryLedger {
         }
     }
 
-    pub fn apply_order_status(
-        &mut self,
-        order_id: &str,
-        filled_size: Decimal,
-        is_open: bool,
-    ) {
+    pub fn apply_order_status(&mut self, order_id: &str, filled_size: Decimal, is_open: bool) {
         let Some(tracked) = self.tracked_orders.get_mut(order_id) else {
             debug!(
                 order_id = %short_id(order_id, 8),
@@ -272,6 +264,47 @@ impl InventoryLedger {
             .get(market_id)
             .map(|p| (p.up_shares, p.down_shares))
             .unwrap_or_default()
+    }
+
+    /// Get all fills for a market with their prices (for aggregate cost calculation)
+    /// Returns Vec of (side, filled_shares, price)
+    pub fn fills_for_market(&self, market_id: &str) -> Vec<(MarketSide, Decimal, Decimal)> {
+        self.tracked_orders
+            .values()
+            .filter(|o| o.market_id == market_id && o.filled_size > Decimal::ZERO)
+            .map(|o| (o.side, o.filled_size, o.price))
+            .collect()
+    }
+
+    /// Calculate aggregate position with weighted average prices
+    pub fn aggregate_for_market(
+        &self,
+        market_id: &str,
+    ) -> (Decimal, Decimal, Decimal, Decimal) {
+        // Returns (up_shares, up_total_cost, down_shares, down_total_cost)
+        let mut up_shares = Decimal::ZERO;
+        let mut up_cost = Decimal::ZERO;
+        let mut down_shares = Decimal::ZERO;
+        let mut down_cost = Decimal::ZERO;
+
+        for order in self.tracked_orders.values() {
+            if order.market_id != market_id || order.filled_size <= Decimal::ZERO {
+                continue;
+            }
+            let cost = order.filled_size * order.price;
+            match order.side {
+                MarketSide::Up => {
+                    up_shares += order.filled_size;
+                    up_cost += cost;
+                }
+                MarketSide::Down => {
+                    down_shares += order.filled_size;
+                    down_cost += cost;
+                }
+            }
+        }
+
+        (up_shares, up_cost, down_shares, down_cost)
     }
 }
 

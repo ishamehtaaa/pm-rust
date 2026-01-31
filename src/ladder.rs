@@ -23,23 +23,28 @@ pub struct LadderConfig {
     pub reladder_threshold: Decimal,
     pub stale_order_distance: Decimal,
     pub max_imbalance: Decimal,
+    // Continuous trading mode
+    pub allow_single_side: bool,
+    pub aggressive_rebalance_threshold: Decimal,
 }
 
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            levels: 5,
+            levels: 3,
             spacing: dec!(0.01),
-            size_per_level: dec!(10),
+            size_per_level: dec!(24),
             top_offset: dec!(0.01),
-            max_pair_cost: dec!(0.97),
+            max_pair_cost: dec!(0.995),
             tick_size: dec!(0.01),
-            target_per_side: dec!(50),
-            max_position_per_side: dec!(50),
-            max_pending_per_side: dec!(20),
+            target_per_side: dec!(5000),
+            max_position_per_side: dec!(5000),
+            max_pending_per_side: dec!(200),
             reladder_threshold: dec!(0.02),
             stale_order_distance: dec!(0.10),
-            max_imbalance: dec!(5),
+            max_imbalance: dec!(200),
+            allow_single_side: true,
+            aggressive_rebalance_threshold: dec!(500),
         }
     }
 }
@@ -129,8 +134,7 @@ impl LadderEngine {
         let target_per_side = target_per_side.unwrap_or(self.config.target_per_side);
         let overrides = overrides.unwrap_or_default();
 
-        // Calculate actual pending from open orders (not from position.pending_*)
-        // This is the source of truth since it's based on actual remote order state
+        // Calculate actual pending from open orders
         let pending_up: Decimal = open_orders
             .iter()
             .filter(|o| o.side == MarketSide::Up)
@@ -145,18 +149,16 @@ impl LadderEngine {
 
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
-
-        // CRITICAL FIX: Calculate imbalance here
         let imbalance = total_up - total_down;
 
-        // Cancel ALL orders on sides that are already at or over target
+        // Cancel orders on sides that are at or over target
         if position.up_shares >= target_per_side {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 info!(
                     order_id = %order.order_id,
                     up_shares = %position.up_shares,
                     target = %target_per_side,
-                    "Cancelling UP order - already at target"
+                    "Cancelling UP order - at target"
                 );
                 plan.cancellations.push(order.order_id.clone());
             }
@@ -168,13 +170,13 @@ impl LadderEngine {
                     order_id = %order.order_id,
                     down_shares = %position.down_shares,
                     target = %target_per_side,
-                    "Cancelling DOWN order - already at target"
+                    "Cancelling DOWN order - at target"
                 );
                 plan.cancellations.push(order.order_id.clone());
             }
         }
 
-        // CRITICAL FIX: Pass the calculated imbalance, not config.max_imbalance
+        // Find stale orders
         let stale = self.find_stale_orders(
             up_ask,
             down_ask,
@@ -188,7 +190,7 @@ impl LadderEngine {
             }
         }
 
-        // Calculate room for new orders (only if position is below target)
+        // Calculate room for new orders
         let up_room = if position.up_shares >= target_per_side {
             Decimal::ZERO
         } else {
@@ -206,18 +208,122 @@ impl LadderEngine {
             return plan;
         }
 
-        // Generate paired ladders only when both sides have room
-        if up_room >= MIN_ORDER_SIZE && down_room >= MIN_ORDER_SIZE {
-            let pair_orders =
-                self.generate_paired_ladder(up_ask, down_ask, up_room, down_room, overrides);
-            plan.orders.extend(pair_orders);
-        } else if let Some(side) = overrides.allow_imbalance_side {
-            let single_orders =
-                self.generate_single_ladder(side, up_ask, down_ask, up_room, down_room, overrides);
-            plan.orders.extend(single_orders);
+        // === CONTINUOUS TRADING MODE ===
+        // Key insight: place orders on both sides independently, prioritizing the lighter side
+        
+        // Determine priority based on imbalance
+        let (priority_side, secondary_side) = if imbalance > self.config.max_imbalance {
+            (MarketSide::Down, MarketSide::Up)
+        } else if imbalance < -self.config.max_imbalance {
+            (MarketSide::Up, MarketSide::Down)
+        } else {
+            // Balanced - use cheaper side as priority
+            if up_ask <= down_ask {
+                (MarketSide::Up, MarketSide::Down)
+            } else {
+                (MarketSide::Down, MarketSide::Up)
+            }
+        };
+
+        // Generate orders for priority side first
+        let priority_room = match priority_side {
+            MarketSide::Up => up_room,
+            MarketSide::Down => down_room,
+        };
+        let priority_ask = match priority_side {
+            MarketSide::Up => up_ask,
+            MarketSide::Down => down_ask,
+        };
+
+        if priority_room >= MIN_ORDER_SIZE {
+            let orders = self.generate_continuous_ladder(
+                priority_side,
+                priority_ask,
+                priority_room,
+                overrides,
+            );
+            plan.orders.extend(orders);
+        }
+
+        // Generate orders for secondary side (if allow_single_side OR both have room)
+        let secondary_room = match secondary_side {
+            MarketSide::Up => up_room,
+            MarketSide::Down => down_room,
+        };
+        let secondary_ask = match secondary_side {
+            MarketSide::Up => up_ask,
+            MarketSide::Down => down_ask,
+        };
+
+        let should_place_secondary = secondary_room >= MIN_ORDER_SIZE
+            && (self.config.allow_single_side || priority_room >= MIN_ORDER_SIZE);
+
+        if should_place_secondary {
+            let orders = self.generate_continuous_ladder(
+                secondary_side,
+                secondary_ask,
+                secondary_room,
+                overrides,
+            );
+            plan.orders.extend(orders);
         }
 
         plan
+    }
+
+    /// Generate a simple ladder for continuous trading.
+    /// Places orders at competitive prices to get filled.
+    fn generate_continuous_ladder(
+        &self,
+        side: MarketSide,
+        ask: Decimal,
+        room: Decimal,
+        overrides: LadderOverrides,
+    ) -> Vec<LadderOrder> {
+        let mut orders = Vec::new();
+        let mut remaining_room = room;
+
+        let size_per_level = (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
+        let spacing = self.config.spacing * overrides.spacing_multiplier;
+        let top_offset = self.config.top_offset + overrides.extra_offset;
+        let tick = self.config.tick_size.max(dec!(0.01));
+        let levels = overrides.max_levels.unwrap_or(self.config.levels);
+
+        // Check price cap if exists
+        let price_cap = match side {
+            MarketSide::Up => overrides.up_price_cap,
+            MarketSide::Down => overrides.down_price_cap,
+        };
+
+        // Top price: just below the ask
+        let mut top_price = (ask - top_offset).max(dec!(0.01));
+        if let Some(cap) = price_cap {
+            top_price = top_price.min(cap);
+        }
+
+        for level in 0..levels {
+            let price = (top_price - spacing * Decimal::from(level as u32)).max(dec!(0.01));
+            let price = floor_to_tick(price, tick);
+
+            // Don't place orders at or above the ask
+            if price >= ask {
+                continue;
+            }
+
+            let size = round_size(size_per_level.min(remaining_room));
+            if size < MIN_ORDER_SIZE {
+                break;
+            }
+
+            orders.push(LadderOrder { side, price, size });
+            remaining_room -= size;
+
+            if remaining_room < MIN_ORDER_SIZE {
+                break;
+            }
+        }
+
+        orders
     }
 
     fn find_stale_orders(
@@ -271,149 +377,6 @@ impl LadderEngine {
         to_cancel
     }
 
-    fn generate_paired_ladder(
-        &self,
-        up_ask: Decimal,
-        down_ask: Decimal,
-        up_room: Decimal,
-        down_room: Decimal,
-        overrides: LadderOverrides,
-    ) -> Vec<LadderOrder> {
-        let mut orders = Vec::new();
-
-        // let up_cap = match overrides.up_price_cap {
-        //     Some(cap) => cap,
-        //     None => {
-        //         trace!("No edge on Up side - skipping paired ladder");
-        //         return orders;
-        //     }
-        // };
-        // let down_cap = match overrides.down_price_cap {
-        //     Some(cap) => cap,
-        //     None => {
-        //         trace!("No edge on Down side - skipping paired ladder");
-        //         return orders;
-        //     }
-        // };
-
-        let mut remaining_room = up_room.min(down_room);
-        if remaining_room <= Decimal::ZERO {
-            return orders;
-        }
-
-        let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
-        let spacing = self.config.spacing * overrides.spacing_multiplier;
-        let top_offset = self.config.top_offset + overrides.extra_offset;
-
-        let top_up = (up_ask - top_offset).max(dec!(0.01));
-        let top_down = (down_ask - top_offset).max(dec!(0.01));
-
-        let tick = self.config.tick_size.max(dec!(0.01));
-        let levels = overrides.max_levels.unwrap_or(self.config.levels);
-
-        for level in 0..levels {
-            let price_up = (top_up - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-            let price_down = (top_down - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-
-            let price_up = floor_to_tick(price_up, tick);
-            let price_down = floor_to_tick(price_down, tick);
-
-            if price_up >= up_ask || price_down >= down_ask {
-                continue;
-            }
-
-            let size = round_size(size_per_level.min(remaining_room));
-            if size < MIN_ORDER_SIZE {
-                break;
-            }
-
-            orders.push(LadderOrder {
-                side: MarketSide::Up,
-                price: price_up,
-                size,
-            });
-            orders.push(LadderOrder {
-                side: MarketSide::Down,
-                price: price_down,
-                size,
-            });
-            remaining_room -= size;
-        }
-        orders
-    }
-
-    fn generate_single_ladder(
-        &self,
-        side: MarketSide,
-        up_ask: Decimal,
-        down_ask: Decimal,
-        up_room: Decimal,
-        down_room: Decimal,
-        overrides: LadderOverrides,
-    ) -> Vec<LadderOrder> {
-        let mut orders = Vec::new();
-
-        // Check if we have edge on this side (price cap exists)
-        let price_cap = match side {
-            MarketSide::Up => overrides.up_price_cap,
-            MarketSide::Down => overrides.down_price_cap,
-        };
-
-        let cap = match price_cap {
-            Some(cap) => cap,
-            None => {
-                trace!(side = ?side, "No edge on side - skipping single ladder");
-                return orders;
-            }
-        };
-
-        let room = match side {
-            MarketSide::Up => up_room,
-            MarketSide::Down => down_room,
-        };
-
-        if room <= Decimal::ZERO {
-            return orders;
-        }
-
-        let size_per_level =
-            (self.config.size_per_level * overrides.size_multiplier).max(MIN_ORDER_SIZE);
-        let spacing = self.config.spacing * overrides.spacing_multiplier;
-        let top_offset = self.config.top_offset + overrides.extra_offset;
-        let tick = self.config.tick_size.max(dec!(0.01));
-        let levels = overrides.max_levels.unwrap_or(self.config.levels);
-
-        let top_price = match side {
-            MarketSide::Up => (up_ask - top_offset).max(dec!(0.01)).min(cap),
-            MarketSide::Down => (down_ask - top_offset).max(dec!(0.01)).min(cap),
-        };
-
-        let mut remaining_room = room;
-        for level in 0..levels {
-            let price = (top_price - spacing * Decimal::from(level as u32)).max(dec!(0.01));
-            let price = floor_to_tick(price, tick);
-
-            let current_ask = match side {
-                MarketSide::Up => up_ask,
-                MarketSide::Down => down_ask,
-            };
-
-            if price >= current_ask {
-                continue;
-            }
-
-            let size = round_size(size_per_level.min(remaining_room));
-            if size < MIN_ORDER_SIZE {
-                break;
-            }
-
-            orders.push(LadderOrder { side, price, size });
-            remaining_room -= size;
-        }
-
-        orders
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

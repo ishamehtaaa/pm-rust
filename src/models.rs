@@ -75,7 +75,6 @@ pub struct MarketState {
     pub end_time: DateTime<Utc>,
 }
 
-
 pub fn duration_label(delta: TimeDelta) -> String {
     let minutes = delta.num_minutes();
     match minutes {

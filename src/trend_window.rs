@@ -118,30 +118,36 @@ impl TrendWindow {
         let mut sum_change = 0.0;
         let mut weight_sum = 0.0;
         let mut weighted_direction = 0.0;
-        
+
         let samples: Vec<_> = self.samples.iter().collect();
         let n = samples.len();
-        
+
         for i in 1..n {
             let dt_ms = (samples[i].ts_ms - samples[i - 1].ts_ms) as f64;
             if dt_ms <= 0.0 {
                 continue;
             }
-            
+
             let dx = samples[i].logit_mid - samples[i - 1].logit_mid;
             let dt_sec = dt_ms / 1000.0;
-            
+
             // Squared change normalized by time (variance per second)
             sum_sq += dx * dx / dt_sec;
             sum_change += 1.0;
-            
+
             // Exponential weighting: recent samples matter more
             // Weight decays with age from the end of the window
             let recency = (i as f64) / (n as f64); // 0 = oldest, 1 = newest
             let weight = recency.powi(2); // Quadratic decay toward older samples
-            
+
             // Direction: positive dx = price going up
-            let direction = if dx > 0.0 { 1.0 } else if dx < 0.0 { -1.0 } else { 0.0 };
+            let direction = if dx > 0.0 {
+                1.0
+            } else if dx < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
             weighted_direction += weight * direction;
             weight_sum += weight;
         }
@@ -194,13 +200,13 @@ impl TrendWindow {
         self.rn_jd_params = rn_jd::calibrate_step_em(&log_odds_increments, &self.rn_jd_params);
         let current_x = self.samples.back()?.logit_mid;
         let drift = rn_jd::calculate_rn_drift(current_x, &self.rn_jd_params, RNJD_MC_SAMPLES);
-        
+
         // Calculate volatility metrics for adaptive spread sizing
         let vol_metrics = self.volatility_metrics();
-        
+
         // Adapt risk aversion based on volatility: more risk averse when volatile
         let effective_gamma = RNJD_RISK_AVERSION * (1.0 + vol_metrics.realized_vol);
-        
+
         let rnjd_quotes = rn_jd::quote_with_drift(
             current_x,
             0.0,
