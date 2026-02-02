@@ -7,7 +7,5 @@ pub mod market_cache;
 pub mod models;
 pub mod poller;
 pub mod price_feed;
-
-// Legacy modules - kept for potential future use
-// pub mod rn_jd;
-// pub mod trend_window;
+pub mod rn_jd;
+pub mod trend_window;

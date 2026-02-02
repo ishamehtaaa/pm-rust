@@ -8,6 +8,7 @@ use crate::{
     constants::round_size,
     poller::{MarketPosition, MarketSide},
 };
+// Lowered from 5 to capture smaller fills like gabagool22
 const MIN_ORDER_SIZE: Decimal = dec!(5);
 
 pub struct LadderConfig {
@@ -26,6 +27,9 @@ pub struct LadderConfig {
     // Continuous trading mode
     pub allow_single_side: bool,
     pub aggressive_rebalance_threshold: Decimal,
+    // Taker mode - aggressive liquidity taking
+    pub taker_threshold: Decimal,
+    pub taker_size_multiplier: Decimal,
 }
 
 impl Default for LadderConfig {
@@ -45,6 +49,8 @@ impl Default for LadderConfig {
             max_imbalance: dec!(200),
             allow_single_side: true,
             aggressive_rebalance_threshold: dec!(500),
+            taker_threshold: dec!(0.98),
+            taker_size_multiplier: dec!(2.0),
         }
     }
 }
@@ -150,27 +156,36 @@ impl LadderEngine {
         let total_up = position.up_shares + pending_up;
         let total_down = position.down_shares + pending_down;
         let imbalance = total_up - total_down;
+        
+        // Determine which side is light (needs more) vs heavy
+        let (light_side, heavy_side) = if imbalance > Decimal::ZERO {
+            (MarketSide::Down, MarketSide::Up)
+        } else {
+            (MarketSide::Up, MarketSide::Down)
+        };
+        let imbalance_abs = imbalance.abs();
 
-        // Cancel orders on sides that are at or over target
-        if position.up_shares >= target_per_side {
+        // Cancel orders on the HEAVY side if at target
+        // But ALWAYS allow rebalancing orders on the light side
+        if position.up_shares >= target_per_side && heavy_side == MarketSide::Up {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Up) {
                 info!(
                     order_id = %order.order_id,
                     up_shares = %position.up_shares,
                     target = %target_per_side,
-                    "Cancelling UP order - at target"
+                    "Cancelling UP order - heavy side at target"
                 );
                 plan.cancellations.push(order.order_id.clone());
             }
         }
 
-        if position.down_shares >= target_per_side {
+        if position.down_shares >= target_per_side && heavy_side == MarketSide::Down {
             for order in open_orders.iter().filter(|o| o.side == MarketSide::Down) {
                 info!(
                     order_id = %order.order_id,
                     down_shares = %position.down_shares,
                     target = %target_per_side,
-                    "Cancelling DOWN order - at target"
+                    "Cancelling DOWN order - heavy side at target"
                 );
                 plan.cancellations.push(order.order_id.clone());
             }
@@ -191,16 +206,39 @@ impl LadderEngine {
         }
 
         // Calculate room for new orders
-        let up_room = if position.up_shares >= target_per_side {
-            Decimal::ZERO
+        // If window-based targets are provided, use those
+        // Otherwise fall back to target_per_side based calculation
+        let (up_room, down_room) = if overrides.up_target_remaining.is_some() || overrides.down_target_remaining.is_some() {
+            // Window-based accumulation mode
+            // Use the remaining targets directly, minus pending orders
+            let up_remaining = overrides.up_target_remaining.unwrap_or(Decimal::ZERO);
+            let down_remaining = overrides.down_target_remaining.unwrap_or(Decimal::ZERO);
+            
+            let up_room = (up_remaining - pending_up).max(Decimal::ZERO);
+            let down_room = (down_remaining - pending_down).max(Decimal::ZERO);
+            
+            (up_room, down_room)
         } else {
-            (target_per_side - total_up).max(Decimal::ZERO)
-        };
+            // Legacy target_per_side based calculation
+            let rebalance_room = imbalance_abs.min(self.config.size_per_level * dec!(3));
+            
+            let up_room = if heavy_side == MarketSide::Up && position.up_shares >= target_per_side {
+                Decimal::ZERO
+            } else if light_side == MarketSide::Up {
+                (target_per_side - total_up).max(Decimal::ZERO) + rebalance_room
+            } else {
+                (target_per_side - total_up).max(Decimal::ZERO)
+            };
 
-        let down_room = if position.down_shares >= target_per_side {
-            Decimal::ZERO
-        } else {
-            (target_per_side - total_down).max(Decimal::ZERO)
+            let down_room = if heavy_side == MarketSide::Down && position.down_shares >= target_per_side {
+                Decimal::ZERO
+            } else if light_side == MarketSide::Down {
+                (target_per_side - total_down).max(Decimal::ZERO) + rebalance_room
+            } else {
+                (target_per_side - total_down).max(Decimal::ZERO)
+            };
+            
+            (up_room, down_room)
         };
 
         if up_room.is_zero() && down_room.is_zero() {
@@ -208,7 +246,32 @@ impl LadderEngine {
             return plan;
         }
 
-        // === CONTINUOUS TRADING MODE ===
+        // === TAKER MODE ===
+        // When combined cost is below threshold, take liquidity aggressively
+        let combined_cost = up_ask + down_ask;
+        let is_taker_mode = combined_cost < self.config.taker_threshold;
+        
+        if is_taker_mode {
+            debug!(
+                combined = %format!("{:.4}", combined_cost),
+                threshold = %self.config.taker_threshold,
+                edge = %format!("{:.2}%", (dec!(1) - combined_cost) * dec!(100)),
+                "TAKER MODE - aggressive liquidity taking"
+            );
+            
+            // In taker mode, place orders AT the ask to take liquidity immediately
+            let taker_orders = self.generate_taker_orders(
+                up_ask,
+                down_ask,
+                up_room,
+                down_room,
+                imbalance,
+            );
+            plan.orders.extend(taker_orders);
+            return plan;
+        }
+
+        // === CONTINUOUS TRADING MODE (MAKER) ===
         // Key insight: place orders on both sides independently, prioritizing the lighter side
         
         // Determine priority based on imbalance
@@ -234,13 +297,24 @@ impl LadderEngine {
             MarketSide::Up => up_ask,
             MarketSide::Down => down_ask,
         };
+        let priority_cap = match priority_side {
+            MarketSide::Up => overrides.up_price_cap,
+            MarketSide::Down => overrides.down_price_cap,
+        };
 
         if priority_room >= MIN_ORDER_SIZE {
+            let mut side_overrides = overrides.clone();
+            if priority_cap.is_some() {
+                match priority_side {
+                    MarketSide::Up => side_overrides.up_price_cap = priority_cap,
+                    MarketSide::Down => side_overrides.down_price_cap = priority_cap,
+                }
+            }
             let orders = self.generate_continuous_ladder(
                 priority_side,
                 priority_ask,
                 priority_room,
-                overrides,
+                side_overrides,
             );
             plan.orders.extend(orders);
         }
@@ -254,21 +328,159 @@ impl LadderEngine {
             MarketSide::Up => up_ask,
             MarketSide::Down => down_ask,
         };
+        let secondary_cap = match secondary_side {
+            MarketSide::Up => overrides.up_price_cap,
+            MarketSide::Down => overrides.down_price_cap,
+        };
 
         let should_place_secondary = secondary_room >= MIN_ORDER_SIZE
             && (self.config.allow_single_side || priority_room >= MIN_ORDER_SIZE);
 
         if should_place_secondary {
+            let mut side_overrides = overrides.clone();
+            if secondary_cap.is_some() {
+                match secondary_side {
+                    MarketSide::Up => side_overrides.up_price_cap = secondary_cap,
+                    MarketSide::Down => side_overrides.down_price_cap = secondary_cap,
+                }
+            }
             let orders = self.generate_continuous_ladder(
                 secondary_side,
                 secondary_ask,
                 secondary_room,
-                overrides,
+                side_overrides,
             );
             plan.orders.extend(orders);
         }
 
         plan
+    }
+
+    /// Generate balanced taker orders - take liquidity while maintaining balance
+    /// Key insight: Place moderate orders on BOTH sides, prioritizing the lighter side
+    /// to keep inventory balanced while capturing edge
+    fn generate_taker_orders(
+        &self,
+        up_ask: Decimal,
+        down_ask: Decimal,
+        up_room: Decimal,
+        down_room: Decimal,
+        imbalance: Decimal,
+    ) -> Vec<LadderOrder> {
+        let mut orders = Vec::new();
+        let tick = self.config.tick_size.max(dec!(0.01));
+        
+        // Use moderate order sizes - consistent accumulation, not aggressive sweeping
+        // This prevents one side from getting filled way more than the other
+        let order_size = self.config.size_per_level * self.config.taker_size_multiplier;
+        let taker_min_size = MIN_ORDER_SIZE;
+        
+        // Calculate how much room we have on each side considering imbalance
+        let imbalance_abs = imbalance.abs();
+        let max_imb = self.config.max_imbalance;
+        
+        // Determine which side needs more shares to balance
+        let (light_side, heavy_side) = if imbalance > Decimal::ZERO {
+            // More Up than Down - prioritize Down
+            (MarketSide::Down, MarketSide::Up)
+        } else {
+            // More Down than Up - prioritize Up
+            (MarketSide::Up, MarketSide::Down)
+        };
+
+        // Calculate effective room - limit heavy side if imbalance is bad
+        let (light_room, heavy_room) = match light_side {
+            MarketSide::Up => {
+                let heavy_limit = if imbalance_abs > max_imb {
+                    Decimal::ZERO // Don't add more to heavy side
+                } else {
+                    down_room
+                };
+                (up_room, heavy_limit)
+            }
+            MarketSide::Down => {
+                let heavy_limit = if imbalance_abs > max_imb {
+                    Decimal::ZERO // Don't add more to heavy side
+                } else {
+                    up_room
+                };
+                (down_room, heavy_limit)
+            }
+        };
+
+        let light_ask = match light_side {
+            MarketSide::Up => up_ask,
+            MarketSide::Down => down_ask,
+        };
+        let heavy_ask = match heavy_side {
+            MarketSide::Up => up_ask,
+            MarketSide::Down => down_ask,
+        };
+
+        // ALWAYS place on light side first (to reduce imbalance)
+        if light_room >= taker_min_size {
+            // Place at ask for immediate fill
+            let size = round_size(order_size.min(light_room));
+            if size >= taker_min_size {
+                orders.push(LadderOrder {
+                    side: light_side,
+                    price: light_ask,
+                    size,
+                });
+                
+                // Add a second level one tick below for depth
+                let remaining = light_room - size;
+                if remaining >= taker_min_size {
+                    let second_price = floor_to_tick(light_ask - tick, tick).max(dec!(0.01));
+                    let second_size = round_size(order_size.min(remaining));
+                    if second_size >= taker_min_size {
+                        orders.push(LadderOrder {
+                            side: light_side,
+                            price: second_price,
+                            size: second_size,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Only place on heavy side if imbalance is acceptable
+        if heavy_room >= taker_min_size {
+            let size = round_size(order_size.min(heavy_room));
+            if size >= taker_min_size {
+                orders.push(LadderOrder {
+                    side: heavy_side,
+                    price: heavy_ask,
+                    size,
+                });
+                
+                // Second level
+                let remaining = heavy_room - size;
+                if remaining >= taker_min_size {
+                    let second_price = floor_to_tick(heavy_ask - tick, tick).max(dec!(0.01));
+                    let second_size = round_size(order_size.min(remaining));
+                    if second_size >= taker_min_size {
+                        orders.push(LadderOrder {
+                            side: heavy_side,
+                            price: second_price,
+                            size: second_size,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Log imbalance status for debugging
+        if imbalance_abs > max_imb {
+            debug!(
+                imbalance = %imbalance,
+                max = %max_imb,
+                light_side = ?light_side,
+                "Imbalance exceeded - only placing on light side"
+            );
+        }
+
+        orders
     }
 
     /// Generate a simple ladder for continuous trading.
@@ -388,6 +600,10 @@ pub struct LadderOverrides {
     pub down_price_cap: Option<Decimal>,
     pub max_levels: Option<usize>,
     pub allow_imbalance_side: Option<MarketSide>,
+    /// Remaining shares to accumulate for Up side this window
+    pub up_target_remaining: Option<Decimal>,
+    /// Remaining shares to accumulate for Down side this window
+    pub down_target_remaining: Option<Decimal>,
 }
 
 impl Default for LadderOverrides {
@@ -400,6 +616,8 @@ impl Default for LadderOverrides {
             down_price_cap: None,
             max_levels: None,
             allow_imbalance_side: None,
+            up_target_remaining: None,
+            down_target_remaining: None,
         }
     }
 }

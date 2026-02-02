@@ -13,22 +13,25 @@ pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
 const DEFAULT_TARGET_PER_SIDE: Decimal = dec!(5000);
 
 /// Size of each individual order (like the target trader's ~24 share orders)
-const DEFAULT_ORDER_SIZE: Decimal = dec!(24);
+const DEFAULT_ORDER_SIZE: Decimal = dec!(12);
 
 /// Maximum combined cost (up_avg + down_avg) to accept
 /// 0.995 = require at least 0.5% edge on aggregate position
-const DEFAULT_MAX_COMBINED_COST: Decimal = dec!(0.995);
+const DEFAULT_MAX_COMBINED_COST: Decimal = dec!(0.990);
 
 /// Maximum imbalance (up_shares - down_shares) before prioritizing the lighter side
-const DEFAULT_MAX_IMBALANCE: Decimal = dec!(200);
+/// Lower = more aggressive rebalancing
+const DEFAULT_MAX_IMBALANCE: Decimal = dec!(50);
 
 /// Number of resting order levels per side
-const DEFAULT_LEVELS: usize = 3;
+const DEFAULT_LEVELS: usize = 5;
 
 /// Price offset below best ask for order placement
+/// 0.01 = place one tick below ask (top of book, best bid)
 const DEFAULT_PRICE_OFFSET: Decimal = dec!(0.01);
 
-/// Spacing between ladder levels
+/// Spacing between ladder levels  
+/// Tighter spacing = more orders near the ask
 const DEFAULT_LEVEL_SPACING: Decimal = dec!(0.01);
 
 // ============================================================================
@@ -36,16 +39,27 @@ const DEFAULT_LEVEL_SPACING: Decimal = dec!(0.01);
 // ============================================================================
 
 /// Maximum age of price data before considering it stale (ms)
-const DEFAULT_MAX_PRICE_AGE_MS: i64 = 2_500;
+const DEFAULT_MAX_PRICE_AGE_MS: i64 = 1_000;
 
 /// Minimum time between order placements per market (seconds)
-const DEFAULT_COOLDOWN_SECS: u64 = 1;
+const DEFAULT_COOLDOWN_SECS: u64 = 0;
 
 /// Price movement threshold to trigger re-laddering
-const DEFAULT_RELADDER_THRESHOLD: Decimal = dec!(0.02);
+/// Lower = reladder more often (add new orders frequently)
+const DEFAULT_RELADDER_THRESHOLD: Decimal = dec!(0.01);
 
 /// Distance from current ask to consider an order stale
-const DEFAULT_STALE_ORDER_DISTANCE: Decimal = dec!(0.10);
+/// Very high = almost never cancel orders, let them sit
+const DEFAULT_STALE_ORDER_DISTANCE: Decimal = dec!(0.50);
+
+/// Combined cost threshold to trigger aggressive taker mode
+/// When up_ask + down_ask < this value, take liquidity immediately
+/// 0.99 = trigger taker mode when there's 1%+ edge
+const DEFAULT_TAKER_THRESHOLD: Decimal = dec!(0.99);
+
+/// Size multiplier for taker orders
+/// 2x base size = 48 shares per order (balanced accumulation)
+const DEFAULT_TAKER_SIZE_MULTIPLIER: Decimal = dec!(2.0);
 
 /// Tick size for price rounding
 const DEFAULT_TICK_SIZE: Decimal = dec!(0.01);
@@ -137,6 +151,10 @@ pub struct TradingConfig {
     pub reladder_threshold: Decimal,
     /// Stale order distance
     pub stale_order_distance: Decimal,
+    /// Combined cost threshold to trigger aggressive taker mode
+    pub taker_threshold: Decimal,
+    /// Size multiplier for taker orders
+    pub taker_size_multiplier: Decimal,
 }
 
 impl Default for TradingConfig {
@@ -151,6 +169,8 @@ impl Default for TradingConfig {
             level_spacing: DEFAULT_LEVEL_SPACING,
             reladder_threshold: DEFAULT_RELADDER_THRESHOLD,
             stale_order_distance: DEFAULT_STALE_ORDER_DISTANCE,
+            taker_threshold: DEFAULT_TAKER_THRESHOLD,
+            taker_size_multiplier: DEFAULT_TAKER_SIZE_MULTIPLIER,
         }
     }
 }
@@ -164,17 +184,17 @@ pub struct Config {
     // Authentication
     pub polymarket_private_key: String,
     pub polymarket_proxy_address: String,
-    
+
     // Mode
     pub dry_run: bool,
-    
+
     // Market selection
     pub target_assets: HashSet<String>,
     pub target_duration: MarketDuration,
-    
+
     // Trading parameters
     pub trading: TradingConfig,
-    
+
     // Safety parameters
     pub max_price_age_ms: i64,
     pub cooldown_secs: u64,
@@ -220,6 +240,8 @@ pub struct LadderTuning {
     pub max_imbalance_shares: Decimal,
     pub allow_single_side: bool,
     pub aggressive_rebalance_threshold: Decimal,
+    pub taker_threshold: Decimal,
+    pub taker_size_multiplier: Decimal,
 }
 
 impl From<&TradingConfig> for LadderTuning {
@@ -235,6 +257,8 @@ impl From<&TradingConfig> for LadderTuning {
             max_imbalance_shares: tc.max_imbalance,
             allow_single_side: true,
             aggressive_rebalance_threshold: tc.max_imbalance * dec!(2.5),
+            taker_threshold: tc.taker_threshold,
+            taker_size_multiplier: tc.taker_size_multiplier,
         }
     }
 }

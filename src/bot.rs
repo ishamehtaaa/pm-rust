@@ -2,11 +2,12 @@
 
 use crate::aggregate_tracker::AggregateTracker;
 use crate::config::{Config, ASSETS_BY_NAME};
-use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderState};
+use crate::ladder::{LadderConfig, LadderEngine, LadderOrder, LadderOverrides, LadderState};
 use crate::market_cache::MarketCache;
 use crate::models::{MarketInfo, MarketState, TradingPair};
 use crate::poller::{InventoryLedger, MarketSide, spawn_order_feed};
 use crate::price_feed::{PriceCache, spawn_price_feed};
+use crate::trend_window::TrendWindow;
 
 use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
@@ -34,8 +35,8 @@ use tracing::{debug, error, info, instrument, warn};
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 type AuthenticatedWsClient = WsClient<Authenticated<Normal>>;
 
-const LOOP_DELAY: Duration = Duration::from_millis(200);
-const BALANCE_REFRESH_SECS: u64 = 30;
+const LOOP_DELAY: Duration = Duration::from_millis(50);
+const BALANCE_REFRESH_SECS: u64 = 10; // Faster refresh for better inventory tracking
 const WS_SUB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
 
 pub struct SimpleBot {
@@ -63,6 +64,22 @@ pub struct SimpleBot {
     last_aggregate_log: HashMap<String, Instant>,
     last_missing_price_log: HashMap<String, Instant>,
     last_dry_run_log: HashMap<String, Instant>,
+    
+    // Trend analysis for smarter order placement
+    trend_windows: HashMap<String, TrendWindow>,
+    last_trend_log: HashMap<String, Instant>,
+    
+    // Time-window based accumulation tracking
+    window_state: HashMap<String, WindowAccumulation>,
+}
+
+/// Tracks accumulation within a time window for balanced buying
+#[derive(Debug, Clone, Default)]
+pub struct WindowAccumulation {
+    pub window_start_ms: i64,
+    /// Position at window start (to calculate accumulation)
+    pub up_at_start: Decimal,
+    pub down_at_start: Decimal,
 }
 
 impl SimpleBot {
@@ -87,6 +104,8 @@ impl SimpleBot {
         ladder_config.max_imbalance = ladder_tuning.max_imbalance_shares;
         ladder_config.allow_single_side = ladder_tuning.allow_single_side;
         ladder_config.aggressive_rebalance_threshold = ladder_tuning.aggressive_rebalance_threshold;
+        ladder_config.taker_threshold = ladder_tuning.taker_threshold;
+        ladder_config.taker_size_multiplier = ladder_tuning.taker_size_multiplier;
         
         let ladder_engine = LadderEngine::new(ladder_config);
         let ladder_state = LadderState::default();
@@ -146,6 +165,9 @@ impl SimpleBot {
             last_aggregate_log: HashMap::new(),
             last_missing_price_log: HashMap::new(),
             last_dry_run_log: HashMap::new(),
+            trend_windows: HashMap::new(),
+            last_trend_log: HashMap::new(),
+            window_state: HashMap::new(),
         })
     }
 
@@ -322,6 +344,9 @@ impl SimpleBot {
                 self.last_missing_price_log.remove(market_id);
                 self.last_dry_run_log.remove(market_id);
                 self.last_order_by_market.remove(market_id);
+                self.trend_windows.remove(market_id);
+                self.last_trend_log.remove(market_id);
+                self.window_state.remove(market_id);
             }
         }
 
@@ -471,14 +496,17 @@ impl SimpleBot {
         let market_ids: Vec<String> = self.markets.keys().cloned().collect();
 
         for market_id in market_ids {
-            let state = match self.markets.get(&market_id) {
-                Some(s) => s,
-                None => continue,
+            // Extract all needed values from state first to avoid borrow conflicts
+            let (market_sym, up_token_id, down_token_id) = {
+                let state = match self.markets.get(&market_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let market_sym = market_symbol(&state.info);
+                let up_token_id = state.info.up_token_id.clone();
+                let down_token_id = state.info.down_token_id.clone();
+                (market_sym, up_token_id, down_token_id)
             };
-            
-            let market_sym = market_symbol(&state.info);
-            let up_token_id = state.info.up_token_id.clone();
-            let down_token_id = state.info.down_token_id.clone();
 
             // Refresh positions periodically
             self.refresh_positions(&market_id, &up_token_id, &down_token_id, &market_sym)
@@ -523,6 +551,58 @@ impl SimpleBot {
                 }
             };
 
+            // ===== SIMPLE STRATEGY: ALWAYS IN THE BOOK =====
+            // Like gabagool - maintain orders on BOTH sides at all times
+            // Calculate MAX price we can pay based on our existing avg on other side
+            
+            // Get current position
+            let pos = {
+                let ledger = self.ledger.read();
+                ledger.effective_position(&market_id)
+            };
+            
+            // Get our current averages
+            let (up_avg, down_avg) = {
+                let agg = self.aggregate_tracker.get(&market_id);
+                match agg {
+                    Some(a) => (a.up_avg_price(), a.down_avg_price()),
+                    None => (None, None),
+                }
+            };
+            
+            // Calculate max prices we can pay while staying profitable
+            // max_up = 1.0 - down_avg (so combined stays <= 1.0)
+            // max_down = 1.0 - up_avg
+            let max_up_price = match down_avg {
+                Some(d_avg) => (dec!(1.0) - d_avg).max(dec!(0.01)),
+                None => dec!(0.99), // No down yet, can pay up to 0.99
+            };
+            
+            let max_down_price = match up_avg {
+                Some(u_avg) => (dec!(1.0) - u_avg).max(dec!(0.01)),
+                None => dec!(0.99), // No up yet, can pay up to 0.99
+            };
+            
+            // Calculate imbalance
+            let imbalance = pos.up_shares - pos.down_shares;
+            let up_behind = imbalance < Decimal::ZERO;
+            let down_behind = imbalance > Decimal::ZERO;
+            
+            // Log state periodically
+            if self.should_log_trend(&market_id) {
+                debug!(
+                    market = %market_sym,
+                    up_ask = %up_ask,
+                    max_up = %format!("{:.2}", max_up_price),
+                    down_ask = %down_ask,
+                    max_down = %format!("{:.2}", max_down_price),
+                    up_avg = ?up_avg,
+                    down_avg = ?down_avg,
+                    imbalance = %format!("{:.1}", imbalance),
+                    "Always in book"
+                );
+            }
+            
             // Check if we should reladder
             let should_reladder = self.ladder_state.should_reladder(
                 &market_id,
@@ -535,14 +615,26 @@ impl SimpleBot {
                 continue;
             }
 
-            // Get position and open orders
-            let (pos, open_orders) = {
+            // Get open orders (we already have pos from above)
+            let open_orders = {
                 let ledger = self.ledger.read();
-                (
-                    ledger.effective_position(&market_id),
-                    ledger.open_orders_for_market(&market_id),
-                )
+                ledger.open_orders_for_market(&market_id)
             };
+
+            // Build ladder overrides
+            let mut overrides = LadderOverrides::default();
+            
+            // Prioritize the side that's behind to stay balanced
+            if up_behind {
+                overrides.allow_imbalance_side = Some(MarketSide::Up);
+            } else if down_behind {
+                overrides.allow_imbalance_side = Some(MarketSide::Down);
+            }
+            
+            // Set price caps based on what keeps us profitable
+            // Place orders up to max price - we stay in the book at good prices
+            overrides.up_price_cap = Some(max_up_price.min(up_ask));
+            overrides.down_price_cap = Some(max_down_price.min(down_ask));
 
             // Compute ladder plan
             let target = self.config.trading.target_per_side;
@@ -552,7 +644,7 @@ impl SimpleBot {
                 &pos,
                 &open_orders,
                 Some(target),
-                None,
+                Some(overrides),
             );
 
             if plan.cancellations.is_empty() && plan.orders.is_empty() {
@@ -582,12 +674,18 @@ impl SimpleBot {
             if !plan.orders.is_empty() {
                 if self.config.dry_run {
                     if self.should_log_dry_run(&market_id) {
+                        let combined = up_ask + down_ask;
+                        let taker_threshold = self.config.trading.taker_threshold;
+                        let mode = if combined < taker_threshold { "TAKER" } else { "maker" };
+                        let edge_pct = (rust_decimal_macros::dec!(1) - combined) * rust_decimal_macros::dec!(100);
                         info!(
                             market = %market_sym,
+                            mode = %mode,
                             count = plan.orders.len(),
                             up_ask = %up_ask,
                             down_ask = %down_ask,
-                            combined = %format!("{:.3}", up_ask + down_ask),
+                            combined = %format!("{:.3}", combined),
+                            edge = %format!("{:.2}%", edge_pct),
                             "Dry run: would place orders"
                         );
                         for order in &plan.orders {
@@ -632,11 +730,16 @@ impl SimpleBot {
 
                             if placed > 0 {
                                 let combined = up_ask + down_ask;
+                                let taker_threshold = self.config.trading.taker_threshold;
+                                let mode = if combined < taker_threshold { "TAKER" } else { "maker" };
+                                let edge_pct = (rust_decimal_macros::dec!(1) - combined) * rust_decimal_macros::dec!(100);
                                 info!(
                                     market = %market_sym,
+                                    mode = %mode,
                                     up_ask = %up_ask,
                                     down_ask = %down_ask,
                                     combined = %format!("{:.3}", combined),
+                                    edge = %format!("{:.2}%", edge_pct),
                                     placed,
                                     "Orders placed"
                                 );
@@ -683,6 +786,17 @@ impl SimpleBot {
             Some(last) if now.duration_since(*last) < Duration::from_secs(10) => false,
             _ => {
                 self.last_aggregate_log.insert(market_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    fn should_log_trend(&mut self, market_id: &str) -> bool {
+        let now = Instant::now();
+        match self.last_trend_log.get(market_id) {
+            Some(last) if now.duration_since(*last) < Duration::from_secs(15) => false,
+            _ => {
+                self.last_trend_log.insert(market_id.to_string(), now);
                 true
             }
         }
